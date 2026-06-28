@@ -192,6 +192,9 @@ def main():
     ap.add_argument("--dome-shift", type=float, default=6.0, help="dome image shift (px) flagged as contact")
     ap.add_argument("--detect-tries", type=int, default=3)
     ap.add_argument("--detect-only", action="store_true", help="list detected objects and exit (no motion)")
+    ap.add_argument("--flat-target", dest="flat_target", action="store_true", default=True,
+                    help="aim the cup at the flattest sealable patch (suction-point detector) not the centroid")
+    ap.add_argument("--no-flat-target", dest="flat_target", action="store_false")
     ap.add_argument("--max-objects", type=int, default=1, help="touch at most N objects (largest first)")
     ap.add_argument("--pick-index", type=int, default=0, help="start at the Nth largest object (skip earlier)")
     ap.add_argument("--grasp-press", type=float, default=0.006, help="press past contact for the suction seal (m)")
@@ -209,6 +212,7 @@ def main():
     from perturb_loop import PlannerClient, RobotState, execute, scale_traj
     from joint_conventions import rad_to_linuxcnc_deg
     import suction_test
+    from real_grasp import estimate_normals, detect_suction_point
     place_xyz = [float(v) for v in args.place.split(",")]
     box_xyz = [float(v) for v in args.box.split(",")]
 
@@ -429,9 +433,10 @@ def main():
                 print("WARN: could not grab base frame for blue-dot template")
         else:
             print("WARN: no blue_dot_mask.npz — blue-dot contact disabled")
-        objs = []
+        objs = []; cam_base = None
         for _ in range(args.detect_tries):
             Tbc = fk_T(state.get_q()) @ make_T(np.eye(3), [0, 0, C.CAM_TCP_Z_SHIFT]) @ C.T_TCP_CAM
+            cam_base = Tbc[:3, 3]                                 # camera position for normal orientation
             r = mon.latest_rgbd()
             if r is None:
                 continue
@@ -450,12 +455,22 @@ def main():
         print(f"detected objects; touching {len(objs)} (largest-first, from index {args.pick_index})")
 
         for i, o in enumerate(objs):
-            P = o["pts"]; cxy = o["centroid"][:2].copy()
+            P = o["pts"]; cxy = o["centroid"][:2].copy(); flat_ok = False
+            if args.flat_target and cam_base is not None:        # aim at the flattest sealable patch
+                try:
+                    nrm = estimate_normals(P, cam_base)
+                    found = detect_suction_point(P, nrm, normal_cone_deg=45.0, select="central")
+                    if found is not None:
+                        cxy = np.asarray(found[0], float)[:2].copy(); flat_ok = True
+                        print(f"  flat suction point [{cxy[0]:.3f},{cxy[1]:.3f}]")
+                except Exception as e:
+                    print(f"  flat-target failed ({e}); using centroid")
             col = P[np.linalg.norm(P[:, :2] - cxy, axis=1) < 0.02]
             surf = float(np.median(col[:, 2])) if len(col) > 20 else float(np.percentile(P[:, 2], 80))
-            face = P[np.abs(P[:, 2] - surf) < 0.010]
-            if len(face) > 20:
-                cxy = face[:, :2].mean(0)
+            if not flat_ok:                                      # centroid path: re-centre on the flat top
+                face = P[np.abs(P[:, 2] - surf) < 0.010]
+                if len(face) > 20:
+                    cxy = face[:, :2].mean(0)
             floor_z = surf - args.max_descend         # HARD safety floor (backstop only)
             print(f"\n== object {i+1}: centre [{cxy[0]:.3f},{cxy[1]:.3f}] surf_est={surf:.3f} ==")
 
