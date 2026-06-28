@@ -1,5 +1,19 @@
 # TODO / Next-session plan — velocity-continuous welded trajectories
 
+> **STATUS (working on hardware, in `servo_touch.py`):**
+> - **S1 weld engine** — `_retime` re-times concatenated cuRobo segments to a non-zero junction
+>   velocity (post-hoc, sampled to uniform `traj_dt`). DONE for the touch/place/return moves.
+> - **S2 welded touch** — DONE: one welded descent through the pregrasp (non-zero v), fast-then-slow,
+>   decel-to-rest; **blue-dot plunger** is the contact signal (gap was unreliable). S4-style.
+> - **S3 welded full pick-and-place** — LARGELY WORKING: welded descent → blue-dot contact →
+>   grasp-press → suction (only v=0 = seal dwell) → **welded collision-aware carry** (object lifted
+>   clear of the box rim) → release → **welded return**. All torque-feasible (≤20 °/s, capped to
+>   cuRobo native — flat 55 °/s caused following-error power-offs). Ran a full table (16 objects).
+> - **Open:** planner-side attach of the carried object (currently geometric routing); flattest-top
+>   suction selection; faster welds need the torque ceiling lifted.
+
+
+
 ## Goal
 
 Remove inter-phase **stops / dead-time** in the touch and pick-and-place motions. The

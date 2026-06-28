@@ -42,6 +42,25 @@ class GapMonitor(threading.Thread):
         self.lock = threading.Lock(); self.stop_evt = threading.Event()
         self._rgbd = None; self._gap = None; self._cupd = None; self._domey = None
         self._t = 0.0; self.n = 0; self.K = None; self.ok = False
+        self.rec = None                                          # set to [] to record (t, jpg, depth-jpg, gap)
+        self.templ = None; self.sbox = None; self.base_y = None  # plunger-dot template tracker (contact signal)
+        self._bluey = None; self._bluedy = None; self._bluescore = 0.0
+
+    def set_bluedot_template(self, templ_gray, sbox, base_y):
+        self.templ = templ_gray; self.sbox = [int(v) for v in sbox]; self.base_y = float(base_y)
+
+    def latest_bluey(self):
+        with self.lock:
+            return self._bluey, self._bluedy                     # (current y, dy = base_y - y; +up = contact)
+
+    def start_rec(self):
+        with self.lock:
+            self.rec = []
+
+    def stop_rec(self):
+        with self.lock:
+            r = self.rec; self.rec = None
+        return r or []
 
     def run(self):
         import pyrealsense2 as rs
@@ -82,9 +101,32 @@ class GapMonitor(threading.Thread):
                 gray = cv2.cvtColor(rgb[y0:y1, x0:x1], cv2.COLOR_RGB2GRAY)
                 dys, dxs = np.where(gray < 80)
                 domey = float(dys.mean() + y0) if len(dys) >= 40 else None
+                # PLUNGER-DOT tracking by TEMPLATE MATCHING (normalized -> robust to the dimming as
+                # the cup nears the object). The dot rises (y decreases) when the cup retracts on contact.
+                bluey = bluedy = None; bscore = 0.0
+                if self.templ is not None:
+                    sx0, sy0, sx1, sy1 = self.sbox
+                    gs = cv2.cvtColor(rgb[sy0:sy1, sx0:sx1], cv2.COLOR_RGB2GRAY)
+                    th, tw = self.templ.shape
+                    if gs.shape[0] >= th and gs.shape[1] >= tw:
+                        res = cv2.matchTemplate(gs, self.templ, cv2.TM_CCOEFF_NORMED)
+                        _, bscore, _, loc = cv2.minMaxLoc(res)
+                        if bscore >= 0.40:
+                            bluey = float(loc[1] + sy0 + th / 2.0); bluedy = self.base_y - bluey
+                tnow = time.time()
                 with self.lock:
                     self._rgbd = (rgb, depth, self.K); self._gap = g; self._cupd = cupd
-                    self._domey = domey; self._t = time.time(); self.n += 1
+                    self._domey = domey; self._t = tnow; self.n += 1
+                    self._bluey = bluey; self._bluedy = bluedy; self._bluescore = bscore
+                    recording = self.rec is not None
+                if recording:
+                    okc, cb = cv2.imencode(".jpg", rgb[:, :, ::-1], [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    dcol = cv2.applyColorMap(cv2.convertScaleAbs(depth, alpha=425.0), cv2.COLORMAP_JET)
+                    okd, db = cv2.imencode(".jpg", dcol, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    if okc and okd:
+                        with self.lock:
+                            if self.rec is not None:
+                                self.rec.append((tnow, cb.tobytes(), db.tobytes(), g))
         finally:
             try:
                 pipe.stop()
@@ -126,23 +168,54 @@ def main():
     ap.add_argument("--margin", type=float, default=0.004, help="linear over-descent past the surface (m); spring absorbs it")
     ap.add_argument("--cal-a", type=float, default=0.78)      # calibrated gap->dist: true = a*gap + b
     ap.add_argument("--cal-b", type=float, default=0.0105)
+    ap.add_argument("--v-des", type=float, default=6.0, help="FAST descent speed past pregrasp (deg/s)")
+    ap.add_argument("--v-contact", type=float, default=2.0, help="SLOW speed near contact (deg/s)")
+    ap.add_argument("--slow-frac", type=float, default=0.5, help="fraction of the descent that is the slow contact zone")
+    ap.add_argument("--weld-dt", type=float, default=0.06, help="uniform traj_dt of the re-timed weld (s)")
+    ap.add_argument("--weld-ramp", type=float, default=0.12, help="junction decel window in joint arc-length (rad)")
+    ap.add_argument("--gap-contact", type=float, default=0.005, help="raw gap (m) at which to HOLD = contact")
+    ap.add_argument("--blue-dot", default=os.path.join(C.OUT_DIR, "blue_dot_mask.npz"))
+    ap.add_argument("--blue-thresh", type=float, default=3.0, help="blue-dot rise (px) = contact")
+    ap.add_argument("--post-dwell", type=float, default=0.5, help="wait after contact before returning (s)")
+    ap.add_argument("--return-vel", type=float, default=20.0, help="welded-return per-joint peak (deg/s)")
+    # pick-and-place mode: at contact -> suction ON -> welded move to place pose -> release
+    ap.add_argument("--pick-place", action="store_true", help="grasp+place each object instead of touch-only")
+    ap.add_argument("--place", default="0.10,0.40,0.30", help="release pose x,y,z (cup tip over the bin)")
+    ap.add_argument("--box", default="0.10,0.40,0.0", help="place box bottom-centre x,y,z")
+    ap.add_argument("--box-size", type=float, default=0.25, help="box height; rim_z = box_z + this")
+    ap.add_argument("--table-z", type=float, default=0.015, help="table top height (for carried-object hang extent)")
+    ap.add_argument("--release-clear", type=float, default=0.05, help="object bottom clears the rim by this at release")
+    ap.add_argument("--place-vel", type=float, default=20.0, help="welded place-move per-joint peak (deg/s)")
+    ap.add_argument("--seal-dwell", type=float, default=0.5, help="suction-seal dwell at contact (s, the only v=0)")
+    ap.add_argument("--record", action="store_true", help="record per-object RGBD+joints (adds save time; off for fast cycle)")
+    ap.add_argument("--suction-host", default="10.0.0.27"); ap.add_argument("--suction-user", default="pi")
     ap.add_argument("--dome-shift", type=float, default=6.0, help="dome image shift (px) flagged as contact")
     ap.add_argument("--detect-tries", type=int, default=3)
+    ap.add_argument("--detect-only", action="store_true", help="list detected objects and exit (no motion)")
+    ap.add_argument("--max-objects", type=int, default=1, help="touch at most N objects (largest first)")
+    ap.add_argument("--pick-index", type=int, default=0, help="start at the Nth largest object (skip earlier)")
+    ap.add_argument("--grasp-press", type=float, default=0.006, help="press past contact for the suction seal (m)")
     ap.add_argument("--dwell", type=float, default=1.2)
+    ap.add_argument("--rec-dir", default=os.path.join(C.OUT_DIR, "touch_rec"),
+                    help="record joint pos/vel + RGBD frames per object here")
     args = ap.parse_args()
 
     import rclpy
     from std_msgs.msg import String
+    from sensor_msgs.msg import JointState
     from object_pointclouds import deproject_mask
     from capture_and_plot import segment
     from multiview_fuse import pick_res
     from perturb_loop import PlannerClient, RobotState, execute, scale_traj
     from joint_conventions import rad_to_linuxcnc_deg
+    import suction_test
+    place_xyz = [float(v) for v in args.place.split(",")]
+    box_xyz = [float(v) for v in args.box.split(",")]
 
     cup = np.load(args.cup); rim = cup["rim"].astype(bool); ann = cup["ring"].astype(bool)
     dome = cup["dome"].astype(bool) if "dome" in cup.files else cup["mask"].astype(bool)
     print(f"cup ROI: rim {int(rim.sum())}px, dome arc {int(ann.sum())}px, dome {int(dome.sum())}px")
-    CW, CH = pick_res(args.serial)
+    CH, CW = rim.shape                     # match the cup-mask resolution (D405 may default to 848x480)
     mon = GapMonitor(args.serial, CW, CH, rim, ann, dome); mon.start()
     t0 = time.time()
     while not mon.ok and time.time() - t0 < 8:
@@ -153,6 +226,12 @@ def main():
     pc = PlannerClient(); rclpy.init(); node = rclpy.create_node("servo_touch")
     pub = node.create_publisher(String, "/mycobot/cmd/move", 10); state = RobotState(node)
     track = {"ramp_time": 0.15, "pos_gain": 1.0, "vff_scale": 1.0}
+    # joint recorder: /mycobot/drive_feedback carries measured position (deg) + velocity (deg/s) @50Hz
+    jrec = []; jrec_on = {"v": False}
+    def _on_drive(msg):
+        if jrec_on["v"]:
+            jrec.append((time.time(), [float(p) for p in msg.position], [float(v) for v in msg.velocity]))
+    node.create_subscription(JointState, "/mycobot/drive_feedback", _on_drive, 50)
     down = list(R_to_quat_wxyz(R_from_two_axes(np.array([0, 0, -1.0]))))
 
     def fk_T(q):
@@ -176,6 +255,123 @@ def main():
                                             "controller": "pid", **track})))
         return True
 
+    def _retime(path, junc, v_app, v_des, dt_ref, ramp, v_end=None, end_frac=0.0):
+        """Re-parametrize a concatenated joint path with a SMOOTH velocity profile: cruise at
+        v_app, ramp down to v_des just before the junction, hold v_des, then (optionally) ramp
+        down to v_end over the last `end_frac` of the post-junction segment so the final approach
+        to contact is slow/gentle while the rest of the descent is fast. v_* in rad/s."""
+        d = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))]  # arc-length (rad)
+        if d[-1] < 1e-6:
+            return path[:1].copy(), 0.0
+        dj = d[junc]; de = d[-1]
+        if v_end is None:
+            v_end = v_des
+        es = de - max(0.0, end_frac) * (de - dj)                     # start of the slow contact zone
+        sg = np.linspace(0, de, 4000)
+        vg = np.where(sg < dj - ramp, v_app,
+              np.where(sg < dj, v_app + (v_des - v_app) * (sg - (dj - ramp)) / max(ramp, 1e-6),
+              np.where(sg < es, v_des,
+                       v_des + (v_end - v_des) * (sg - es) / max(de - es, 1e-6))))     # ramp to v_end near contact
+        vg = np.maximum(vg, 1e-3)
+        tg = np.r_[0.0, np.cumsum(np.diff(sg) / vg[:-1])]            # cumulative time along the path
+        ts = np.arange(0, tg[-1], dt_ref)
+        ss = np.interp(ts, tg, sg)                                   # arc-length at each uniform-time tick
+        out = np.column_stack([np.interp(ss, d, path[:, j]) for j in range(6)])
+        junc_t = float(np.interp(dj, sg, tg))                        # time when the path reaches the junction
+        return out, junc_t
+
+    def send_weld_descent(pregrasp, grasp, v_app_deg, v_des_deg, dt_ref, ramp, v_contact_deg=None, slow_frac=0.0):
+        """ONE velocity-continuous trajectory current -> pregrasp(non-zero v) -> grasp(decel-to-rest).
+        Descends fast at v_des, slowing to v_contact over the last `slow_frac` of the descent."""
+        q = state.get_q()
+        r1 = pc.plan_pose(list(map(float, q)), list(map(float, pregrasp)) + down, max_attempts=14)
+        if not r1.get("success"):
+            return None
+        r2 = pc.plan_pose([float(x) for x in r1["trajectory"][-1]], list(map(float, grasp)) + down, max_attempts=14)
+        if not r2.get("success"):
+            return None
+        p1 = np.array(r1["trajectory"]); p2 = np.array(r2["trajectory"])
+        # cap the approach speed to cuRobo's torque-FEASIBLE native peak (never speed past its plan);
+        # forcing a higher flat peak races motor-cmd past feedback -> following-error power-off.
+        nap = float(np.degrees(np.max(np.abs(np.diff(p1, axis=0))) / r1["dt"])) if len(p1) > 1 else v_app_deg
+        v_app_eff = min(v_app_deg, 0.9 * nap)
+        path = np.vstack([p1, p2[1:]]); junc = len(p1) - 1
+        vc = np.radians(v_contact_deg) if v_contact_deg is not None else None
+        traj, junc_t = _retime(path, junc, np.radians(v_app_eff), np.radians(v_des_deg), dt_ref, ramp,
+                               v_end=vc, end_frac=slow_frac)
+        traj = fix_j6(traj)
+        peak = float(np.abs(np.diff(traj, axis=0)).max()) / dt_ref   # rad/s, per-joint
+        if np.degrees(peak) > 56.0:                                  # firmware ceiling guard
+            print(f"  WELD peak {np.degrees(peak):.0f}deg/s > ceiling; aborting"); return None
+        td = [list(map(float, rad_to_linuxcnc_deg(wp))) for wp in traj]
+        pub.publish(String(data=json.dumps({"trajectory": td, "traj_dt": dt_ref, "target_deg": td[-1],
+                                            "controller": "pid", **track})))
+        return {"n": len(traj), "junc_t": junc_t, "T": len(traj) * dt_ref, "peak_degs": np.degrees(peak)}
+
+    def send_weld_return(lift_xyz, target_vel, dt_ref, ramp):
+        """ONE velocity-continuous return: current -> lift(non-zero v via-point) -> base(decel-to-rest).
+        `target_vel` is the desired PER-JOINT peak (deg/s); the welded path is uniformly re-timed to hit
+        it, capped to cuRobo's torque-feasible native peak, and run with a gentle accel ramp."""
+        q = state.get_q()
+        r1 = pc.plan_pose(list(map(float, q)), list(map(float, lift_xyz)) + down, max_attempts=14)
+        if not r1.get("success"):
+            return False
+        r2 = pc.plan_joint([float(x) for x in r1["trajectory"][-1]], list(map(float, C.BASE_Q)))
+        if not r2.get("success"):
+            return False
+        p1 = np.array(r1["trajectory"]); p2 = np.array(r2["trajectory"])
+        nmv = float(np.degrees(np.max(np.abs(np.diff(p2, axis=0))) / r2["dt"])) if len(p2) > 1 else target_vel
+        path = np.vstack([p1, p2[1:]]); junc = len(p1) - 1
+        _rt, junc_t = _retime(path, junc, np.radians(10.0), np.radians(15.0), dt_ref, ramp)       # profile shape
+        traj = fix_j6(_rt)
+        peak0 = float(np.degrees(np.max(np.abs(np.diff(traj, axis=0)))) / dt_ref)                 # per-joint @ dt_ref
+        target = min(target_vel, 0.9 * nmv)                     # per-joint peak target, torque-capped
+        eff_dt = dt_ref * peak0 / max(target, 1.0)              # uniform re-time so per-joint peak == target
+        td = [list(map(float, rad_to_linuxcnc_deg(wp))) for wp in traj]
+        pub.publish(String(data=json.dumps({"trajectory": td, "traj_dt": eff_dt, "target_deg": td[-1],
+                                            "controller": "pid", "ramp_time": 0.35, "pos_gain": 1.0, "vff_scale": 1.0})))
+        dur = len(traj) * eff_dt; t0 = time.time(); dev = 99.0
+        while time.time() - t0 < dur + 2.0:                      # poll until settled (don't false-fail on follow-lag)
+            rclpy.spin_once(node, timeout_sec=0.02)
+            if time.time() - t0 > dur - 0.3:
+                dev = float(np.degrees(np.abs(state.get_q()[:6] - C.BASE_Q)).max())
+                if dev < 6.0:
+                    break
+        print(f"  weld-return: {len(traj)} wpts ~{dur:.1f}s, lift@{junc_t*eff_dt/dt_ref:.1f}s, "
+              f"peak {target:.0f}deg/s (native {nmv:.0f}), final dev {dev:.1f}deg {'OK' if dev < 8 else 'INCOMPLETE'}")
+        return dev < 8.0
+
+    def send_weld_place(lift_xyz, place_pose, target_vel, dt_ref, ramp):
+        """ONE velocity-continuous carry: current -> lift(non-zero v via-point) -> place pose (Cartesian,
+        decel-to-rest). Re-timed to a torque-feasible per-joint peak with a gentle accel ramp."""
+        q = state.get_q()
+        r1 = pc.plan_pose(list(map(float, q)), list(map(float, lift_xyz)) + down, max_attempts=14)
+        if not r1.get("success"):
+            return False
+        r2 = pc.plan_pose([float(x) for x in r1["trajectory"][-1]], list(map(float, place_pose)) + down, max_attempts=14)
+        if not r2.get("success"):
+            return False
+        p1 = np.array(r1["trajectory"]); p2 = np.array(r2["trajectory"])
+        nmv = float(np.degrees(np.max(np.abs(np.diff(p2, axis=0))) / r2["dt"])) if len(p2) > 1 else target_vel
+        path = np.vstack([p1, p2[1:]]); junc = len(p1) - 1
+        _rt, junc_t = _retime(path, junc, np.radians(10.0), np.radians(15.0), dt_ref, ramp)
+        traj = fix_j6(_rt)
+        peak0 = float(np.degrees(np.max(np.abs(np.diff(traj, axis=0)))) / dt_ref)
+        target = min(target_vel, 0.9 * nmv); eff_dt = dt_ref * peak0 / max(target, 1.0)
+        td = [list(map(float, rad_to_linuxcnc_deg(wp))) for wp in traj]
+        pub.publish(String(data=json.dumps({"trajectory": td, "traj_dt": eff_dt, "target_deg": td[-1],
+                                            "controller": "pid", "ramp_time": 0.35, "pos_gain": 1.0, "vff_scale": 1.0})))
+        dur = len(traj) * eff_dt; t0 = time.time(); err = 99.0
+        while time.time() - t0 < dur + 2.0:
+            rclpy.spin_once(node, timeout_sec=0.02)
+            if time.time() - t0 > dur - 0.3:
+                err = float(np.linalg.norm(fk_T(state.get_q())[:3, 3] - np.array(place_pose)))
+                if err < 0.02:
+                    break
+        print(f"  weld-place: {len(traj)} wpts ~{dur:.1f}s, peak {target:.0f}deg/s (native {nmv:.0f}), "
+              f"tcp err {err*1000:.0f}mm {'OK' if err < 0.03 else 'INCOMPLETE'}")
+        return err < 0.03
+
     def send_hold():
         q = state.get_q(); d = list(map(float, rad_to_linuxcnc_deg(q)))
         pub.publish(String(data=json.dumps({"trajectory": [d, d], "traj_dt": 0.1, "target_deg": d,
@@ -194,8 +390,45 @@ def main():
         if r.get("success"):
             execute(state, pub, fix_j6(r["trajectory"]), r["dt"], "pid", 22.0, 3.0, "to-base", track=track)
 
+    def _save_rec(base, idx, jr, frames, marks, info):
+        import shutil
+        d = os.path.join(base, f"obj{idx:02d}")
+        if os.path.isdir(d):
+            shutil.rmtree(d)
+        fd = os.path.join(d, "frames"); os.makedirs(fd, exist_ok=True)
+        t0 = marks.get("approach") or (jr[0][0] if jr else (frames[0][0] if frames else 0.0))
+        if jr:
+            np.savez(os.path.join(d, "joints.npz"),
+                     t=np.array([r[0] for r in jr]) - t0,
+                     pos=np.array([r[1][:6] for r in jr], float),
+                     vel=np.array([r[2][:6] for r in jr], float))
+        with open(os.path.join(d, "frames.jsonl"), "w") as fh:
+            for k, (tf, cb, db, g) in enumerate(frames):
+                open(os.path.join(fd, f"{k:04d}_c.jpg"), "wb").write(cb)
+                open(os.path.join(fd, f"{k:04d}_d.jpg"), "wb").write(db)
+                fh.write(json.dumps({"idx": k, "t": tf - t0,
+                                     "gap": None if g is None else round(g, 4)}) + "\n")
+        json.dump({"marks": {k: v - t0 for k, v in marks.items()}, **info,
+                   "n_joint": len(jr), "n_frame": len(frames)},
+                  open(os.path.join(d, "meta.json"), "w"), indent=2)
+        print(f"  recorded -> {d}: {len(jr)} joint samples, {len(frames)} frames")
+
     try:
         to_base(); time.sleep(0.3)
+        # grab the plunger-dot template at rest (current lighting) for robust template tracking
+        if os.path.exists(args.blue_dot):
+            bd = np.load(args.blue_dot); cyx = bd["centroid"]; rr = mon.latest_rgbd()
+            if rr is not None and not np.isnan(cyx[0]):
+                rgb0 = rr[0]; cx, cyc = int(round(cyx[0])), int(round(cyx[1])); hw = 18
+                templ = cv2.cvtColor(rgb0[cyc - hw:cyc + hw, cx - hw:cx + hw], cv2.COLOR_RGB2GRAY)
+                sbox = [cx - 30, cyc - 50, cx + 30, cyc + 20]    # search strip extends UP (dot rises on contact)
+                mon.set_bluedot_template(templ, sbox, float(cyc))
+                print(f"blue-dot template {templ.shape} set; base_y={cyc}, search {sbox}, "
+                      f"contact when rise >= {args.blue_thresh:.0f}px")
+            else:
+                print("WARN: could not grab base frame for blue-dot template")
+        else:
+            print("WARN: no blue_dot_mask.npz — blue-dot contact disabled")
         objs = []
         for _ in range(args.detect_tries):
             Tbc = fk_T(state.get_q()) @ make_T(np.eye(3), [0, 0, C.CAM_TCP_Z_SHIFT]) @ C.T_TCP_CAM
@@ -206,7 +439,15 @@ def main():
             for o in detect_objects(rgb, depth, K, Tbc, segment, deproject_mask, args):
                 if all(np.linalg.norm(o["centroid"][:2] - a["centroid"][:2]) > 0.04 for a in objs):
                     objs.append(o)
-        print(f"detected {len(objs)} object(s)")
+        objs.sort(key=lambda o: -len(o["pts"]))                  # largest (most prominent) first
+        if args.detect_only:
+            print(f"=== {len(objs)} objects detected ===")
+            for j, o in enumerate(objs):
+                print(f"  [{j}] centre [{o['centroid'][0]:+.2f},{o['centroid'][1]:+.2f}] "
+                      f"h={o['height']*100:.0f}cm foot={o['foot']*100:.0f}cm flat={o['flatness']:.2f} n={o['n']}")
+            return
+        objs = objs[args.pick_index:args.pick_index + args.max_objects]
+        print(f"detected objects; touching {len(objs)} (largest-first, from index {args.pick_index})")
 
         for i, o in enumerate(objs):
             P = o["pts"]; cxy = o["centroid"][:2].copy()
@@ -218,55 +459,118 @@ def main():
             floor_z = surf - args.max_descend         # HARD safety floor (backstop only)
             print(f"\n== object {i+1}: centre [{cxy[0]:.3f},{cxy[1]:.3f}] surf_est={surf:.3f} ==")
 
-            # PHASE 1: approach to the 2 cm standoff (blocking)
-            if not goto([cxy[0], cxy[1], surf + args.standoff], f"approach{i}", args.v_approach):
-                continue
-            # PHASE 2: read the CALIBRATED gap (reliable at this close range) -> surface; dome baseline
-            time.sleep(0.3)
-            gs, by = [], []
-            for _ in range(15):
-                g, _ = mon.latest_gap(); c, dy = mon.latest_cupd()
-                if g is not None:
-                    gs.append(g)
-                if dy is not None:
-                    by.append(dy)
-                time.sleep(0.04)
-            if len(gs) < 5:
-                print("  no gap; skipping"); continue
-            gapm = float(np.median(gs)); tcpz = float(fk_T(state.get_q())[2, 3])
-            surf_cal = tcpz - (args.cal_a * gapm + args.cal_b)
-            base_domey = float(np.median(by)) if by else None
-            floor_z = max(0.015, surf_cal - 0.012)                # safety vs the CALIBRATED surface
-            target = max(floor_z, surf_cal - args.margin)         # linear target, bounded compression
-            print(f"  gap={gapm*1000:.0f}mm -> surf_cal={surf_cal:.3f}; linear descent to {target:.3f} "
-                  f"(margin {args.margin*1000:.0f}mm)")
-            # PHASE 3: ONE smooth linear decel-to-rest descent (from rest -> no overshoot, gentle),
-            # camera MONITORS the contact point (gap->0 / dome shift) during the motion.
-            if not send_descent_nb([cxy[0], cxy[1], target], args.v_touch):
-                print("  descent plan FAILED"); continue
-            contact_z = None; last_print = 0; t_start = time.time()
-            while time.time() - t_start < 20.0:
+            standoff_z = surf + args.standoff
+            target = surf - args.margin                           # DETECTION surface (reliable interior median)
+            floor_abs = max(0.012, surf - args.max_descend)       # absolute safety backstop
+            print(f"\n== object {i+1}: centre [{cxy[0]:.3f},{cxy[1]:.3f}] surf_est={surf:.3f} "
+                  f"-> target {target:.3f} ==")
+
+            # ONE velocity-continuous WELD: current -> pregrasp(non-zero v) -> expected grasp(decel-to-rest).
+            # The pregrasp is a true via-point (no rest-to-rest stop); RGBD then fine-tunes the endpoint
+            # via the gap-contact HOLD during the slow descent.
+            marks = {}
+            if args.record:
+                jrec.clear(); jrec_on["v"] = True; mon.start_rec()           # RECORD pregrasp+contact
+            marks["approach"] = t_send = time.time()
+            wd = send_weld_descent([cxy[0], cxy[1], standoff_z], [cxy[0], cxy[1], target],
+                                   args.v_approach, args.v_des, args.weld_dt, args.weld_ramp,
+                                   v_contact_deg=args.v_contact, slow_frac=args.slow_frac)
+            if wd is None:
+                jrec_on["v"] = False; mon.stop_rec(); print("  weld plan FAILED"); continue
+            marks["pregrasp"] = t_send + wd["junc_t"]                # via-point pass-through time (non-zero v)
+            print(f"  weld: {wd['n']} wpts, ~{wd['T']:.1f}s, pregrasp@{wd['junc_t']:.1f}s, "
+                  f"peak {wd['peak_degs']:.0f}deg/s")
+            # (3) ride it down; gap is LOG-ONLY + a slow-overshoot safety stop if contact is seen
+            #     well above target (object taller than detection thought).
+            print("  welded decel-to-rest descent (gap = log/safety only):")
+            contact_z = None; last_print = 0; t0 = time.time(); zhist = collections.deque(maxlen=8)
+            blue_base2 = None                                    # blue-dot baseline re-captured at gate-open
+            while time.time() - t0 < 25.0:
                 rclpy.spin_once(node, timeout_sec=0.02)
-                g, _ = mon.latest_gap(); c, dy = mon.latest_cupd()
-                q = state.get_q(); z = float(fk_T(q)[2, 3]) if q is not None else 9.0
-                shift = abs(dy - base_domey) if (dy is not None and base_domey is not None) else 0.0
-                now = time.time()
-                if contact_z is None and ((g is not None and g <= 0.003) or shift >= args.dome_shift):
-                    contact_z = z
-                    print(f"  >> CONTACT (camera) at z={z:.3f}  gap={'--' if g is None else f'{g*1000:.0f}mm'}  "
-                          f"domeshift={shift:.1f}px")
-                if now - last_print > 0.25:
-                    print(f"    z={z:.3f}  gap={'--' if g is None else f'{g*1000:.0f}mm'}  domeshift={shift:+.1f}px")
-                    last_print = now
-                if abs(z - target) < 0.0015:
-                    break
+                gap, _ = mon.latest_gap(); q = state.get_q()
+                z = float(fk_T(q)[2, 3]) if q is not None else 9.0
+                now = time.time(); zhist.append((now, z)); vz = 0.0
+                if len(zhist) >= 4 and zhist[-1][0] > zhist[0][0]:
+                    vz = max(0.0, (zhist[0][1] - zhist[-1][1]) / (zhist[-1][0] - zhist[0][0]))
+                bluey, _ = mon.latest_bluey()
+                past_pregrasp = now >= marks.get("pregrasp", now) and z < standoff_z + 0.012
+                if past_pregrasp and bluey is not None and blue_base2 is None:
+                    blue_base2 = bluey                                          # re-baseline (no contact yet)
+                dy2 = (blue_base2 - bluey) if (blue_base2 is not None and bluey is not None) else None
+                # blue-dot plunger rise is the ONLY contact trigger (gap under-reads near contact and
+                # false-fires above the object; it stays as a log signal only). Endpoint + floor = fallback.
+                blue_hit = dy2 is not None and dy2 >= args.blue_thresh
+                if past_pregrasp and contact_z is None and blue_hit:
+                    contact_z = z; marks["contact"] = time.time()
+                    send_hold(); print(f"  >> CONTACT (blue-dot {dy2:+.1f}px) HOLD at z={z:.3f} "
+                                       f"vz={vz*1000:.0f}mm/s"); break
+                if now - last_print > 0.2:
+                    print(f"    z={z:.3f}  vz={vz*1000:.0f}mm/s  gap={'--' if gap is None else f'{gap*1000:.0f}mm'}  "
+                          f"blue_dy={'--' if dy2 is None else f'{dy2:+.1f}px'}"); last_print = now
+                if abs(z - target) < 0.0015 and vz < 0.0015:                   # FALLBACK: decel-to-rest floor
+                    print("  reached detection target (no gap-contact)"); break
+                if z <= floor_abs + 1e-3:
+                    send_hold(); print("  hit hard floor"); break
                 time.sleep(0.01)
             z = float(fk_T(state.get_q())[2, 3])
-            comp = (contact_z - z) * 1000 if contact_z is not None else None
-            print(f"  ended z={z:.3f}; contact_z={contact_z}; cup compression ~"
-                  f"{'?' if comp is None else f'{comp:.1f}mm'}")
-            time.sleep(args.dwell)
-            goto([cxy[0], cxy[1], surf + args.standoff + 0.03], f"lift{i}", 10.0)
+            print(f"  ended z={z:.3f}; contact_z(gap)={contact_z}")
+            if args.record:                                    # optional: record + save the contact settle
+                tdw = time.time()
+                while time.time() - tdw < args.post_dwell:
+                    rclpy.spin_once(node, timeout_sec=0.02)
+                jrec_on["v"] = False; frames = mon.stop_rec()
+                _save_rec(args.rec_dir, i, jrec, frames, marks, dict(
+                    surf=float(surf), target=float(target),
+                    contact_z=(None if contact_z is None else float(contact_z)),
+                    cxy=[float(cxy[0]), float(cxy[1])]))
+            Tc = fk_T(state.get_q())
+            if args.pick_place:
+                # brief settle of the contact HOLD, then press from REST to the seal depth (poll until reached)
+                tset = time.time()
+                while time.time() - tset < 0.35:
+                    rclpy.spin_once(node, timeout_sec=0.02)
+                Tc = fk_T(state.get_q())
+                if args.grasp_press > 0:
+                    pz = float(Tc[2, 3]) - args.grasp_press
+                    send_descent_nb([cxy[0], cxy[1], pz], 1.2)
+                    tp = time.time()
+                    while time.time() - tp < 1.6:
+                        rclpy.spin_once(node, timeout_sec=0.02)
+                        if abs(float(fk_T(state.get_q())[2, 3]) - pz) < 0.0015:
+                            break
+                    Tc = fk_T(state.get_q()); print(f"  grasp-press -> z={float(Tc[2, 3]):.3f}")
+                # GRASP: suction ON (cup pressed on the object), seal dwell = the only v=0
+                suction_test.set_pin(True, args.suction_host, args.suction_user); print("  suction ON; sealing")
+                ts = time.time()
+                while time.time() - ts < args.seal_dwell:
+                    rclpy.spin_once(node, timeout_sec=0.02)
+                # COLLISION-AWARE place: the carried object hangs ~(contact_z - table) below the tip,
+                # so lift it straight up CLEAR of the box rim, carry it over the box at that height, and
+                # release above the rim -> the object volume can't clip the box.
+                down_extent = max(0.02, float(Tc[2, 3]) - args.table_z)
+                rim_z = box_xyz[2] + args.box_size
+                transit_z = min(0.42, rim_z + args.release_clear + down_extent)
+                lift_xyz = [float(Tc[0, 3]), float(Tc[1, 3]), transit_z]          # straight up, clear of rim
+                place_pose = [box_xyz[0], box_xyz[1], transit_z]                  # carry over the box, high
+                print(f"  carried object hangs ~{down_extent*100:.0f}cm -> transit/release z={transit_z:.2f} "
+                      f"(rim {rim_z:.2f})")
+                # WELDED carry: contact -> lift(non-zero v) -> place pose over the bin
+                send_weld_place(lift_xyz, place_pose, args.place_vel, args.weld_dt, args.weld_ramp)
+                # RELEASE over the bin, let it drop
+                suction_test.set_pin(False, args.suction_host, args.suction_user); print("  released")
+                tr = time.time()
+                while time.time() - tr < 0.3:
+                    rclpy.spin_once(node, timeout_sec=0.02)
+                # WELDED return to base from the place pose
+                Tp = fk_T(state.get_q())
+                send_weld_return([float(Tp[0, 3]), float(Tp[1, 3]), min(0.32, float(Tp[2, 3]) + 0.05)],
+                                 args.return_vel, args.weld_dt, args.weld_ramp)
+            else:
+                # touch-only: WELDED return current -> lift(non-zero v) -> base (torque-feasible)
+                lift_xyz = [float(Tc[0, 3]), float(Tc[1, 3]), min(0.24, float(Tc[2, 3]) + 0.10)]
+                if not send_weld_return(lift_xyz, args.return_vel, args.weld_dt, args.weld_ramp):
+                    print("  weld-return failed -> segmented fallback")
+                    goto(lift_xyz, "lift", 12.0); to_base()
 
         to_base()
     finally:

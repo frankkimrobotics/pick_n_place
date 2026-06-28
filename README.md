@@ -64,30 +64,42 @@ python3 pick_and_place/real_multi.py --target "orange juice carton" --near 0.45,
 
 ---
 
-## B. Touch / contact (no suction)
+## B. Welded touch + blue-dot pick-and-place (`servo_touch.py`)
 
-Bring the cup gently onto an object's centre. `touch_objects.py` (open-loop, welded
-approach) and `servo_touch.py` (vision-corrected, calibration-free surface).
+The main real-robot controller. Every phase is **velocity-continuous** ("welded") — the robot
+never decelerates to rest between phases except the suction-seal dwell. Contact is detected by
+a **blue marker dot** on the cup's spring-loaded plunger, which physically rises when the cup
+touches an object (tracked by normalized template matching, robust to shadow).
 
 ```
- base → DETECT object centre (interior top-face median surface — avoids edge-float bias)
-      → approach to 2 cm standoff
-      → measure CALIBRATED gap at the standoff   (gap = median depth[dome top-curve ring]
-      │     − median depth[cup rim];  true ≈ 0.78·gap + 10.5 mm)        → surface z
-      → ONE smooth decel-to-rest linear descent to  surf − margin
-      │     (stop is planned in → no lag overshoot;  the ~1 cm soft-cup spring = compliance)
-      → camera MONITORS the contact point (gap → 0 / dome image-shift)
+ base → ONE welded descent: current → pregrasp (passed at NON-ZERO velocity, no stop)
+      │   → fast descent → slow last stretch → decel-to-rest at the detected surface
+      → CONTACT = blue-dot plunger rises ≥ thresh (re-baselined at gate-open; gap is log-only)
+   [pick-and-place mode]
+      → grasp-press (settle, then press from rest to seal) → SUCTION ON → seal dwell  ← only v=0
+      → WELDED carry: lift the object CLEAR of the box rim → over the box → release above rim
+      │   (collision-aware: transit z = rim + clearance + object-hang, so the carried object
+      │    can't clip the box; the planner has no runtime attach, so this is geometric routing)
+      → WELDED return to base
 ```
 
-Why this shape (hard lessons, see memory `real-touch-controller.md`): the controller has a
-~0.8 s follow-lag, so any **vision-HOLD mid-descent overshoots ~1 cm** ("too hard"); the
-**gap under-reads in the last ~1.5 cm**; and there is **no force/vacuum sensor** — only the
-soft cup's spring. The robust recipe is therefore *measure → decel-to-rest to a target*, not
-*stop-on-contact*.
+**Hard-won constraints** (see memory `real-touch-controller.md` / `next-welded-trajectories.md`):
+- ~0.8 s follow-lag → a vision-HOLD on a *fast* descent overshoots; the welded descent is
+  fast then **slows to ~2 °/s in the last stretch** so the blue-dot HOLD is gentle.
+- cuRobo plans **rest-to-rest** & is **torque-aware** — welds are post-hoc re-timed to a
+  non-zero junction velocity, and the lift/return/carry are **capped to cuRobo's native peak**
+  (forcing a flat 55 °/s races motor-cmd past feedback → following-error power-off; ~20 °/s is
+  the torque-feasible ceiling lifting against gravity).
+- the **gap under-reads / false-fires** near contact → blue-dot is the only contact trigger.
 
 ```bash
-PYTHONPATH=~/librealsense/build/release python3 pick_and_place/servo_touch.py \
-    --standoff 0.02 --margin 0.004 --v-touch 2
+# touch only (records joints+RGBD with --record; plot with plot_touch.py)
+PYTHONPATH=~/librealsense/build/release python3 pick_and_place/servo_touch.py --record
+# full welded pick-and-place of every object into the bin at [0.1,0.4]
+python3 pick_and_place/servo_touch.py --pick-place --max-objects 10 --max-foot 0.25 \
+    --suction-host 10.0.0.27
+# segment the blue marker dot first (once): writes outputs/blue_dot_mask.npz
+python3 pick_and_place/blue_dot_mask.py
 ```
 
 ---
@@ -155,7 +167,9 @@ released_above_rim · placed.
 | `suction_test.py` | toggle the suction HAL pin (`pro600.digital_out00`), no motion |
 | **touch / calibration** | |
 | `touch_objects.py` | welded approach → touch object centres (no suction) |
-| `servo_touch.py` | vision touch: calibrated-gap surface → decel-to-rest; cup-mask `GapMonitor` |
+| **`servo_touch.py`** | **welded touch + blue-dot contact + suction pick-and-place** (weld descent/return/carry, torque-feasible, collision-aware place); `GapMonitor` streams gap + plunger-dot template |
+| `blue_dot_mask.py` | segment the blue plunger marker below the cup dome (contact-signal ROI) |
+| `plot_touch.py` | joint pos/vel profiles + time-aligned RGBD filmstrip for a recorded episode |
 | `servo_diag.py` | gap-vs-distance diagnostic at several annulus offsets/heights |
 | `calib_handeye.py` | eye-in-hand `T_TCP_CAM` recalibration (ChArUco + `calibrateHandEye`) |
 | `aruco_touch.py` | hand-eye validation: touch each detected ArUco marker |
