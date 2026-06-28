@@ -1,0 +1,8 @@
+# debug/run artifacts (large)
+outputs/
+# python
+__pycache__/
+*.pyc
+*.pyo
+# backups
+*.bak_*
