@@ -27,7 +27,7 @@ MJ_DIR = os.path.join(C.OUT_DIR, "mujoco")
 MESH_DIR = os.path.join(MJ_DIR, "meshes")
 # robot links that carry a visual mesh (base_link is the static mount at origin)
 VIS_LINKS = ["base", "link1", "link2", "link3", "link4", "link5", "link6",
-             "suction_cup"]
+             "camera_mount", "suction_cup"]
 
 
 def bake_link_meshes():
