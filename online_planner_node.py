@@ -37,6 +37,8 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from builtin_interfaces.msg import Duration as DurationMsg
 
 import sys, os
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -69,7 +71,9 @@ class OnlinePlanner(Node):
         self.welder = TrajectoryWelder(dof=6, fine_dt=self.fine_dt)   # mirror of controller
         self.cache = None            # (fine_plan_rad, t0_abs) for chunk mode
         self.create_subscription(JointState, "/joint_states", self._on_js, 20)
-        self.pub = self.create_publisher(String, "/mycobot/cmd/move", 10)
+        self.pub = self.create_publisher(String, args.chunk_topic, 10)        # to controller
+        self.pub_log = self.create_publisher(JointTrajectory, "/planner/chunks", 10)  # timestamped log
+        self._infer = 0
         self.goal_pose = [float(x) for x in args.goal.split(",")] + DOWN if args.goal else None
         self.goal_q = [float(x) for x in args.goal_joint.split(",")] if args.goal_joint else None
         self._stop = threading.Event()
@@ -168,6 +172,18 @@ class OnlinePlanner(Node):
         msg = {"trajectory": deg, "traj_dt": self.fine_dt, "target_deg": deg[-1],
                "controller": "pid", "weld": True, "t_anchor": float(t_anchor)}
         self.pub.publish(String(data=json.dumps(msg)))
+        # timestamped log of ALL chunk waypoints for this inference
+        jt = JointTrajectory()
+        jt.header.stamp = self.get_clock().now().to_msg()
+        jt.joint_names = list(JOINT_NAMES)
+        for i, w in enumerate(chunk_rad):
+            pt = JointTrajectoryPoint()
+            pt.positions = [float(x) for x in w]
+            tf = i * self.fine_dt
+            pt.time_from_start = DurationMsg(sec=int(tf), nanosec=int((tf % 1) * 1e9))
+            jt.points.append(pt)
+        self.pub_log.publish(jt)
+        self._infer += 1
 
     def _publish_hold(self, q, t_anchor):
         self.welder.weld(np.vstack([q, q]), self.fine_dt, t_anchor, blend=self.a.blend)
@@ -181,6 +197,9 @@ class OnlinePlanner(Node):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["chunk", "mpc"], default="chunk")
+    ap.add_argument("--chunk-topic", default="/mycobot/cmd/move",
+                    help="where to publish weld chunks (sim: /mycobot/cmd/move; "
+                         "hardware via weld-controller: /planner/weld_chunks)")
     ap.add_argument("--goal", default=None, help="goal tcp pose x,y,z (cup-down)")
     ap.add_argument("--goal-joint", default=None, help="goal joint config (6 rad)")
     ap.add_argument("--plan-hz", type=float, default=10.0)
