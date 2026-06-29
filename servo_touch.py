@@ -500,6 +500,13 @@ def main():
         objs = objs[args.pick_index:args.pick_index + args.max_objects]
         print(f"detected objects; touching {len(objs)} (largest-first, from index {args.pick_index})")
 
+        if ebag is not None:                              # ONE rosbag for the whole run
+            try:
+                run_uri = os.path.join(args.bag_dir, f"run_{time.strftime('%Y%m%d_%H%M%S')}")
+                ebag.start(run_uri, frame_getter=mon.latest_rgbd)
+            except Exception as e:
+                print(f"  [bag] start failed ({e}); continuing without recording"); ebag = None
+
         for i, o in enumerate(objs):
             P = o["pts"]; cxy = o["centroid"][:2].copy(); flat_ok = False
             nrm_v = np.array([0.0, 0.0, 1.0])                     # descent direction (vertical unless --angled)
@@ -513,7 +520,15 @@ def main():
                         if nn[2] < 0:
                             nn = -nn                              # outward (up-ish)
                         if args.angled:
-                            nrm_v = nn                            # approach along the face normal
+                            z = np.array([0.0, 0.0, 1.0])
+                            ang = float(np.degrees(np.arccos(np.clip(nn @ z, -1.0, 1.0))))
+                            if ang > 45.0 and np.linalg.norm(np.cross(z, nn)) > 1e-6:
+                                ax = np.cross(z, nn); ax = ax / np.linalg.norm(ax)
+                                th = np.radians(45.0)        # tilt vertical toward the normal by 45deg max
+                                nn = z * np.cos(th) + np.cross(ax, z) * np.sin(th)
+                                nn = nn / np.linalg.norm(nn)
+                                print(f"  approach normal clamped to 45deg from vertical (was {ang:.0f}deg)")
+                            nrm_v = nn                            # approach along the (<=45deg) face normal
                         print(f"  flat suction point [{cxy[0]:.3f},{cxy[1]:.3f}] normal={np.round(nrm_v,2).tolist()}")
                 except Exception as e:
                     print(f"  flat-target failed ({e}); using centroid")
@@ -526,12 +541,13 @@ def main():
             # normal-aligned approach: cup oriented along -normal; pregrasp/grasp offset along the normal.
             # (vertical normal -> identical to the straight-down path; z-targets are the angled points' z.)
             sp3 = np.array([cxy[0], cxy[1], surf])
-            q_n = list(R_to_quat_wxyz(R_from_two_axes(-nrm_v)))
-            pregrasp3 = (sp3 + args.standoff * nrm_v).tolist()
-            grasp3 = (sp3 - args.margin * nrm_v).tolist()
-            standoff_z = pregrasp3[2]
-            target = grasp3[2]
-            floor_abs = max(0.012, float((sp3 - args.max_descend * nrm_v)[2]))
+            def _approach(nrm):                                  # pose set for an approach normal
+                qn = list(R_to_quat_wxyz(R_from_two_axes(-nrm)))
+                pg = (sp3 + args.standoff * nrm).tolist()
+                gr = (sp3 - args.margin * nrm).tolist()
+                fl = max(0.012, float((sp3 - args.max_descend * nrm)[2]))
+                return qn, pg, gr, pg[2], gr[2], fl
+            q_n, pregrasp3, grasp3, standoff_z, target, floor_abs = _approach(nrm_v)
             print(f"\n== object {i+1}: centre [{cxy[0]:.3f},{cxy[1]:.3f}] surf={surf:.3f} "
                   f"normal={np.round(nrm_v,2).tolist()} -> grasp z {target:.3f} ==")
 
@@ -541,16 +557,24 @@ def main():
             marks = {}
             if args.record:
                 jrec.clear(); jrec_on["v"] = True; mon.start_rec()           # RECORD pregrasp+contact
-            if ebag is not None:                                             # one rosbag per episode
-                ebag.start(os.path.join(args.bag_dir, f"obj_{i:02d}"), frame_getter=mon.latest_rgbd)
-                ebag.write_phase("pregrasp")
+            if ebag is not None:                                             # mark this object in the run bag
+                ebag.write_phase(f"object_{i}_pregrasp")
             marks["approach"] = t_send = time.time()
             wd = send_weld_descent(pregrasp3, grasp3,
                                    args.v_approach, args.v_des, args.weld_dt, args.weld_ramp,
                                    v_contact_deg=args.v_contact, slow_frac=args.slow_frac, quat=q_n)
+            if wd is None and args.angled and abs(float(nrm_v[2])) < 0.999:
+                # angled (tilted) grasp pose unreachable -> fall back to a VERTICAL approach
+                print("  angled weld plan FAILED -> retrying VERTICAL approach")
+                nrm_v = np.array([0.0, 0.0, 1.0])
+                q_n, pregrasp3, grasp3, standoff_z, target, floor_abs = _approach(nrm_v)
+                marks["approach"] = t_send = time.time()
+                wd = send_weld_descent(pregrasp3, grasp3,
+                                       args.v_approach, args.v_des, args.weld_dt, args.weld_ramp,
+                                       v_contact_deg=args.v_contact, slow_frac=args.slow_frac, quat=q_n)
             if wd is None:
                 jrec_on["v"] = False; mon.stop_rec()
-                if ebag is not None: ebag.stop()
+                if ebag is not None: ebag.write_phase(f"object_{i}_plan_failed")
                 print("  weld plan FAILED"); continue
             marks["pregrasp"] = t_send + wd["junc_t"]                # via-point pass-through time (non-zero v)
             print(f"  weld: {wd['n']} wpts, ~{wd['T']:.1f}s, pregrasp@{wd['junc_t']:.1f}s, "
@@ -645,7 +669,7 @@ def main():
                     grasp_q = list(map(float, state.get_q()))          # config holding the object right now
                     ar = pc.rpc({"type": "attach", "grasp_q": grasp_q,
                                  "dims": [ex, ey, ez], "obj_pose": obj_pose})
-                    place_z = min(box_xyz[2] + args.release_clear + ez, rim_z - 0.01)   # object bottom ~floor
+                    place_z = rim_z - 0.01   # dip only to the rim; deeper drives the wrist/camera into the box
                     place_pose = [box_xyz[0], box_xyz[1], float(place_z)]
                     lift_xyz = [float(Tc[0, 3]), float(Tc[1, 3]), min(0.42, rim_z + 0.06)]   # clear the rim first
                     print(f"  attached obj dims={[round(ex,3),round(ey,3),round(ez,3)]} "
@@ -682,10 +706,12 @@ def main():
                     print("  weld-return failed -> segmented fallback")
                     goto(lift_xyz, "lift", 12.0); to_base()
             if ebag is not None:
-                ebag.stop()                                  # close this episode's rosbag
+                ebag.write_phase(f"object_{i}_done")
 
         to_base()
     finally:
+        if ebag is not None:
+            ebag.stop()                                  # close the single run rosbag
         mon.stop_evt.set(); mon.join(timeout=3)
         print("== done ==")
         rclpy.shutdown()
