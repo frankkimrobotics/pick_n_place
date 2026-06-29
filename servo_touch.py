@@ -184,8 +184,15 @@ def main():
     ap.add_argument("--place", default="0.10,0.40,0.30", help="release pose x,y,z (cup tip over the bin)")
     ap.add_argument("--box", default="0.10,0.40,0.0", help="place box bottom-centre x,y,z")
     ap.add_argument("--box-size", type=float, default=0.25, help="box height; rim_z = box_z + this")
+    ap.add_argument("--box-fp", type=float, default=0.25, help="box inner footprint width (m, for planner walls)")
     ap.add_argument("--table-z", type=float, default=0.015, help="table top height (for carried-object hang extent)")
     ap.add_argument("--release-clear", type=float, default=0.05, help="object bottom clears the rim by this at release")
+    ap.add_argument("--planner-place", action="store_true",
+                    help="planner-side carried-object collision: attach the grasped object to the cuRobo "
+                         "planner + add the box walls as world obstacles, so the place path natively routes "
+                         "the held object over the rim and lowers it INTO the box (replaces geometric routing)")
+    ap.add_argument("--box-wall", type=float, default=0.01, help="box wall thickness for planner obstacles (m)")
+    ap.add_argument("--box-margin", type=float, default=0.01, help="bbox inflation added to the held object (m)")
     ap.add_argument("--place-vel", type=float, default=20.0, help="welded place-move per-joint peak (deg/s)")
     ap.add_argument("--seal-dwell", type=float, default=0.5, help="suction-seal dwell at contact (s, the only v=0)")
     ap.add_argument("--record", action="store_true", help="record per-object RGBD+joints (adds save time; off for fast cycle)")
@@ -239,6 +246,22 @@ def main():
             jrec.append((time.time(), [float(p) for p in msg.position], [float(v) for v in msg.velocity]))
     node.create_subscription(JointState, "/mycobot/drive_feedback", _on_drive, 50)
     down = list(R_to_quat_wxyz(R_from_two_axes(np.array([0, 0, -1.0]))))
+
+    def box_walls(bxyz, fp, height, t):
+        """5 cuboids (floor + 4 walls, OPEN top) approximating the place box as
+        planner world obstacles. bxyz = bottom-centre; fp = inner footprint; t = wall."""
+        bx, by, bz = bxyz; h = fp / 2.0
+        return [
+            {"name": "box_floor", "dims": [fp + 2*t, fp + 2*t, t], "pose": [bx, by, bz - t/2, 1, 0, 0, 0]},
+            {"name": "box_xm", "dims": [t, fp + 2*t, height], "pose": [bx - (h + t/2), by, bz + height/2, 1, 0, 0, 0]},
+            {"name": "box_xp", "dims": [t, fp + 2*t, height], "pose": [bx + (h + t/2), by, bz + height/2, 1, 0, 0, 0]},
+            {"name": "box_ym", "dims": [fp, t, height], "pose": [bx, by - (h + t/2), bz + height/2, 1, 0, 0, 0]},
+            {"name": "box_yp", "dims": [fp, t, height], "pose": [bx, by + (h + t/2), bz + height/2, 1, 0, 0, 0]},
+        ]
+
+    if args.planner_place:                       # register the box walls with the planner once
+        wr = pc.rpc({"type": "set_world", "cuboids": box_walls(box_xyz, args.box_fp, args.box_size, args.box_wall)})
+        print(f"  planner-place: box walls -> world ({wr.get('names')})")
 
     def fk_T(q):
         r = pc.rpc({"type": "fk", "q": list(map(float, q))})
@@ -579,20 +602,40 @@ def main():
                 ts = time.time()
                 while time.time() - ts < args.seal_dwell:
                     rclpy.spin_once(node, timeout_sec=0.02)
-                # COLLISION-AWARE place: the carried object hangs ~(contact_z - table) below the tip,
-                # so lift it straight up CLEAR of the box rim, carry it over the box at that height, and
-                # release above the rim -> the object volume can't clip the box.
-                down_extent = max(0.02, float(Tc[2, 3]) - args.table_z)
+                # COLLISION-AWARE place. Two modes:
                 rim_z = box_xyz[2] + args.box_size
-                transit_z = min(0.42, rim_z + args.release_clear + down_extent)
-                lift_xyz = [float(Tc[0, 3]), float(Tc[1, 3]), transit_z]          # straight up, clear of rim
-                place_pose = [box_xyz[0], box_xyz[1], transit_z]                  # carry over the box, high
-                print(f"  carried object hangs ~{down_extent*100:.0f}cm -> transit/release z={transit_z:.2f} "
-                      f"(rim {rim_z:.2f})")
-                # WELDED carry: contact -> lift(non-zero v) -> place pose over the bin
+                if args.planner_place:
+                    # PLANNER-SIDE: attach the grasped object's bbox (extended down to the table, since the
+                    # camera sees only its top) to the cuRobo planner; with the box walls already in the world,
+                    # cuRobo natively routes the held object OVER the rim and lowers it INTO the box.
+                    P = o["pts"]; bmin = P.min(0); bmax = P.max(0)
+                    ex = float(bmax[0] - bmin[0]) + args.box_margin
+                    ey = float(bmax[1] - bmin[1]) + args.box_margin
+                    top = float(bmax[2]); bot = float(args.table_z)
+                    ez = max(0.02, top - bot); cz = (top + bot) / 2.0
+                    obj_pose = [float((bmin[0] + bmax[0]) / 2), float((bmin[1] + bmax[1]) / 2), cz, 1, 0, 0, 0]
+                    grasp_q = list(map(float, state.get_q()))          # config holding the object right now
+                    ar = pc.rpc({"type": "attach", "grasp_q": grasp_q,
+                                 "dims": [ex, ey, ez], "obj_pose": obj_pose})
+                    place_z = min(box_xyz[2] + args.release_clear + ez, rim_z - 0.01)   # object bottom ~floor
+                    place_pose = [box_xyz[0], box_xyz[1], float(place_z)]
+                    lift_xyz = [float(Tc[0, 3]), float(Tc[1, 3]), min(0.42, rim_z + 0.06)]   # clear the rim first
+                    print(f"  attached obj dims={[round(ex,3),round(ey,3),round(ez,3)]} "
+                          f"({ar.get('n_managers')} mgrs) -> place INTO box, tcp z={place_z:.2f} (rim {rim_z:.2f})")
+                else:
+                    # GEOMETRIC: lift straight up CLEAR of the rim, carry over the box, release above it.
+                    down_extent = max(0.02, float(Tc[2, 3]) - args.table_z)
+                    transit_z = min(0.42, rim_z + args.release_clear + down_extent)
+                    lift_xyz = [float(Tc[0, 3]), float(Tc[1, 3]), transit_z]      # straight up, clear of rim
+                    place_pose = [box_xyz[0], box_xyz[1], transit_z]              # carry over the box, high
+                    print(f"  carried object hangs ~{down_extent*100:.0f}cm -> transit/release z={transit_z:.2f} "
+                          f"(rim {rim_z:.2f})")
+                # WELDED carry: contact -> lift(non-zero v) -> place pose over/into the bin
                 send_weld_place(lift_xyz, place_pose, args.place_vel, args.weld_dt, args.weld_ramp)
                 # RELEASE over the bin, let it drop
                 suction_test.set_pin(False, args.suction_host, args.suction_user); print("  released")
+                if args.planner_place:
+                    pc.rpc({"type": "detach"}); print("  detached object from planner")
                 tr = time.time()
                 while time.time() - tr < 0.3:
                     rclpy.spin_once(node, timeout_sec=0.02)
