@@ -216,6 +216,13 @@ def main():
                     help="per-episode rosbags go here as obj_NN/")
     ap.add_argument("--bag-storage", default="mcap", choices=["mcap", "sqlite3"],
                     help="rosbag2 storage plugin (mcap preferred; auto-falls back to sqlite3)")
+    ap.add_argument("--stream", action="store_true",
+                    help="route motion through the online weld-controller (publish weld chunks to "
+                         "--chunk-topic) instead of one-shot cmd/move; the weld-controller welds "
+                         "consecutive pick-place segments into one continuous reference for robot_hal. "
+                         "Requires robot_weld_controller.py running. Default OFF (proven direct path).")
+    ap.add_argument("--chunk-topic", default="/planner/weld_chunks")
+    ap.add_argument("--stream-lead", type=float, default=0.10, help="weld anchor lead time (s)")
     args = ap.parse_args()
 
     import rclpy
@@ -245,6 +252,18 @@ def main():
     pc = PlannerClient(); rclpy.init(); node = rclpy.create_node("servo_touch")
     pub = node.create_publisher(String, "/mycobot/cmd/move", 10); state = RobotState(node)
     track = {"ramp_time": 0.15, "pos_gain": 1.0, "vff_scale": 1.0}
+    chunk_pub = node.create_publisher(String, args.chunk_topic, 10)
+
+    def publish_motion(cmd):
+        """--stream: hand the motion to the weld-controller as a weld chunk (it welds
+        consecutive segments + windows them to robot_hal). Else: direct cmd/move (proven)."""
+        if args.stream:
+            chunk_pub.publish(String(data=json.dumps(
+                {"trajectory": cmd["trajectory"], "traj_dt": cmd["traj_dt"],
+                 "target_deg": cmd["target_deg"], "weld": True,
+                 "t_anchor": time.time() + args.stream_lead})))
+        else:
+            pub.publish(String(data=json.dumps(cmd)))
     # joint recorder: /mycobot/drive_feedback carries measured position (deg) + velocity (deg/s) @50Hz
     jrec = []; jrec_on = {"v": False}
     def _on_drive(msg):
@@ -299,8 +318,8 @@ def main():
             return False
         traj = fix_j6(r["trajectory"]); sdt, _ = scale_traj(traj, r["dt"], vmax, 0.5)
         td = [list(map(float, rad_to_linuxcnc_deg(wp))) for wp in traj]
-        pub.publish(String(data=json.dumps({"trajectory": td, "traj_dt": sdt, "target_deg": td[-1],
-                                            "controller": "pid", **track})))
+        publish_motion({"trajectory": td, "traj_dt": sdt, "target_deg": td[-1],
+                        "controller": "pid", **track})
         return True
 
     def _retime(path, junc, v_app, v_des, dt_ref, ramp, v_end=None, end_frac=0.0):
@@ -353,8 +372,8 @@ def main():
         if np.degrees(peak) > 56.0:                                  # firmware ceiling guard
             print(f"  WELD peak {np.degrees(peak):.0f}deg/s > ceiling; aborting"); return None
         td = [list(map(float, rad_to_linuxcnc_deg(wp))) for wp in traj]
-        pub.publish(String(data=json.dumps({"trajectory": td, "traj_dt": dt_ref, "target_deg": td[-1],
-                                            "controller": "pid", **track})))
+        publish_motion({"trajectory": td, "traj_dt": dt_ref, "target_deg": td[-1],
+                        "controller": "pid", **track})
         return {"n": len(traj), "junc_t": junc_t, "T": len(traj) * dt_ref, "peak_degs": np.degrees(peak)}
 
     def send_weld_return(lift_xyz, target_vel, dt_ref, ramp):
@@ -377,8 +396,8 @@ def main():
         target = min(target_vel, 0.9 * nmv)                     # per-joint peak target, torque-capped
         eff_dt = dt_ref * peak0 / max(target, 1.0)              # uniform re-time so per-joint peak == target
         td = [list(map(float, rad_to_linuxcnc_deg(wp))) for wp in traj]
-        pub.publish(String(data=json.dumps({"trajectory": td, "traj_dt": eff_dt, "target_deg": td[-1],
-                                            "controller": "pid", "ramp_time": 0.35, "pos_gain": 1.0, "vff_scale": 1.0})))
+        publish_motion({"trajectory": td, "traj_dt": eff_dt, "target_deg": td[-1],
+                        "controller": "pid", "ramp_time": 0.35, "pos_gain": 1.0, "vff_scale": 1.0})
         dur = len(traj) * eff_dt; t0 = time.time(); dev = 99.0
         while time.time() - t0 < dur + 2.0:                      # poll until settled (don't false-fail on follow-lag)
             rclpy.spin_once(node, timeout_sec=0.02)
@@ -409,8 +428,8 @@ def main():
         peak0 = float(np.degrees(np.max(np.abs(np.diff(traj, axis=0)))) / dt_ref)
         target = min(target_vel, 0.9 * nmv); eff_dt = dt_ref * peak0 / max(target, 1.0)
         td = [list(map(float, rad_to_linuxcnc_deg(wp))) for wp in traj]
-        pub.publish(String(data=json.dumps({"trajectory": td, "traj_dt": eff_dt, "target_deg": td[-1],
-                                            "controller": "pid", "ramp_time": 0.35, "pos_gain": 1.0, "vff_scale": 1.0})))
+        publish_motion({"trajectory": td, "traj_dt": eff_dt, "target_deg": td[-1],
+                        "controller": "pid", "ramp_time": 0.35, "pos_gain": 1.0, "vff_scale": 1.0})
         dur = len(traj) * eff_dt; t0 = time.time(); err = 99.0
         while time.time() - t0 < dur + 2.0:
             rclpy.spin_once(node, timeout_sec=0.02)
@@ -424,8 +443,8 @@ def main():
 
     def send_hold():
         q = state.get_q(); d = list(map(float, rad_to_linuxcnc_deg(q)))
-        pub.publish(String(data=json.dumps({"trajectory": [d, d], "traj_dt": 0.1, "target_deg": d,
-                                            "controller": "pid", **track})))
+        publish_motion({"trajectory": [d, d], "traj_dt": 0.1, "target_deg": d,
+                        "controller": "pid", **track})
 
     def goto(xyz, label, vmax):
         q = state.get_q()
