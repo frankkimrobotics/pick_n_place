@@ -9,8 +9,15 @@
 >   grasp-press → suction (only v=0 = seal dwell) → **welded collision-aware carry** (object lifted
 >   clear of the box rim) → release → **welded return**. All torque-feasible (≤20 °/s, capped to
 >   cuRobo native — flat 55 °/s caused following-error power-offs). Ran a full table (16 objects).
-> - **Open:** planner-side attach of the carried object (currently geometric routing); flattest-top
->   suction selection; faster welds need the torque ceiling lifted.
+> - **S5 per-episode rosbag** — DONE (`episode_bag.py` + `servo_touch.py --bag`): one rosbag2 per
+>   episode (RGBD jpeg/16UC1 + `/joint_states` + `/joint_vel` + `/joint_cmd` + `/phase` + camera_info),
+>   mcap-preferred with sqlite3 auto-fallback. Unit-tested (write+`ros2 bag info` readback); needs a
+>   live pick run to validate against real frames/joints. **mcap plugin not installed** (using sqlite3).
+> - **Planner-side attach** — DONE (cuRobo `attached_object` link + attach/detach/set_world RPCs +
+>   `servo_touch --planner-place`); verified in planning (held object routes into an open box; far/tall
+>   bins can exceed cup-down reach). Milk-box hardware run: angled approach + attach worked, but the
+>   flat-target suction point missed the box laterally (use `--no-flat-target`, confirm `surf`).
+> - **Open:** flattest-top suction selection robustness; faster welds need the torque ceiling lifted.
 
 
 

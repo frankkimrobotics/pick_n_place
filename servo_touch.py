@@ -210,6 +210,12 @@ def main():
     ap.add_argument("--dwell", type=float, default=1.2)
     ap.add_argument("--rec-dir", default=os.path.join(C.OUT_DIR, "touch_rec"),
                     help="record joint pos/vel + RGBD frames per object here")
+    ap.add_argument("--bag", action="store_true",
+                    help="record ONE rosbag2 per episode (RGBD + joint pos/vel/cmd + phase) (S5)")
+    ap.add_argument("--bag-dir", default=os.path.join(C.OUT_DIR, "episodes"),
+                    help="per-episode rosbags go here as obj_NN/")
+    ap.add_argument("--bag-storage", default="mcap", choices=["mcap", "sqlite3"],
+                    help="rosbag2 storage plugin (mcap preferred; auto-falls back to sqlite3)")
     args = ap.parse_args()
 
     import rclpy
@@ -262,6 +268,19 @@ def main():
     if args.planner_place:                       # register the box walls with the planner once
         wr = pc.rpc({"type": "set_world", "cuboids": box_walls(box_xyz, args.box_fp, args.box_size, args.box_wall)})
         print(f"  planner-place: box walls -> world ({wr.get('names')})")
+
+    ebag = None                                  # per-episode rosbag (S5)
+    if args.bag:
+        from episode_bag import EpisodeBag
+        jn = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+        try:
+            png = pc.rpc({"type": "ping"}).get("joint_names")
+            if png:
+                jn = list(png)
+        except Exception:
+            pass
+        ebag = EpisodeBag(node, jn, storage=args.bag_storage)
+        print(f"  rosbag logging ON -> {args.bag_dir}/obj_NN  (storage {args.bag_storage})")
 
     def fk_T(q):
         r = pc.rpc({"type": "fk", "q": list(map(float, q))})
@@ -377,10 +396,11 @@ def main():
         q = state.get_q()
         r1 = pc.plan_pose(list(map(float, q)), list(map(float, lift_xyz)) + down, max_attempts=14)
         if not r1.get("success"):
-            return False
+            print(f"  weld-place: LIFT plan to {[round(v,2) for v in lift_xyz]} FAILED"); return False
         r2 = pc.plan_pose([float(x) for x in r1["trajectory"][-1]], list(map(float, place_pose)) + down, max_attempts=14)
         if not r2.get("success"):
-            return False
+            print(f"  weld-place: CARRY plan to {[round(v,2) for v in place_pose]} FAILED "
+                  f"(box location/rim out of reach with the held object?)"); return False
         p1 = np.array(r1["trajectory"]); p2 = np.array(r2["trajectory"])
         nmv = float(np.degrees(np.max(np.abs(np.diff(p2, axis=0))) / r2["dt"])) if len(p2) > 1 else target_vel
         path = np.vstack([p1, p2[1:]]); junc = len(p1) - 1
@@ -521,12 +541,17 @@ def main():
             marks = {}
             if args.record:
                 jrec.clear(); jrec_on["v"] = True; mon.start_rec()           # RECORD pregrasp+contact
+            if ebag is not None:                                             # one rosbag per episode
+                ebag.start(os.path.join(args.bag_dir, f"obj_{i:02d}"), frame_getter=mon.latest_rgbd)
+                ebag.write_phase("pregrasp")
             marks["approach"] = t_send = time.time()
             wd = send_weld_descent(pregrasp3, grasp3,
                                    args.v_approach, args.v_des, args.weld_dt, args.weld_ramp,
                                    v_contact_deg=args.v_contact, slow_frac=args.slow_frac, quat=q_n)
             if wd is None:
-                jrec_on["v"] = False; mon.stop_rec(); print("  weld plan FAILED"); continue
+                jrec_on["v"] = False; mon.stop_rec()
+                if ebag is not None: ebag.stop()
+                print("  weld plan FAILED"); continue
             marks["pregrasp"] = t_send + wd["junc_t"]                # via-point pass-through time (non-zero v)
             print(f"  weld: {wd['n']} wpts, ~{wd['T']:.1f}s, pregrasp@{wd['junc_t']:.1f}s, "
                   f"peak {wd['peak_degs']:.0f}deg/s")
@@ -553,6 +578,7 @@ def main():
                 blue_hit = dy2 is not None and dy2 >= args.blue_thresh
                 if past_pregrasp and contact_z is None and blue_hit:
                     contact_z = z; marks["contact"] = time.time()
+                    if ebag is not None: ebag.write_phase("contact")
                     send_hold(); print(f"  >> CONTACT (blue-dot {dy2:+.1f}px) HOLD at z={z:.3f} "
                                        f"vz={vz*1000:.0f}mm/s"); break
                 if now - last_print > 0.2:
@@ -565,6 +591,7 @@ def main():
                         send_descent_nb(grasp_cur, args.v_contact, quat=q_n)
                         print(f"  no contact yet; extending descent -> z={descent_target:.3f}")
                     else:
+                        if ebag is not None: ebag.write_phase("floor_no_contact")
                         send_hold(); print("  reached floor, no contact"); break
                 if z <= floor_abs + 1e-3:
                     send_hold(); print("  hit hard floor"); break
@@ -598,6 +625,7 @@ def main():
                             break
                     Tc = fk_T(state.get_q()); print(f"  grasp-press -> z={float(Tc[2, 3]):.3f}")
                 # GRASP: suction ON (cup pressed on the object), seal dwell = the only v=0
+                if ebag is not None: ebag.write_phase("grasp")
                 suction_test.set_pin(True, args.suction_host, args.suction_user); print("  suction ON; sealing")
                 ts = time.time()
                 while time.time() - ts < args.seal_dwell:
@@ -631,8 +659,10 @@ def main():
                     print(f"  carried object hangs ~{down_extent*100:.0f}cm -> transit/release z={transit_z:.2f} "
                           f"(rim {rim_z:.2f})")
                 # WELDED carry: contact -> lift(non-zero v) -> place pose over/into the bin
+                if ebag is not None: ebag.write_phase("place")
                 send_weld_place(lift_xyz, place_pose, args.place_vel, args.weld_dt, args.weld_ramp)
                 # RELEASE over the bin, let it drop
+                if ebag is not None: ebag.write_phase("release")
                 suction_test.set_pin(False, args.suction_host, args.suction_user); print("  released")
                 if args.planner_place:
                     pc.rpc({"type": "detach"}); print("  detached object from planner")
@@ -641,14 +671,18 @@ def main():
                     rclpy.spin_once(node, timeout_sec=0.02)
                 # WELDED return to base from the place pose
                 Tp = fk_T(state.get_q())
+                if ebag is not None: ebag.write_phase("return")
                 send_weld_return([float(Tp[0, 3]), float(Tp[1, 3]), min(0.32, float(Tp[2, 3]) + 0.05)],
                                  args.return_vel, args.weld_dt, args.weld_ramp)
             else:
                 # touch-only: WELDED return current -> lift(non-zero v) -> base (torque-feasible)
+                if ebag is not None: ebag.write_phase("return")
                 lift_xyz = [float(Tc[0, 3]), float(Tc[1, 3]), min(0.24, float(Tc[2, 3]) + 0.10)]
                 if not send_weld_return(lift_xyz, args.return_vel, args.weld_dt, args.weld_ramp):
                     print("  weld-return failed -> segmented fallback")
                     goto(lift_xyz, "lift", 12.0); to_base()
+            if ebag is not None:
+                ebag.stop()                                  # close this episode's rosbag
 
         to_base()
     finally:
