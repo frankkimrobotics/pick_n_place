@@ -108,50 +108,59 @@ class OnlinePlanner(Node):
 
         period = 1.0 / self.a.plan_hz
         chunk_len = max(2, int(round(self.a.horizon / self.fine_dt)))   # waypoints per chunk
-        last_replan = 0.0
+        last_replan = -1e9
         while not self._stop.is_set():
             tick = time.time()
             rclpy.spin_once(self, timeout_sec=0.0)
-            t_anchor = time.time() + self.a.commit
-            q_anchor = self.welder.sample(t_anchor)
-            v_anchor = self.welder.velocity(t_anchor)
 
             if self.a.mode == "chunk":
                 need = (self.cache is None or
                         (time.time() - last_replan) > self.a.replan_period)
-                if need:
-                    plan, dt = self.plan_full(q_anchor)
+                if need:               # planning can be slow (~1s); predict the start ahead
+                    q_start = self.welder.sample(time.time() + self.a.plan_lead)
+                    plan, dt = self.plan_full(q_start)
                     if plan is not None:
-                        self.cache = (resample(plan, dt, self.fine_dt), t_anchor)
+                        self.cache = (resample(plan, dt, self.fine_dt), None)  # c_t0 set below
                         last_replan = time.time()
                 if self.cache is None:
-                    time.sleep(period); continue
+                    self._sleep_to(tick + period); continue
+                t_anchor = time.time() + self.a.commit       # AFTER the (possibly slow) plan
                 fine, c_t0 = self.cache
+                if c_t0 is None:                              # fresh plan: play its t=0 from here
+                    c_t0 = t_anchor; self.cache = (fine, c_t0)
                 k = int(round((t_anchor - c_t0) / self.fine_dt))
-                if k >= len(fine) - 1:                      # plan consumed -> hold goal
-                    self._publish_hold(q_anchor, t_anchor);
+                if k >= len(fine) - 1:                        # plan consumed -> hold goal
+                    self._publish_hold(fine[-1], t_anchor)
                     if self.welder.reached(fine[-1], time.time(), tol=0.02):
                         self.get_logger().info("goal reached; streaming done"); break
                     self._sleep_to(tick + period); continue
                 chunk = fine[k:k + chunk_len]
-            else:  # mpc
-                plan, dt = self.plan_full(q_anchor)
+                q_anchor = self.welder.sample(t_anchor)
+            else:  # mpc -- per-cycle replan (constant-cruise + decel; weld absorbs rest->cruise)
+                q_pred = self.welder.sample(time.time() + self.a.plan_lead)
+                plan, dt = self.plan_full(q_pred)
                 if plan is None:
                     self._sleep_to(tick + period); continue
-                # constant-cruise chunks: re-timing from the tiny current speed makes
-                # rest-to-rest trajopt creep, so drive each chunk at cruise speed and let
-                # the weld blend absorb the rest->cruise transition on the first chunk.
-                dist = float(np.abs(np.asarray(plan[-1]) - q_anchor).max())   # rad to goal
-                if dist < 0.025:
+                dist = float(np.abs(np.asarray(plan[-1]) - q_pred).max())   # rad to goal
+                if dist < 0.03:
                     self.get_logger().info("goal reached (mpc); done"); break
-                vcru = np.radians(self.a.cruise_deg) * min(1.0, max(0.12, dist / 0.4))  # decel near goal
+                vcru = np.radians(self.a.cruise_deg) * min(1.0, max(0.12, dist / 0.4))
                 horizon_pts = max(2, int(self.a.horizon / max(dt, 1e-3)))
                 seg, _ = retime_to_velocity(plan[:horizon_pts * 3], dt, vcru, vcru,
                                             self.fine_dt, ramp=self.a.ramp)
+                t_anchor = time.time() + self.a.commit       # AFTER the plan
                 chunk = seg[:chunk_len]
+                q_anchor = q_pred
 
             self.welder.weld(chunk, self.fine_dt, t_anchor, blend=self.a.blend)
             self._publish_chunk(chunk, t_anchor)
+            if getattr(self, "_dbg", 0) % 4 == 0:
+                nt = time.time()
+                self.get_logger().info(
+                    f"t={nt-t0:.2f} mode={self.a.mode} qa={q_anchor[0]:.3f} "
+                    f"robot_now={self.welder.sample(nt)[0]:.3f} chunk0={chunk[0][0]:.3f} "
+                    f"horizon_end={self.welder.horizon_end()-nt:.2f}")
+            self._dbg = getattr(self, "_dbg", 0) + 1
             self._sleep_to(tick + period)
 
     def _publish_chunk(self, chunk_rad, t_anchor):
@@ -176,7 +185,8 @@ def main():
     ap.add_argument("--goal-joint", default=None, help="goal joint config (6 rad)")
     ap.add_argument("--plan-hz", type=float, default=10.0)
     ap.add_argument("--horizon", type=float, default=0.20, help="chunk horizon (s)")
-    ap.add_argument("--commit", type=float, default=0.20, help="anchor lead time (covers latency)")
+    ap.add_argument("--commit", type=float, default=0.06, help="anchor lead (slice+comms; AFTER planning)")
+    ap.add_argument("--plan-lead", type=float, default=0.30, help="predict start this far ahead when replanning")
     ap.add_argument("--blend", type=float, default=0.06, help="weld blend window (s)")
     ap.add_argument("--replan-period", type=float, default=1.5, help="chunk-mode refresh (s)")
     ap.add_argument("--cruise-deg", type=float, default=35.0, help="mpc cruise per-joint speed")
