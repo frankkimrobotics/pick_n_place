@@ -168,7 +168,8 @@ def main():
     ap.add_argument("--margin", type=float, default=0.004, help="linear over-descent past the surface (m); spring absorbs it")
     ap.add_argument("--cal-a", type=float, default=0.78)      # calibrated gap->dist: true = a*gap + b
     ap.add_argument("--cal-b", type=float, default=0.0105)
-    ap.add_argument("--v-des", type=float, default=6.0, help="FAST descent speed past pregrasp (deg/s)")
+    ap.add_argument("--v-des", type=float, default=2.5, help="descent speed past pregrasp (deg/s); keep slow — a fast"
+                    " descent slams objects taller than the (noisy) detection and false-triggers the blue-dot")
     ap.add_argument("--v-contact", type=float, default=2.0, help="SLOW speed near contact (deg/s)")
     ap.add_argument("--slow-frac", type=float, default=0.5, help="fraction of the descent that is the slow contact zone")
     ap.add_argument("--weld-dt", type=float, default=0.06, help="uniform traj_dt of the re-timed weld (s)")
@@ -500,7 +501,8 @@ def main():
             print("  welded decel-to-rest descent (gap = log/safety only):")
             contact_z = None; last_print = 0; t0 = time.time(); zhist = collections.deque(maxlen=8)
             blue_base2 = None                                    # blue-dot baseline re-captured at gate-open
-            while time.time() - t0 < 25.0:
+            descent_target = target                             # descend-until-contact extends this past the endpoint
+            while time.time() - t0 < 35.0:
                 rclpy.spin_once(node, timeout_sec=0.02)
                 gap, _ = mon.latest_gap(); q = state.get_q()
                 z = float(fk_T(q)[2, 3]) if q is not None else 9.0
@@ -522,8 +524,13 @@ def main():
                 if now - last_print > 0.2:
                     print(f"    z={z:.3f}  vz={vz*1000:.0f}mm/s  gap={'--' if gap is None else f'{gap*1000:.0f}mm'}  "
                           f"blue_dy={'--' if dy2 is None else f'{dy2:+.1f}px'}"); last_print = now
-                if abs(z - target) < 0.0015 and vz < 0.0015:                   # FALLBACK: decel-to-rest floor
-                    print("  reached detection target (no gap-contact)"); break
+                if abs(z - descent_target) < 0.002 and vz < 0.002:             # reached target without contact
+                    if descent_target - 0.001 > floor_abs:                     # DESCEND-UNTIL-CONTACT: keep going
+                        descent_target = max(floor_abs, descent_target - 0.008)
+                        send_descent_nb([cxy[0], cxy[1], descent_target], args.v_contact)
+                        print(f"  no contact yet; extending descent -> {descent_target:.3f}")
+                    else:
+                        send_hold(); print("  reached floor, no contact"); break
                 if z <= floor_abs + 1e-3:
                     send_hold(); print("  hit hard floor"); break
                 time.sleep(0.01)
