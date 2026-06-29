@@ -196,6 +196,7 @@ def main():
     ap.add_argument("--flat-target", dest="flat_target", action="store_true", default=True,
                     help="aim the cup at the flattest sealable patch (suction-point detector) not the centroid")
     ap.add_argument("--no-flat-target", dest="flat_target", action="store_false")
+    ap.add_argument("--angled", action="store_true", help="approach along the face normal (tilted) not straight down")
     ap.add_argument("--max-objects", type=int, default=1, help="touch at most N objects (largest first)")
     ap.add_argument("--pick-index", type=int, default=0, help="start at the Nth largest object (skip earlier)")
     ap.add_argument("--grasp-press", type=float, default=0.006, help="press past contact for the suction seal (m)")
@@ -246,12 +247,12 @@ def main():
     def fix_j6(t):
         t = np.array(t, float); t[:, 5] = t[0, 5]; return t
 
-    def send_descent_nb(goal, vmax):
-        """Plan current -> goal (straight down) and publish NON-BLOCKING at a slow vmax.
-        The cuRobo trajectory decelerates to rest AT goal, so the over-press is bounded by
-        goal (no overshoot past it); vision HOLD just stops it earlier."""
+    def send_descent_nb(goal, vmax, quat=None):
+        """Plan current -> goal pose and publish NON-BLOCKING at a slow vmax. `quat` (wxyz) sets the
+        approach orientation (default = straight-down `down`); pass a normal-aligned quat for angled.
+        The cuRobo trajectory decelerates to rest AT goal; vision HOLD just stops it earlier."""
         q = state.get_q()
-        r = pc.plan_pose(list(map(float, q)), list(map(float, goal)) + down, max_attempts=14)
+        r = pc.plan_pose(list(map(float, q)), list(map(float, goal)) + (quat or down), max_attempts=14)
         if not r.get("success"):
             return False
         traj = fix_j6(r["trajectory"]); sdt, _ = scale_traj(traj, r["dt"], vmax, 0.5)
@@ -285,14 +286,15 @@ def main():
         junc_t = float(np.interp(dj, sg, tg))                        # time when the path reaches the junction
         return out, junc_t
 
-    def send_weld_descent(pregrasp, grasp, v_app_deg, v_des_deg, dt_ref, ramp, v_contact_deg=None, slow_frac=0.0):
+    def send_weld_descent(pregrasp, grasp, v_app_deg, v_des_deg, dt_ref, ramp, v_contact_deg=None, slow_frac=0.0, quat=None):
         """ONE velocity-continuous trajectory current -> pregrasp(non-zero v) -> grasp(decel-to-rest).
-        Descends fast at v_des, slowing to v_contact over the last `slow_frac` of the descent."""
+        Descends fast at v_des, slowing to v_contact over the last `slow_frac` of the descent.
+        `quat` (wxyz) is the approach orientation for both poses (default straight-down)."""
         q = state.get_q()
-        r1 = pc.plan_pose(list(map(float, q)), list(map(float, pregrasp)) + down, max_attempts=14)
+        r1 = pc.plan_pose(list(map(float, q)), list(map(float, pregrasp)) + (quat or down), max_attempts=14)
         if not r1.get("success"):
             return None
-        r2 = pc.plan_pose([float(x) for x in r1["trajectory"][-1]], list(map(float, grasp)) + down, max_attempts=14)
+        r2 = pc.plan_pose([float(x) for x in r1["trajectory"][-1]], list(map(float, grasp)) + (quat or down), max_attempts=14)
         if not r2.get("success"):
             return None
         p1 = np.array(r1["trajectory"]); p2 = np.array(r2["trajectory"])
@@ -457,13 +459,19 @@ def main():
 
         for i, o in enumerate(objs):
             P = o["pts"]; cxy = o["centroid"][:2].copy(); flat_ok = False
+            nrm_v = np.array([0.0, 0.0, 1.0])                     # descent direction (vertical unless --angled)
             if args.flat_target and cam_base is not None:        # aim at the flattest sealable patch
                 try:
                     nrm = estimate_normals(P, cam_base)
                     found = detect_suction_point(P, nrm, normal_cone_deg=45.0, select="central")
                     if found is not None:
                         cxy = np.asarray(found[0], float)[:2].copy(); flat_ok = True
-                        print(f"  flat suction point [{cxy[0]:.3f},{cxy[1]:.3f}]")
+                        nn = np.asarray(found[1], float); nn = nn / (np.linalg.norm(nn) + 1e-9)
+                        if nn[2] < 0:
+                            nn = -nn                              # outward (up-ish)
+                        if args.angled:
+                            nrm_v = nn                            # approach along the face normal
+                        print(f"  flat suction point [{cxy[0]:.3f},{cxy[1]:.3f}] normal={np.round(nrm_v,2).tolist()}")
                 except Exception as e:
                     print(f"  flat-target failed ({e}); using centroid")
             col = P[np.linalg.norm(P[:, :2] - cxy, axis=1) < 0.02]
@@ -472,14 +480,17 @@ def main():
                 face = P[np.abs(P[:, 2] - surf) < 0.010]
                 if len(face) > 20:
                     cxy = face[:, :2].mean(0)
-            floor_z = surf - args.max_descend         # HARD safety floor (backstop only)
-            print(f"\n== object {i+1}: centre [{cxy[0]:.3f},{cxy[1]:.3f}] surf_est={surf:.3f} ==")
-
-            standoff_z = surf + args.standoff
-            target = surf - args.margin                           # DETECTION surface (reliable interior median)
-            floor_abs = max(0.012, surf - args.max_descend)       # absolute safety backstop
-            print(f"\n== object {i+1}: centre [{cxy[0]:.3f},{cxy[1]:.3f}] surf_est={surf:.3f} "
-                  f"-> target {target:.3f} ==")
+            # normal-aligned approach: cup oriented along -normal; pregrasp/grasp offset along the normal.
+            # (vertical normal -> identical to the straight-down path; z-targets are the angled points' z.)
+            sp3 = np.array([cxy[0], cxy[1], surf])
+            q_n = list(R_to_quat_wxyz(R_from_two_axes(-nrm_v)))
+            pregrasp3 = (sp3 + args.standoff * nrm_v).tolist()
+            grasp3 = (sp3 - args.margin * nrm_v).tolist()
+            standoff_z = pregrasp3[2]
+            target = grasp3[2]
+            floor_abs = max(0.012, float((sp3 - args.max_descend * nrm_v)[2]))
+            print(f"\n== object {i+1}: centre [{cxy[0]:.3f},{cxy[1]:.3f}] surf={surf:.3f} "
+                  f"normal={np.round(nrm_v,2).tolist()} -> grasp z {target:.3f} ==")
 
             # ONE velocity-continuous WELD: current -> pregrasp(non-zero v) -> expected grasp(decel-to-rest).
             # The pregrasp is a true via-point (no rest-to-rest stop); RGBD then fine-tunes the endpoint
@@ -488,9 +499,9 @@ def main():
             if args.record:
                 jrec.clear(); jrec_on["v"] = True; mon.start_rec()           # RECORD pregrasp+contact
             marks["approach"] = t_send = time.time()
-            wd = send_weld_descent([cxy[0], cxy[1], standoff_z], [cxy[0], cxy[1], target],
+            wd = send_weld_descent(pregrasp3, grasp3,
                                    args.v_approach, args.v_des, args.weld_dt, args.weld_ramp,
-                                   v_contact_deg=args.v_contact, slow_frac=args.slow_frac)
+                                   v_contact_deg=args.v_contact, slow_frac=args.slow_frac, quat=q_n)
             if wd is None:
                 jrec_on["v"] = False; mon.stop_rec(); print("  weld plan FAILED"); continue
             marks["pregrasp"] = t_send + wd["junc_t"]                # via-point pass-through time (non-zero v)
@@ -501,7 +512,7 @@ def main():
             print("  welded decel-to-rest descent (gap = log/safety only):")
             contact_z = None; last_print = 0; t0 = time.time(); zhist = collections.deque(maxlen=8)
             blue_base2 = None                                    # blue-dot baseline re-captured at gate-open
-            descent_target = target                             # descend-until-contact extends this past the endpoint
+            descent_target = target; grasp_cur = list(grasp3)   # descend-until-contact extends along the normal
             while time.time() - t0 < 35.0:
                 rclpy.spin_once(node, timeout_sec=0.02)
                 gap, _ = mon.latest_gap(); q = state.get_q()
@@ -525,10 +536,11 @@ def main():
                     print(f"    z={z:.3f}  vz={vz*1000:.0f}mm/s  gap={'--' if gap is None else f'{gap*1000:.0f}mm'}  "
                           f"blue_dy={'--' if dy2 is None else f'{dy2:+.1f}px'}"); last_print = now
                 if abs(z - descent_target) < 0.002 and vz < 0.002:             # reached target without contact
-                    if descent_target - 0.001 > floor_abs:                     # DESCEND-UNTIL-CONTACT: keep going
-                        descent_target = max(floor_abs, descent_target - 0.008)
-                        send_descent_nb([cxy[0], cxy[1], descent_target], args.v_contact)
-                        print(f"  no contact yet; extending descent -> {descent_target:.3f}")
+                    nxt = np.array(grasp_cur) - 0.008 * nrm_v                  # DESCEND-UNTIL-CONTACT: step along -normal
+                    if float(nxt[2]) > floor_abs:
+                        grasp_cur = nxt.tolist(); descent_target = grasp_cur[2]
+                        send_descent_nb(grasp_cur, args.v_contact, quat=q_n)
+                        print(f"  no contact yet; extending descent -> z={descent_target:.3f}")
                     else:
                         send_hold(); print("  reached floor, no contact"); break
                 if z <= floor_abs + 1e-3:
@@ -553,8 +565,9 @@ def main():
                     rclpy.spin_once(node, timeout_sec=0.02)
                 Tc = fk_T(state.get_q())
                 if args.grasp_press > 0:
-                    pz = float(Tc[2, 3]) - args.grasp_press
-                    send_descent_nb([cxy[0], cxy[1], pz], 1.2)
+                    press_pos = (Tc[:3, 3] - args.grasp_press * nrm_v).tolist()  # press along -normal
+                    pz = press_pos[2]
+                    send_descent_nb(press_pos, 1.2, quat=q_n)
                     tp = time.time()
                     while time.time() - tp < 1.6:
                         rclpy.spin_once(node, timeout_sec=0.02)
