@@ -31,6 +31,7 @@ class TrajectoryWelder:
         self.fine_dt = float(fine_dt)
         self.t = None          # absolute times [M]
         self.q = None          # [M, dof]
+        self._last_t = None    # latest sampled time (the trim keeps the active region around it)
 
     def seed(self, q, t0, hold=5.0):
         """Initialise a resting reference at q from t0 (held for `hold` s)."""
@@ -43,6 +44,7 @@ class TrajectoryWelder:
         t = float(t)
         if self.t is None:
             return None
+        self._last_t = t
         return np.array([np.interp(t, self.t, self.q[:, j]) for j in range(self.dof)])
 
     def velocity(self, t, h=None):
@@ -76,9 +78,11 @@ class TrajectoryWelder:
         keep = self.t < t_anchor            # keep the recent past (for sampling/velocity)
         self.t = np.concatenate([self.t[keep], tnew])
         self.q = np.vstack([self.q[keep], blended])
-        # trim ancient history to bound memory (keep ~2 s back)
-        if self.t[-1] - self.t[0] > 4.0:
-            m = self.t >= self.t[-1] - 3.0
+        # trim only history BEFORE the last sampled time (keep the active + future ref;
+        # keying off self.t[-1] wrongly discarded the present when chunks anchor far ahead).
+        cut = (self._last_t - 2.0) if self._last_t is not None else (self.t[-1] - 30.0)
+        m = self.t >= cut
+        if m.sum() >= 2:
             self.t, self.q = self.t[m], self.q[m]
 
     def reached(self, q_goal, t, tol=0.02):
