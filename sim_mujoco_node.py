@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "mycobot_mpc")))
 import config as C
 from joint_conventions import (JOINT_NAMES, linuxcnc_deg_to_rad,
                                rad_to_linuxcnc_deg)
+from traj_weld import TrajectoryWelder
 
 
 def _T(pos, mat):
@@ -90,6 +91,8 @@ class MujocoRobot(Node):
 
         self.lock = threading.Lock()
         self._queue = []                  # list of (traj_rad[N,6], dt)
+        self.welder = TrajectoryWelder(dof=6, fine_dt=0.01)   # online streaming reference
+        self._weld = False
         self._attached = False
         self._rel = None                  # tcp->object relative transform when grasped
         self.fb_dt = 1.0 / fb_hz
@@ -131,6 +134,13 @@ class MujocoRobot(Node):
         deg = c.get("trajectory") or [c["target_deg"]]
         traj = np.array([linuxcnc_deg_to_rad(w) for w in deg])
         dt = float(c.get("traj_dt", c.get("duration", 2.0) / max(len(traj), 1)))
+        if c.get("weld"):                          # streaming chunk -> weld onto live ref
+            with self.lock:
+                if self.welder.t is None:
+                    self.welder.seed(self.q.copy(), time.time() - 0.2)
+                self.welder.weld(traj, dt, float(c.get("t_anchor", time.time())), blend=0.06)
+                self._weld = True
+            return
         with self.lock:
             self._queue.append((traj, dt))
         self.get_logger().info(f"cmd: {len(traj)} wpts @ dt={dt:.3f}")
@@ -157,6 +167,19 @@ class MujocoRobot(Node):
         last_q = self.q.copy()
         last_fb_t = time.time()
         while not self._stop.is_set():
+            if self._weld:                              # streaming mode: track the welded ref
+                now = time.time()
+                with self.lock:
+                    qs = self.welder.sample(now)
+                    if qs is not None:
+                        self.q = qs.copy(); self._apply(self.q)
+                if now - t_fb >= self.fb_dt:
+                    self._publish_fb(last_q, now - last_fb_t)
+                    last_q = self.q.copy(); last_fb_t = now; t_fb = now
+                if self._renderer is not None and now - t_rd >= self.render_dt:
+                    self._grab(); t_rd = now
+                time.sleep(0.005)
+                continue
             with self.lock:
                 job = self._queue.pop(0) if self._queue else None
             if job is not None:
@@ -242,7 +265,8 @@ def main():
     finally:
         node.close()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
