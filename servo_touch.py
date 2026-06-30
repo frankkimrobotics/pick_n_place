@@ -446,6 +446,46 @@ def main():
         publish_motion({"trajectory": [d, d], "traj_dt": 0.1, "target_deg": d,
                         "controller": "pid", **track})
 
+    def stream_weld_sweep(segments, jfrac=0.8, cruise_deg=None):
+        """--stream: plan a list of (kind, goal) segments and CROSS-WELD them into ONE
+        continuous streamed sweep (each later segment re-timed to leave at the previous
+        junction velocity, anchored to overlap it). Returns the wall-clock start time of
+        each segment (so the caller can release suction on the fly at a junction), or None
+        if any plan fails. Requires the weld-controller running."""
+        from traj_weld import retime_to_velocity
+        cruise = np.radians(cruise_deg if cruise_deg is not None else args.place_vel + 15.0)
+        q0 = list(map(float, state.get_q())); v_start = 0.0
+        fines = []; junc_dts = []
+        for i, (kind, goal) in enumerate(segments):
+            if kind == "pose":
+                r = pc.plan_pose(q0, list(map(float, goal)) + down, max_attempts=12)
+            else:
+                r = pc.plan_joint(q0, list(map(float, goal)))
+            if not r.get("success"):
+                print(f"  sweep seg{i} plan FAILED ({r.get('status')})"); return None
+            path = np.array(r["trajectory"]); dt = float(r["dt"])
+            if v_start > 1e-3:
+                fine, _ = retime_to_velocity(path, dt, v_start, cruise, 0.01, ramp=0.35)
+            else:
+                tt = np.arange(len(path)) * dt; tn = np.arange(0, tt[-1] + 1e-9, 0.01)
+                fine = np.column_stack([np.interp(tn, tt, path[:, j]) for j in range(6)])
+            fines.append(fine)
+            if i < len(segments) - 1:
+                idx = int(len(fine) * jfrac)
+                q0 = [float(x) for x in fine[idx]]
+                v_start = float(np.abs(fine[idx + 1] - fine[idx]).max()) / 0.01
+                junc_dts.append(idx * 0.01)
+            else:
+                junc_dts.append(len(fine) * 0.01)
+        t = time.time() + 0.20; starts = []
+        for fine, jdt in zip(fines, junc_dts):
+            td = [list(map(float, rad_to_linuxcnc_deg(w))) for w in fine]
+            chunk_pub.publish(String(data=json.dumps(
+                {"trajectory": td, "traj_dt": 0.01, "target_deg": td[-1],
+                 "weld": True, "t_anchor": float(t)})))
+            starts.append(t); t += jdt
+        return starts
+
     def goto(xyz, label, vmax):
         q = state.get_q()
         r = pc.plan_pose(list(map(float, q)), list(map(float, xyz)) + down, max_attempts=14)
@@ -701,22 +741,47 @@ def main():
                     place_pose = [box_xyz[0], box_xyz[1], transit_z]              # carry over the box, high
                     print(f"  carried object hangs ~{down_extent*100:.0f}cm -> transit/release z={transit_z:.2f} "
                           f"(rim {rim_z:.2f})")
-                # WELDED carry: contact -> lift(non-zero v) -> place pose over/into the bin
-                if ebag is not None: ebag.write_phase("place")
-                send_weld_place(lift_xyz, place_pose, args.place_vel, args.weld_dt, args.weld_ramp)
-                # RELEASE over the bin, let it drop
-                if ebag is not None: ebag.write_phase("release")
-                suction_test.set_pin(False, args.suction_host, args.suction_user); print("  released")
-                if args.planner_place:
-                    pc.rpc({"type": "detach"}); print("  detached object from planner")
-                tr = time.time()
-                while time.time() - tr < 0.3:
-                    rclpy.spin_once(node, timeout_sec=0.02)
-                # WELDED return to base from the place pose
-                Tp = fk_T(state.get_q())
-                if ebag is not None: ebag.write_phase("return")
-                send_weld_return([float(Tp[0, 3]), float(Tp[1, 3]), min(0.32, float(Tp[2, 3]) + 0.05)],
-                                 args.return_vel, args.weld_dt, args.weld_ramp)
+                did_sweep = False
+                if args.stream:
+                    # CROSS-WELDED post-grasp sweep: lift -> place -> return as ONE continuous
+                    # motion (non-zero junctions), releasing suction ON THE FLY at the place
+                    # junction (object drops as the cup sweeps over the box). v=0 only at grasp.
+                    if ebag is not None: ebag.write_phase("sweep")
+                    starts = stream_weld_sweep([("pose", lift_xyz), ("pose", place_pose),
+                                                ("joint", C.BASE_Q)])
+                    if starts is not None:
+                        did_sweep = True
+                        t_rel = starts[2]                          # place->return junction
+                        while time.time() < t_rel:
+                            rclpy.spin_once(node, timeout_sec=0.02)
+                        if ebag is not None: ebag.write_phase("release")
+                        suction_test.set_pin(False, args.suction_host, args.suction_user)
+                        print("  released on-the-fly at the place junction")
+                        if args.planner_place:
+                            pc.rpc({"type": "detach"})
+                        tend = t_rel + 9.0
+                        while time.time() < tend:                  # let the sweep finish at base
+                            rclpy.spin_once(node, timeout_sec=0.05)
+                            if float(np.degrees(np.abs(state.get_q()[:6] - C.BASE_Q)).max()) < 6.0:
+                                break
+                        print("  cross-welded sweep done (no settle between lift/place/return)")
+                if not did_sweep:
+                    # WELDED carry: contact -> lift(non-zero v) -> place pose over/into the bin
+                    if ebag is not None: ebag.write_phase("place")
+                    send_weld_place(lift_xyz, place_pose, args.place_vel, args.weld_dt, args.weld_ramp)
+                    # RELEASE over the bin, let it drop
+                    if ebag is not None: ebag.write_phase("release")
+                    suction_test.set_pin(False, args.suction_host, args.suction_user); print("  released")
+                    if args.planner_place:
+                        pc.rpc({"type": "detach"}); print("  detached object from planner")
+                    tr = time.time()
+                    while time.time() - tr < 0.3:
+                        rclpy.spin_once(node, timeout_sec=0.02)
+                    # WELDED return to base from the place pose
+                    Tp = fk_T(state.get_q())
+                    if ebag is not None: ebag.write_phase("return")
+                    send_weld_return([float(Tp[0, 3]), float(Tp[1, 3]), min(0.32, float(Tp[2, 3]) + 0.05)],
+                                     args.return_vel, args.weld_dt, args.weld_ramp)
             else:
                 # touch-only: WELDED return current -> lift(non-zero v) -> base (torque-feasible)
                 if ebag is not None: ebag.write_phase("return")
