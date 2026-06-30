@@ -184,8 +184,15 @@ def main():
     ap.add_argument("--place", default="0.10,0.40,0.30", help="release pose x,y,z (cup tip over the bin)")
     ap.add_argument("--box", default="0.10,0.40,0.0", help="place box bottom-centre x,y,z")
     ap.add_argument("--box-size", type=float, default=0.25, help="box height; rim_z = box_z + this")
+    ap.add_argument("--box-fp", type=float, default=0.25, help="box inner footprint width (m, for planner walls)")
     ap.add_argument("--table-z", type=float, default=0.015, help="table top height (for carried-object hang extent)")
     ap.add_argument("--release-clear", type=float, default=0.05, help="object bottom clears the rim by this at release")
+    ap.add_argument("--planner-place", action="store_true",
+                    help="planner-side carried-object collision: attach the grasped object to the cuRobo "
+                         "planner + add the box walls as world obstacles, so the place path natively routes "
+                         "the held object over the rim and lowers it INTO the box (replaces geometric routing)")
+    ap.add_argument("--box-wall", type=float, default=0.01, help="box wall thickness for planner obstacles (m)")
+    ap.add_argument("--box-margin", type=float, default=0.01, help="bbox inflation added to the held object (m)")
     ap.add_argument("--place-vel", type=float, default=20.0, help="welded place-move per-joint peak (deg/s)")
     ap.add_argument("--seal-dwell", type=float, default=0.5, help="suction-seal dwell at contact (s, the only v=0)")
     ap.add_argument("--record", action="store_true", help="record per-object RGBD+joints (adds save time; off for fast cycle)")
@@ -203,6 +210,19 @@ def main():
     ap.add_argument("--dwell", type=float, default=1.2)
     ap.add_argument("--rec-dir", default=os.path.join(C.OUT_DIR, "touch_rec"),
                     help="record joint pos/vel + RGBD frames per object here")
+    ap.add_argument("--bag", action="store_true",
+                    help="record ONE rosbag2 per episode (RGBD + joint pos/vel/cmd + phase) (S5)")
+    ap.add_argument("--bag-dir", default=os.path.join(C.OUT_DIR, "episodes"),
+                    help="per-episode rosbags go here as obj_NN/")
+    ap.add_argument("--bag-storage", default="mcap", choices=["mcap", "sqlite3"],
+                    help="rosbag2 storage plugin (mcap preferred; auto-falls back to sqlite3)")
+    ap.add_argument("--stream", action="store_true",
+                    help="route motion through the online weld-controller (publish weld chunks to "
+                         "--chunk-topic) instead of one-shot cmd/move; the weld-controller welds "
+                         "consecutive pick-place segments into one continuous reference for robot_hal. "
+                         "Requires robot_weld_controller.py running. Default OFF (proven direct path).")
+    ap.add_argument("--chunk-topic", default="/planner/weld_chunks")
+    ap.add_argument("--stream-lead", type=float, default=0.10, help="weld anchor lead time (s)")
     args = ap.parse_args()
 
     import rclpy
@@ -232,6 +252,18 @@ def main():
     pc = PlannerClient(); rclpy.init(); node = rclpy.create_node("servo_touch")
     pub = node.create_publisher(String, "/mycobot/cmd/move", 10); state = RobotState(node)
     track = {"ramp_time": 0.15, "pos_gain": 1.0, "vff_scale": 1.0}
+    chunk_pub = node.create_publisher(String, args.chunk_topic, 10)
+
+    def publish_motion(cmd):
+        """--stream: hand the motion to the weld-controller as a weld chunk (it welds
+        consecutive segments + windows them to robot_hal). Else: direct cmd/move (proven)."""
+        if args.stream:
+            chunk_pub.publish(String(data=json.dumps(
+                {"trajectory": cmd["trajectory"], "traj_dt": cmd["traj_dt"],
+                 "target_deg": cmd["target_deg"], "weld": True,
+                 "t_anchor": time.time() + args.stream_lead})))
+        else:
+            pub.publish(String(data=json.dumps(cmd)))
     # joint recorder: /mycobot/drive_feedback carries measured position (deg) + velocity (deg/s) @50Hz
     jrec = []; jrec_on = {"v": False}
     def _on_drive(msg):
@@ -239,6 +271,35 @@ def main():
             jrec.append((time.time(), [float(p) for p in msg.position], [float(v) for v in msg.velocity]))
     node.create_subscription(JointState, "/mycobot/drive_feedback", _on_drive, 50)
     down = list(R_to_quat_wxyz(R_from_two_axes(np.array([0, 0, -1.0]))))
+
+    def box_walls(bxyz, fp, height, t):
+        """5 cuboids (floor + 4 walls, OPEN top) approximating the place box as
+        planner world obstacles. bxyz = bottom-centre; fp = inner footprint; t = wall."""
+        bx, by, bz = bxyz; h = fp / 2.0
+        return [
+            {"name": "box_floor", "dims": [fp + 2*t, fp + 2*t, t], "pose": [bx, by, bz - t/2, 1, 0, 0, 0]},
+            {"name": "box_xm", "dims": [t, fp + 2*t, height], "pose": [bx - (h + t/2), by, bz + height/2, 1, 0, 0, 0]},
+            {"name": "box_xp", "dims": [t, fp + 2*t, height], "pose": [bx + (h + t/2), by, bz + height/2, 1, 0, 0, 0]},
+            {"name": "box_ym", "dims": [fp, t, height], "pose": [bx, by - (h + t/2), bz + height/2, 1, 0, 0, 0]},
+            {"name": "box_yp", "dims": [fp, t, height], "pose": [bx, by + (h + t/2), bz + height/2, 1, 0, 0, 0]},
+        ]
+
+    if args.planner_place:                       # register the box walls with the planner once
+        wr = pc.rpc({"type": "set_world", "cuboids": box_walls(box_xyz, args.box_fp, args.box_size, args.box_wall)})
+        print(f"  planner-place: box walls -> world ({wr.get('names')})")
+
+    ebag = None                                  # per-episode rosbag (S5)
+    if args.bag:
+        from episode_bag import EpisodeBag
+        jn = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+        try:
+            png = pc.rpc({"type": "ping"}).get("joint_names")
+            if png:
+                jn = list(png)
+        except Exception:
+            pass
+        ebag = EpisodeBag(node, jn, storage=args.bag_storage)
+        print(f"  rosbag logging ON -> {args.bag_dir}/obj_NN  (storage {args.bag_storage})")
 
     def fk_T(q):
         r = pc.rpc({"type": "fk", "q": list(map(float, q))})
@@ -257,8 +318,8 @@ def main():
             return False
         traj = fix_j6(r["trajectory"]); sdt, _ = scale_traj(traj, r["dt"], vmax, 0.5)
         td = [list(map(float, rad_to_linuxcnc_deg(wp))) for wp in traj]
-        pub.publish(String(data=json.dumps({"trajectory": td, "traj_dt": sdt, "target_deg": td[-1],
-                                            "controller": "pid", **track})))
+        publish_motion({"trajectory": td, "traj_dt": sdt, "target_deg": td[-1],
+                        "controller": "pid", **track})
         return True
 
     def _retime(path, junc, v_app, v_des, dt_ref, ramp, v_end=None, end_frac=0.0):
@@ -311,8 +372,8 @@ def main():
         if np.degrees(peak) > 56.0:                                  # firmware ceiling guard
             print(f"  WELD peak {np.degrees(peak):.0f}deg/s > ceiling; aborting"); return None
         td = [list(map(float, rad_to_linuxcnc_deg(wp))) for wp in traj]
-        pub.publish(String(data=json.dumps({"trajectory": td, "traj_dt": dt_ref, "target_deg": td[-1],
-                                            "controller": "pid", **track})))
+        publish_motion({"trajectory": td, "traj_dt": dt_ref, "target_deg": td[-1],
+                        "controller": "pid", **track})
         return {"n": len(traj), "junc_t": junc_t, "T": len(traj) * dt_ref, "peak_degs": np.degrees(peak)}
 
     def send_weld_return(lift_xyz, target_vel, dt_ref, ramp):
@@ -335,8 +396,8 @@ def main():
         target = min(target_vel, 0.9 * nmv)                     # per-joint peak target, torque-capped
         eff_dt = dt_ref * peak0 / max(target, 1.0)              # uniform re-time so per-joint peak == target
         td = [list(map(float, rad_to_linuxcnc_deg(wp))) for wp in traj]
-        pub.publish(String(data=json.dumps({"trajectory": td, "traj_dt": eff_dt, "target_deg": td[-1],
-                                            "controller": "pid", "ramp_time": 0.35, "pos_gain": 1.0, "vff_scale": 1.0})))
+        publish_motion({"trajectory": td, "traj_dt": eff_dt, "target_deg": td[-1],
+                        "controller": "pid", "ramp_time": 0.35, "pos_gain": 1.0, "vff_scale": 1.0})
         dur = len(traj) * eff_dt; t0 = time.time(); dev = 99.0
         while time.time() - t0 < dur + 2.0:                      # poll until settled (don't false-fail on follow-lag)
             rclpy.spin_once(node, timeout_sec=0.02)
@@ -354,10 +415,11 @@ def main():
         q = state.get_q()
         r1 = pc.plan_pose(list(map(float, q)), list(map(float, lift_xyz)) + down, max_attempts=14)
         if not r1.get("success"):
-            return False
+            print(f"  weld-place: LIFT plan to {[round(v,2) for v in lift_xyz]} FAILED"); return False
         r2 = pc.plan_pose([float(x) for x in r1["trajectory"][-1]], list(map(float, place_pose)) + down, max_attempts=14)
         if not r2.get("success"):
-            return False
+            print(f"  weld-place: CARRY plan to {[round(v,2) for v in place_pose]} FAILED "
+                  f"(box location/rim out of reach with the held object?)"); return False
         p1 = np.array(r1["trajectory"]); p2 = np.array(r2["trajectory"])
         nmv = float(np.degrees(np.max(np.abs(np.diff(p2, axis=0))) / r2["dt"])) if len(p2) > 1 else target_vel
         path = np.vstack([p1, p2[1:]]); junc = len(p1) - 1
@@ -366,8 +428,8 @@ def main():
         peak0 = float(np.degrees(np.max(np.abs(np.diff(traj, axis=0)))) / dt_ref)
         target = min(target_vel, 0.9 * nmv); eff_dt = dt_ref * peak0 / max(target, 1.0)
         td = [list(map(float, rad_to_linuxcnc_deg(wp))) for wp in traj]
-        pub.publish(String(data=json.dumps({"trajectory": td, "traj_dt": eff_dt, "target_deg": td[-1],
-                                            "controller": "pid", "ramp_time": 0.35, "pos_gain": 1.0, "vff_scale": 1.0})))
+        publish_motion({"trajectory": td, "traj_dt": eff_dt, "target_deg": td[-1],
+                        "controller": "pid", "ramp_time": 0.35, "pos_gain": 1.0, "vff_scale": 1.0})
         dur = len(traj) * eff_dt; t0 = time.time(); err = 99.0
         while time.time() - t0 < dur + 2.0:
             rclpy.spin_once(node, timeout_sec=0.02)
@@ -381,8 +443,48 @@ def main():
 
     def send_hold():
         q = state.get_q(); d = list(map(float, rad_to_linuxcnc_deg(q)))
-        pub.publish(String(data=json.dumps({"trajectory": [d, d], "traj_dt": 0.1, "target_deg": d,
-                                            "controller": "pid", **track})))
+        publish_motion({"trajectory": [d, d], "traj_dt": 0.1, "target_deg": d,
+                        "controller": "pid", **track})
+
+    def stream_weld_sweep(segments, jfrac=0.8, cruise_deg=None):
+        """--stream: plan a list of (kind, goal) segments and CROSS-WELD them into ONE
+        continuous streamed sweep (each later segment re-timed to leave at the previous
+        junction velocity, anchored to overlap it). Returns the wall-clock start time of
+        each segment (so the caller can release suction on the fly at a junction), or None
+        if any plan fails. Requires the weld-controller running."""
+        from traj_weld import retime_to_velocity
+        cruise = np.radians(cruise_deg if cruise_deg is not None else args.place_vel + 15.0)
+        q0 = list(map(float, state.get_q())); v_start = 0.0
+        fines = []; junc_dts = []
+        for i, (kind, goal) in enumerate(segments):
+            if kind == "pose":
+                r = pc.plan_pose(q0, list(map(float, goal)) + down, max_attempts=12)
+            else:
+                r = pc.plan_joint(q0, list(map(float, goal)))
+            if not r.get("success"):
+                print(f"  sweep seg{i} plan FAILED ({r.get('status')})"); return None
+            path = np.array(r["trajectory"]); dt = float(r["dt"])
+            if v_start > 1e-3:
+                fine, _ = retime_to_velocity(path, dt, v_start, cruise, 0.01, ramp=0.35)
+            else:
+                tt = np.arange(len(path)) * dt; tn = np.arange(0, tt[-1] + 1e-9, 0.01)
+                fine = np.column_stack([np.interp(tn, tt, path[:, j]) for j in range(6)])
+            fines.append(fine)
+            if i < len(segments) - 1:
+                idx = int(len(fine) * jfrac)
+                q0 = [float(x) for x in fine[idx]]
+                v_start = float(np.abs(fine[idx + 1] - fine[idx]).max()) / 0.01
+                junc_dts.append(idx * 0.01)
+            else:
+                junc_dts.append(len(fine) * 0.01)
+        t = time.time() + 0.20; starts = []
+        for fine, jdt in zip(fines, junc_dts):
+            td = [list(map(float, rad_to_linuxcnc_deg(w))) for w in fine]
+            chunk_pub.publish(String(data=json.dumps(
+                {"trajectory": td, "traj_dt": 0.01, "target_deg": td[-1],
+                 "weld": True, "t_anchor": float(t)})))
+            starts.append(t); t += jdt
+        return starts
 
     def goto(xyz, label, vmax):
         q = state.get_q()
@@ -457,6 +559,13 @@ def main():
         objs = objs[args.pick_index:args.pick_index + args.max_objects]
         print(f"detected objects; touching {len(objs)} (largest-first, from index {args.pick_index})")
 
+        if ebag is not None:                              # ONE rosbag for the whole run
+            try:
+                run_uri = os.path.join(args.bag_dir, f"run_{time.strftime('%Y%m%d_%H%M%S')}")
+                ebag.start(run_uri, frame_getter=mon.latest_rgbd)
+            except Exception as e:
+                print(f"  [bag] start failed ({e}); continuing without recording"); ebag = None
+
         for i, o in enumerate(objs):
             P = o["pts"]; cxy = o["centroid"][:2].copy(); flat_ok = False
             nrm_v = np.array([0.0, 0.0, 1.0])                     # descent direction (vertical unless --angled)
@@ -470,7 +579,15 @@ def main():
                         if nn[2] < 0:
                             nn = -nn                              # outward (up-ish)
                         if args.angled:
-                            nrm_v = nn                            # approach along the face normal
+                            z = np.array([0.0, 0.0, 1.0])
+                            ang = float(np.degrees(np.arccos(np.clip(nn @ z, -1.0, 1.0))))
+                            if ang > 45.0 and np.linalg.norm(np.cross(z, nn)) > 1e-6:
+                                ax = np.cross(z, nn); ax = ax / np.linalg.norm(ax)
+                                th = np.radians(45.0)        # tilt vertical toward the normal by 45deg max
+                                nn = z * np.cos(th) + np.cross(ax, z) * np.sin(th)
+                                nn = nn / np.linalg.norm(nn)
+                                print(f"  approach normal clamped to 45deg from vertical (was {ang:.0f}deg)")
+                            nrm_v = nn                            # approach along the (<=45deg) face normal
                         print(f"  flat suction point [{cxy[0]:.3f},{cxy[1]:.3f}] normal={np.round(nrm_v,2).tolist()}")
                 except Exception as e:
                     print(f"  flat-target failed ({e}); using centroid")
@@ -483,12 +600,13 @@ def main():
             # normal-aligned approach: cup oriented along -normal; pregrasp/grasp offset along the normal.
             # (vertical normal -> identical to the straight-down path; z-targets are the angled points' z.)
             sp3 = np.array([cxy[0], cxy[1], surf])
-            q_n = list(R_to_quat_wxyz(R_from_two_axes(-nrm_v)))
-            pregrasp3 = (sp3 + args.standoff * nrm_v).tolist()
-            grasp3 = (sp3 - args.margin * nrm_v).tolist()
-            standoff_z = pregrasp3[2]
-            target = grasp3[2]
-            floor_abs = max(0.012, float((sp3 - args.max_descend * nrm_v)[2]))
+            def _approach(nrm):                                  # pose set for an approach normal
+                qn = list(R_to_quat_wxyz(R_from_two_axes(-nrm)))
+                pg = (sp3 + args.standoff * nrm).tolist()
+                gr = (sp3 - args.margin * nrm).tolist()
+                fl = max(0.012, float((sp3 - args.max_descend * nrm)[2]))
+                return qn, pg, gr, pg[2], gr[2], fl
+            q_n, pregrasp3, grasp3, standoff_z, target, floor_abs = _approach(nrm_v)
             print(f"\n== object {i+1}: centre [{cxy[0]:.3f},{cxy[1]:.3f}] surf={surf:.3f} "
                   f"normal={np.round(nrm_v,2).tolist()} -> grasp z {target:.3f} ==")
 
@@ -498,12 +616,25 @@ def main():
             marks = {}
             if args.record:
                 jrec.clear(); jrec_on["v"] = True; mon.start_rec()           # RECORD pregrasp+contact
+            if ebag is not None:                                             # mark this object in the run bag
+                ebag.write_phase(f"object_{i}_pregrasp")
             marks["approach"] = t_send = time.time()
             wd = send_weld_descent(pregrasp3, grasp3,
                                    args.v_approach, args.v_des, args.weld_dt, args.weld_ramp,
                                    v_contact_deg=args.v_contact, slow_frac=args.slow_frac, quat=q_n)
+            if wd is None and args.angled and abs(float(nrm_v[2])) < 0.999:
+                # angled (tilted) grasp pose unreachable -> fall back to a VERTICAL approach
+                print("  angled weld plan FAILED -> retrying VERTICAL approach")
+                nrm_v = np.array([0.0, 0.0, 1.0])
+                q_n, pregrasp3, grasp3, standoff_z, target, floor_abs = _approach(nrm_v)
+                marks["approach"] = t_send = time.time()
+                wd = send_weld_descent(pregrasp3, grasp3,
+                                       args.v_approach, args.v_des, args.weld_dt, args.weld_ramp,
+                                       v_contact_deg=args.v_contact, slow_frac=args.slow_frac, quat=q_n)
             if wd is None:
-                jrec_on["v"] = False; mon.stop_rec(); print("  weld plan FAILED"); continue
+                jrec_on["v"] = False; mon.stop_rec()
+                if ebag is not None: ebag.write_phase(f"object_{i}_plan_failed")
+                print("  weld plan FAILED"); continue
             marks["pregrasp"] = t_send + wd["junc_t"]                # via-point pass-through time (non-zero v)
             print(f"  weld: {wd['n']} wpts, ~{wd['T']:.1f}s, pregrasp@{wd['junc_t']:.1f}s, "
                   f"peak {wd['peak_degs']:.0f}deg/s")
@@ -530,6 +661,7 @@ def main():
                 blue_hit = dy2 is not None and dy2 >= args.blue_thresh
                 if past_pregrasp and contact_z is None and blue_hit:
                     contact_z = z; marks["contact"] = time.time()
+                    if ebag is not None: ebag.write_phase("contact")
                     send_hold(); print(f"  >> CONTACT (blue-dot {dy2:+.1f}px) HOLD at z={z:.3f} "
                                        f"vz={vz*1000:.0f}mm/s"); break
                 if now - last_print > 0.2:
@@ -542,6 +674,7 @@ def main():
                         send_descent_nb(grasp_cur, args.v_contact, quat=q_n)
                         print(f"  no contact yet; extending descent -> z={descent_target:.3f}")
                     else:
+                        if ebag is not None: ebag.write_phase("floor_no_contact")
                         send_hold(); print("  reached floor, no contact"); break
                 if z <= floor_abs + 1e-3:
                     send_hold(); print("  hit hard floor"); break
@@ -575,40 +708,94 @@ def main():
                             break
                     Tc = fk_T(state.get_q()); print(f"  grasp-press -> z={float(Tc[2, 3]):.3f}")
                 # GRASP: suction ON (cup pressed on the object), seal dwell = the only v=0
+                if ebag is not None: ebag.write_phase("grasp")
                 suction_test.set_pin(True, args.suction_host, args.suction_user); print("  suction ON; sealing")
                 ts = time.time()
                 while time.time() - ts < args.seal_dwell:
                     rclpy.spin_once(node, timeout_sec=0.02)
-                # COLLISION-AWARE place: the carried object hangs ~(contact_z - table) below the tip,
-                # so lift it straight up CLEAR of the box rim, carry it over the box at that height, and
-                # release above the rim -> the object volume can't clip the box.
-                down_extent = max(0.02, float(Tc[2, 3]) - args.table_z)
+                # COLLISION-AWARE place. Two modes:
                 rim_z = box_xyz[2] + args.box_size
-                transit_z = min(0.42, rim_z + args.release_clear + down_extent)
-                lift_xyz = [float(Tc[0, 3]), float(Tc[1, 3]), transit_z]          # straight up, clear of rim
-                place_pose = [box_xyz[0], box_xyz[1], transit_z]                  # carry over the box, high
-                print(f"  carried object hangs ~{down_extent*100:.0f}cm -> transit/release z={transit_z:.2f} "
-                      f"(rim {rim_z:.2f})")
-                # WELDED carry: contact -> lift(non-zero v) -> place pose over the bin
-                send_weld_place(lift_xyz, place_pose, args.place_vel, args.weld_dt, args.weld_ramp)
-                # RELEASE over the bin, let it drop
-                suction_test.set_pin(False, args.suction_host, args.suction_user); print("  released")
-                tr = time.time()
-                while time.time() - tr < 0.3:
-                    rclpy.spin_once(node, timeout_sec=0.02)
-                # WELDED return to base from the place pose
-                Tp = fk_T(state.get_q())
-                send_weld_return([float(Tp[0, 3]), float(Tp[1, 3]), min(0.32, float(Tp[2, 3]) + 0.05)],
-                                 args.return_vel, args.weld_dt, args.weld_ramp)
+                if args.planner_place:
+                    # PLANNER-SIDE: attach the grasped object's bbox (extended down to the table, since the
+                    # camera sees only its top) to the cuRobo planner; with the box walls already in the world,
+                    # cuRobo natively routes the held object OVER the rim and lowers it INTO the box.
+                    P = o["pts"]; bmin = P.min(0); bmax = P.max(0)
+                    ex = float(bmax[0] - bmin[0]) + args.box_margin
+                    ey = float(bmax[1] - bmin[1]) + args.box_margin
+                    top = float(bmax[2]); bot = float(args.table_z)
+                    ez = max(0.02, top - bot); cz = (top + bot) / 2.0
+                    obj_pose = [float((bmin[0] + bmax[0]) / 2), float((bmin[1] + bmax[1]) / 2), cz, 1, 0, 0, 0]
+                    grasp_q = list(map(float, state.get_q()))          # config holding the object right now
+                    ar = pc.rpc({"type": "attach", "grasp_q": grasp_q,
+                                 "dims": [ex, ey, ez], "obj_pose": obj_pose})
+                    place_z = rim_z - 0.01   # dip only to the rim; deeper drives the wrist/camera into the box
+                    place_pose = [box_xyz[0], box_xyz[1], float(place_z)]
+                    lift_xyz = [float(Tc[0, 3]), float(Tc[1, 3]), min(0.42, rim_z + 0.06)]   # clear the rim first
+                    print(f"  attached obj dims={[round(ex,3),round(ey,3),round(ez,3)]} "
+                          f"({ar.get('n_managers')} mgrs) -> place INTO box, tcp z={place_z:.2f} (rim {rim_z:.2f})")
+                else:
+                    # GEOMETRIC: lift straight up CLEAR of the rim, carry over the box, release above it.
+                    down_extent = max(0.02, float(Tc[2, 3]) - args.table_z)
+                    transit_z = min(0.42, rim_z + args.release_clear + down_extent)
+                    lift_xyz = [float(Tc[0, 3]), float(Tc[1, 3]), transit_z]      # straight up, clear of rim
+                    place_pose = [box_xyz[0], box_xyz[1], transit_z]              # carry over the box, high
+                    print(f"  carried object hangs ~{down_extent*100:.0f}cm -> transit/release z={transit_z:.2f} "
+                          f"(rim {rim_z:.2f})")
+                did_sweep = False
+                if args.stream:
+                    # CROSS-WELDED post-grasp sweep: lift -> place -> return as ONE continuous
+                    # motion (non-zero junctions), releasing suction ON THE FLY at the place
+                    # junction (object drops as the cup sweeps over the box). v=0 only at grasp.
+                    if ebag is not None: ebag.write_phase("sweep")
+                    starts = stream_weld_sweep([("pose", lift_xyz), ("pose", place_pose),
+                                                ("joint", C.BASE_Q)])
+                    if starts is not None:
+                        did_sweep = True
+                        t_rel = starts[2]                          # place->return junction
+                        while time.time() < t_rel:
+                            rclpy.spin_once(node, timeout_sec=0.02)
+                        if ebag is not None: ebag.write_phase("release")
+                        suction_test.set_pin(False, args.suction_host, args.suction_user)
+                        print("  released on-the-fly at the place junction")
+                        if args.planner_place:
+                            pc.rpc({"type": "detach"})
+                        tend = t_rel + 9.0
+                        while time.time() < tend:                  # let the sweep finish at base
+                            rclpy.spin_once(node, timeout_sec=0.05)
+                            if float(np.degrees(np.abs(state.get_q()[:6] - C.BASE_Q)).max()) < 6.0:
+                                break
+                        print("  cross-welded sweep done (no settle between lift/place/return)")
+                if not did_sweep:
+                    # WELDED carry: contact -> lift(non-zero v) -> place pose over/into the bin
+                    if ebag is not None: ebag.write_phase("place")
+                    send_weld_place(lift_xyz, place_pose, args.place_vel, args.weld_dt, args.weld_ramp)
+                    # RELEASE over the bin, let it drop
+                    if ebag is not None: ebag.write_phase("release")
+                    suction_test.set_pin(False, args.suction_host, args.suction_user); print("  released")
+                    if args.planner_place:
+                        pc.rpc({"type": "detach"}); print("  detached object from planner")
+                    tr = time.time()
+                    while time.time() - tr < 0.3:
+                        rclpy.spin_once(node, timeout_sec=0.02)
+                    # WELDED return to base from the place pose
+                    Tp = fk_T(state.get_q())
+                    if ebag is not None: ebag.write_phase("return")
+                    send_weld_return([float(Tp[0, 3]), float(Tp[1, 3]), min(0.32, float(Tp[2, 3]) + 0.05)],
+                                     args.return_vel, args.weld_dt, args.weld_ramp)
             else:
                 # touch-only: WELDED return current -> lift(non-zero v) -> base (torque-feasible)
+                if ebag is not None: ebag.write_phase("return")
                 lift_xyz = [float(Tc[0, 3]), float(Tc[1, 3]), min(0.24, float(Tc[2, 3]) + 0.10)]
                 if not send_weld_return(lift_xyz, args.return_vel, args.weld_dt, args.weld_ramp):
                     print("  weld-return failed -> segmented fallback")
                     goto(lift_xyz, "lift", 12.0); to_base()
+            if ebag is not None:
+                ebag.write_phase(f"object_{i}_done")
 
         to_base()
     finally:
+        if ebag is not None:
+            ebag.stop()                                  # close the single run rosbag
         mon.stop_evt.set(); mon.join(timeout=3)
         print("== done ==")
         rclpy.shutdown()
