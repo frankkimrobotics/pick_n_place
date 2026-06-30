@@ -1,0 +1,110 @@
+<mujoco model="mycobot_sim">
+  <compiler angle="radian" meshdir="meshes" autolimits="true"/>
+  <option timestep="0.002" gravity="0 0 -9.81"/>
+  <visual><global offwidth="1280" offheight="960"/>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.4 0.4 0.4"/><map znear="0.01"/></visual>
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" rgb1=".2 .3 .4" rgb2=".1 .15 .2" width="300" height="300"/>
+    <material name="grid" texture="grid" texrepeat="8 8" reflectance=".1"/>
+    <material name="metal" rgba="0.7 0.72 0.75 1"/>
+    <material name="box" rgba="0.27 0.43 0.78 1"/>
+    <material name="table" rgba="0.55 0.55 0.58 1"/>
+    <material name="o0" rgba="0.85 0.35 0.24 1"/>
+    <material name="o1" rgba="0.30 0.69 0.31 1"/>
+    <material name="o2" rgba="0.20 0.55 0.86 1"/>
+    <material name="o3" rgba="0.95 0.61 0.07 1"/>
+    <material name="o4" rgba="0.61 0.35 0.71 1"/>
+    <material name="o5" rgba="0.90 0.80 0.16 1"/>
+    <material name="o6" rgba="0.40 0.76 0.75 1"/>
+    <mesh name="base" file="base.stl"/>
+    <mesh name="link1" file="link1.stl"/>
+    <mesh name="link2" file="link2.stl"/>
+    <mesh name="link3" file="link3.stl"/>
+    <mesh name="link4" file="link4.stl"/>
+    <mesh name="link5" file="link5.stl"/>
+    <mesh name="link6" file="link6.stl"/>
+    <mesh name="camera_mount" file="camera_mount.stl"/>
+    <mesh name="suction_cup" file="suction_cup.stl"/>
+  </asset>
+  <worldbody>
+    <light pos="0.3 0.1 1.5" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+    <geom name="floor" type="plane" size="2 2 0.1" pos="0 0 -0.1200" material="grid"/>
+    <geom name="table" type="box" pos="0.38 0.00 -0.0100" size="0.20 0.22 0.01" material="table"/>
+    <!-- place bin at [0.10,0.40], floor top at 0.0, ~12 cm walls -->
+    <geom name="box_floor" type="box" pos="0.1000 0.4000 -0.0050" size="0.1100 0.1100 0.0050" material="box"/>
+    <geom name="box_xm" type="box" pos="-0.0050 0.4000 0.0600" size="0.0050 0.1100 0.0600" material="box"/>
+    <geom name="box_xp" type="box" pos="0.2050 0.4000 0.0600" size="0.0050 0.1100 0.0600" material="box"/>
+    <geom name="box_ym" type="box" pos="0.1000 0.2950 0.0600" size="0.1000 0.0050 0.0600" material="box"/>
+    <geom name="box_yp" type="box" pos="0.1000 0.5050 0.0600" size="0.1000 0.0050 0.0600" material="box"/>
+    <camera name="iso" pos="1.05 -0.55 0.78" xyaxes="0.45 0.89 0 -0.5 0.25 0.83"/>
+    <camera name="front" pos="0.38 -0.85 0.45" xyaxes="1 0 0 0 0.45 0.89"/>
+    <camera name="top" pos="0.38 0.0 0.9" xyaxes="1 0 0 0 1 0"/>
+    <body name="base_link" pos="0 0 0">
+        <body name="base" pos="0.000000 0.000000 0.000000" quat="1.000000 0.000000 0.000000 0.000000">
+            <geom type="mesh" mesh="base" material="metal" contype="0" conaffinity="0"/>
+            <body name="link1" pos="0.000000 0.000000 0.229340" quat="1.000000 0.000000 0.000000 0.000000">
+                <joint name="joint1" type="hinge" axis="0.0000 0.0000 1.0000" range="-3.1416 3.1416" damping="1.0"/>
+                <geom type="mesh" mesh="link1" material="metal" contype="0" conaffinity="0"/>
+                <body name="link2" pos="0.000000 0.000000 0.000000" quat="-0.500023 -0.499975 0.500025 -0.499977">
+                    <joint name="joint2" type="hinge" axis="0.0000 0.0000 -1.0000" range="-3.1416 3.1416" damping="1.0"/>
+                    <geom type="mesh" mesh="link2" material="metal" contype="0" conaffinity="0"/>
+                    <body name="link3" pos="0.270000 0.000000 0.000000" quat="1.000000 0.000000 0.000000 0.000000">
+                        <joint name="joint3" type="hinge" axis="0.0000 0.0000 -1.0000" range="-2.6100 2.6180" damping="1.0"/>
+                        <geom type="mesh" mesh="link3" material="metal" contype="0" conaffinity="0"/>
+                        <body name="link4" pos="0.267000 0.000000 -0.074500" quat="0.707105 0.000000 0.000000 0.707108">
+                            <joint name="joint4" type="hinge" axis="0.0000 0.0000 -1.0000" range="-2.9670 2.9670" damping="1.0"/>
+                            <geom type="mesh" mesh="link4" material="metal" contype="0" conaffinity="0"/>
+                            <body name="link5" pos="0.000000 -0.095000 0.002000" quat="0.500048 0.500000 -0.500000 0.499952">
+                                <joint name="joint5" type="hinge" axis="0.0000 0.0000 1.0000" range="-2.9300 2.9321" damping="1.0"/>
+                                <geom type="mesh" mesh="link5" material="metal" contype="0" conaffinity="0"/>
+                                <body name="link6" pos="-0.054000 0.000000 0.000000" quat="0.707141 -0.707073 0.000000 0.000000">
+                                    <joint name="joint6" type="hinge" axis="-1.0000 0.0000 0.0000" range="-3.0300 3.0368" damping="1.0"/>
+                                    <geom type="mesh" mesh="link6" material="metal" contype="0" conaffinity="0"/>
+                                    <body name="camera_mount" pos="-0.003000 -0.003000 0.000000" quat="0.000003 -0.707105 0.000003 0.707108">
+                                        <geom type="mesh" mesh="camera_mount" material="metal" contype="0" conaffinity="0"/>
+                                    </body>
+                                    <body name="suction_cup" pos="0.000000 0.000000 0.000000" quat="0.707105 0.000000 0.707108 0.000000">
+                                        <geom type="mesh" mesh="suction_cup" material="metal" contype="0" conaffinity="0"/>
+                                        <body name="tcp" pos="0.000000 0.000000 -0.145000" quat="-0.000004 1.000000 0.000000 0.000000">
+                                            <site name="tcp" size="0.005" rgba="1 0 0 1"/>
+                                            <site name="tip_rf" size="0.004" rgba="0 1 0 0.6"/>
+                                        </body>
+                                        <body name="eef" pos="0.000000 0.000000 -0.105000" quat="-0.000004 1.000000 0.000000 0.000000">
+                                        </body>
+                                    </body>
+                                </body>
+                            </body>
+                        </body>
+                    </body>
+                </body>
+            </body>
+        </body>
+    </body>
+    <!-- cluttered objects on the table (kinematic; freejoints) -->
+    <body name="object0" pos="0.340 0.050 0.030"><freejoint name="obj0_free"/>
+      <geom name="g_object0" type="cylinder" size="0.026 0.030" material="o0" mass="0.05"/></body>
+    <body name="object1" pos="0.405 -0.055 0.040"><freejoint name="obj1_free"/>
+      <geom name="g_object1" type="box" size="0.025 0.025 0.040" material="o1" mass="0.05"/></body>
+    <body name="object2" pos="0.375 0.105 0.025"><freejoint name="obj2_free"/>
+      <geom name="g_object2" type="cylinder" size="0.030 0.025" material="o2" mass="0.05"/></body>
+    <body name="object3" pos="0.445 0.030 0.035"><freejoint name="obj3_free"/>
+      <geom name="g_object3" type="cylinder" size="0.022 0.035" material="o3" mass="0.05"/></body>
+    <body name="object4" pos="0.330 -0.110 0.022"><freejoint name="obj4_free"/>
+      <geom name="g_object4" type="box" size="0.030 0.030 0.022" material="o4" mass="0.05"/></body>
+    <body name="object5" pos="0.460 -0.085 0.030"><freejoint name="obj5_free"/>
+      <geom name="g_object5" type="cylinder" size="0.028 0.030" material="o5" mass="0.05"/></body>
+    <body name="object6" pos="0.300 0.095 0.028"><freejoint name="obj6_free"/>
+      <geom name="g_object6" type="cylinder" size="0.024 0.028" material="o6" mass="0.05"/></body>
+  </worldbody>
+  <actuator>
+    <position name="act_joint1" joint="joint1" kp="80" ctrlrange="-6.5 6.5"/>
+    <position name="act_joint2" joint="joint2" kp="80" ctrlrange="-6.5 6.5"/>
+    <position name="act_joint3" joint="joint3" kp="80" ctrlrange="-6.5 6.5"/>
+    <position name="act_joint4" joint="joint4" kp="80" ctrlrange="-6.5 6.5"/>
+    <position name="act_joint5" joint="joint5" kp="80" ctrlrange="-6.5 6.5"/>
+    <position name="act_joint6" joint="joint6" kp="80" ctrlrange="-6.5 6.5"/>
+  </actuator>
+  <sensor>
+    <rangefinder name="tip_range" site="tip_rf"/>
+  </sensor>
+</mujoco>
