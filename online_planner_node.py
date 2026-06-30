@@ -202,8 +202,10 @@ def main():
                          "hardware via weld-controller: /planner/weld_chunks)")
     ap.add_argument("--goal", default=None, help="goal tcp pose x,y,z (cup-down)")
     ap.add_argument("--goal-joint", default=None, help="goal joint config (6 rad)")
-    ap.add_argument("--plan-hz", type=float, default=10.0)
-    ap.add_argument("--horizon", type=float, default=0.20, help="chunk horizon (s)")
+    ap.add_argument("--plan-hz", type=float, default=10.0, help="chunk emit rate (Hz) -> 10 = every 0.1s")
+    ap.add_argument("--horizon", type=float, default=0.40,
+                    help="chunk horizon (s): 0.4s @ dt=0.01 = 40 waypoints. Must exceed the "
+                         "controller's dead-time lead so q_ref(now+lead) is always in-chunk.")
     ap.add_argument("--commit", type=float, default=0.06, help="anchor lead (slice+comms; AFTER planning)")
     ap.add_argument("--plan-lead", type=float, default=0.30, help="predict start this far ahead when replanning")
     ap.add_argument("--blend", type=float, default=0.06, help="weld blend window (s)")
