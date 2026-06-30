@@ -175,6 +175,24 @@ def main():
     ap.add_argument("--weld-dt", type=float, default=0.06, help="uniform traj_dt of the re-timed weld (s)")
     ap.add_argument("--weld-ramp", type=float, default=0.12, help="junction decel window in joint arc-length (rad)")
     ap.add_argument("--gap-contact", type=float, default=0.005, help="raw gap (m) at which to HOLD = contact")
+    ap.add_argument("--gap-stop", action="store_true",
+                    help="use the GAP (annulus-rim depth) as the active contact trigger (not just log). "
+                         "Good for WIDE circular-top objects where the ring sees the object; blue-dot stays as a backup.")
+    ap.add_argument("--ring-px", type=int, default=5,
+                    help="with --gap-stop: thickness (px) of the ring around the mushroom rim used for the gap "
+                         "(the thin cup-mask annulus has depth errors)")
+    ap.add_argument("--gap-descend", type=float, default=0.032,
+                    help="with --gap-stop: the gap fires ~constant offset ABOVE the surface (proximity gate); "
+                         "after it fires, descend this far open-loop to actually touch (tune to the observed offset)")
+    ap.add_argument("--open-touch", action="store_true",
+                    help="OPEN-LOOP touch: no contact sensing -- descend to the grasp depth (surf-margin) and hold; "
+                         "the compliant cup presses. Works because the controller tracks to ~1mm (depth/vision sensing "
+                         "is impossible -- cup is in the D405 near-field blind spot). Most reliable for the wide tops.")
+    ap.add_argument("--torque-stop", action="store_true",
+                    help="TORQUE-based contact: watch joint torque from the drive feedback; HOLD when it rises past "
+                         "--torque-thresh (the arm loads up as the compliant cup presses). No camera.")
+    ap.add_argument("--torque-thresh", type=float, default=0.15,
+                    help="torque-rise (fraction of rated, summed over the descending joints) that = contact")
     ap.add_argument("--blue-dot", default=os.path.join(C.OUT_DIR, "blue_dot_mask.npz"))
     ap.add_argument("--blue-thresh", type=float, default=3.0, help="blue-dot rise (px) = contact")
     ap.add_argument("--post-dwell", type=float, default=0.5, help="wait after contact before returning (s)")
@@ -187,6 +205,11 @@ def main():
     ap.add_argument("--box-fp", type=float, default=0.25, help="box inner footprint width (m, for planner walls)")
     ap.add_argument("--table-z", type=float, default=0.015, help="table top height (for carried-object hang extent)")
     ap.add_argument("--release-clear", type=float, default=0.05, help="object bottom clears the rim by this at release")
+    ap.add_argument("--carry-z", type=float, default=None,
+                    help="override carry/lift height (m): carry the object over at a reachable height instead of "
+                         "the high rim-clearing transit (use when the box xy is near the reach edge)")
+    ap.add_argument("--place-z", type=float, default=None,
+                    help="override release height at the box xy (m): lower and SET DOWN on the table, no rim dip")
     ap.add_argument("--planner-place", action="store_true",
                     help="planner-side carried-object collision: attach the grasped object to the cuRobo "
                          "planner + add the box walls as world obstacles, so the place path natively routes "
@@ -237,10 +260,35 @@ def main():
     from real_grasp import estimate_normals, detect_suction_point
     place_xyz = [float(v) for v in args.place.split(",")]
     box_xyz = [float(v) for v in args.box.split(",")]
+    torque_state = {"t": None}                           # latest joint torque from :9999 (for --torque-stop)
+    if args.torque_stop:
+        def _torque_reader():
+            while True:
+                try:
+                    ts = socket.create_connection((args.suction_host, 9999), timeout=3); ts.settimeout(2); buf = b""
+                    while True:
+                        buf += ts.recv(4096)
+                        while b"\n" in buf:
+                            line, buf = buf.split(b"\n", 1)
+                            try:
+                                d = json.loads(line)
+                                if d.get("torque") is not None:
+                                    torque_state["t"] = d["torque"]
+                            except Exception:
+                                pass
+                except Exception:
+                    time.sleep(1.0)
+        threading.Thread(target=_torque_reader, daemon=True).start()
+        print("  torque-stop: reading joint torque from :9999 (needs the torque-stream online_servo reloaded)")
 
     cup = np.load(args.cup); rim = cup["rim"].astype(bool); ann = cup["ring"].astype(bool)
     dome = cup["dome"].astype(bool) if "dome" in cup.files else cup["mask"].astype(bool)
-    print(f"cup ROI: rim {int(rim.sum())}px, dome arc {int(ann.sum())}px, dome {int(dome.sum())}px")
+    if args.gap_stop:                                  # robust 5px-thick ring around the rim
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (args.ring_px * 2 + 1,) * 2)
+        ann = (cv2.dilate(rim.astype(np.uint8), k) > 0) & ~rim & ~dome
+        print(f"  gap-stop: {args.ring_px}px ring around the mushroom rim ({int(ann.sum())}px) "
+              f"replaces the thin cup-mask annulus")
+    print(f"cup ROI: rim {int(rim.sum())}px, ring {int(ann.sum())}px, dome {int(dome.sum())}px")
     CH, CW = rim.shape                     # match the cup-mask resolution (D405 may default to 848x480)
     mon = GapMonitor(args.serial, CW, CH, rim, ann, dome); mon.start()
     t0 = time.time()
@@ -642,7 +690,7 @@ def main():
             #     well above target (object taller than detection thought).
             print("  welded decel-to-rest descent (gap = log/safety only):")
             contact_z = None; last_print = 0; t0 = time.time(); zhist = collections.deque(maxlen=8)
-            blue_base2 = None                                    # blue-dot baseline re-captured at gate-open
+            blue_base2 = None; torque_base = None                # blue-dot / torque baselines, captured at gate-open
             descent_target = target; grasp_cur = list(grasp3)   # descend-until-contact extends along the normal
             while time.time() - t0 < 35.0:
                 rclpy.spin_once(node, timeout_sec=0.02)
@@ -656,18 +704,43 @@ def main():
                 if past_pregrasp and bluey is not None and blue_base2 is None:
                     blue_base2 = bluey                                          # re-baseline (no contact yet)
                 dy2 = (blue_base2 - bluey) if (blue_base2 is not None and bluey is not None) else None
-                # blue-dot plunger rise is the ONLY contact trigger (gap under-reads near contact and
-                # false-fires above the object; it stays as a log signal only). Endpoint + floor = fallback.
+                tq = torque_state.get("t")
+                if args.torque_stop and tq is not None and past_pregrasp and torque_base is None:
+                    torque_base = list(tq)                       # torque baseline at gate-open (no contact yet)
+                trise = (sum(abs(tq[i] - torque_base[i]) for i in range(min(6, len(tq))))
+                         if (tq is not None and torque_base is not None) else None)
+                # contact triggers: blue-dot plunger rise, gap (proximity), or torque rise (arm loads on press)
                 blue_hit = dy2 is not None and dy2 >= args.blue_thresh
-                if past_pregrasp and contact_z is None and blue_hit:
+                gap_hit = args.gap_stop and (gap is not None) and gap <= args.gap_contact and vz > 0.001
+                torque_hit = args.torque_stop and trise is not None and trise >= args.torque_thresh and vz > 0.001
+                if past_pregrasp and contact_z is None and (blue_hit or gap_hit or torque_hit) and not args.open_touch:
+                    gate = gap_hit and not blue_hit and args.gap_descend > 0
+                    if gate:               # gap = PROXIMITY gate (fires ~constant offset above) -> descend to touch
+                        tz = max(z - args.gap_descend, floor_abs)
+                        print(f"  >> GAP proximity z={z:.3f} (gap {gap*1000:.0f}mm); descending "
+                              f"{args.gap_descend*1000:.0f}mm -> touch z={tz:.3f}")
+                        send_descent_nb([grasp3[0], grasp3[1], tz], args.v_contact, quat=q_n)
+                        td = time.time()
+                        while time.time() - td < 6.0:
+                            rclpy.spin_once(node, timeout_sec=0.02)
+                            if float(fk_T(state.get_q())[2, 3]) <= tz + 0.003:
+                                break
+                        z = float(fk_T(state.get_q())[2, 3])
                     contact_z = z; marks["contact"] = time.time()
                     if ebag is not None: ebag.write_phase("contact")
-                    send_hold(); print(f"  >> CONTACT (blue-dot {dy2:+.1f}px) HOLD at z={z:.3f} "
-                                       f"vz={vz*1000:.0f}mm/s"); break
+                    why = ("torque rise {:.2f}".format(trise) if torque_hit else
+                           "gap-gate+descend" if gate else
+                           (f"gap {gap*1000:.0f}mm" if gap_hit else f"blue-dot {dy2:+.1f}px"))
+                    send_hold(); print(f"  >> CONTACT ({why}) HOLD at z={z:.3f} vz={vz*1000:.0f}mm/s"); break
                 if now - last_print > 0.2:
                     print(f"    z={z:.3f}  vz={vz*1000:.0f}mm/s  gap={'--' if gap is None else f'{gap*1000:.0f}mm'}  "
-                          f"blue_dy={'--' if dy2 is None else f'{dy2:+.1f}px'}"); last_print = now
+                          f"blue_dy={'--' if dy2 is None else f'{dy2:+.1f}px'}  "
+                          f"trise={'--' if trise is None else f'{trise:.2f}'}"); last_print = now
                 if abs(z - descent_target) < 0.002 and vz < 0.002:             # reached target without contact
+                    if args.open_touch:               # OPEN-LOOP touch: hold at grasp z, compliant cup presses
+                        contact_z = z; marks["contact"] = time.time()
+                        if ebag is not None: ebag.write_phase("contact")
+                        send_hold(); print(f"  >> OPEN-TOUCH at grasp z={z:.3f} (compliant press)"); break
                     nxt = np.array(grasp_cur) - 0.008 * nrm_v                  # DESCEND-UNTIL-CONTACT: step along -normal
                     if float(nxt[2]) > floor_abs:
                         grasp_cur = nxt.tolist(); descent_target = grasp_cur[2]
@@ -737,10 +810,12 @@ def main():
                     # GEOMETRIC: lift straight up CLEAR of the rim, carry over the box, release above it.
                     down_extent = max(0.02, float(Tc[2, 3]) - args.table_z)
                     transit_z = min(0.42, rim_z + args.release_clear + down_extent)
-                    lift_xyz = [float(Tc[0, 3]), float(Tc[1, 3]), transit_z]      # straight up, clear of rim
-                    place_pose = [box_xyz[0], box_xyz[1], transit_z]              # carry over the box, high
-                    print(f"  carried object hangs ~{down_extent*100:.0f}cm -> transit/release z={transit_z:.2f} "
-                          f"(rim {rim_z:.2f})")
+                    cz = args.carry_z if args.carry_z is not None else transit_z   # reachable carry height
+                    pz = args.place_z if args.place_z is not None else transit_z   # set-down (no dip) vs high drop
+                    lift_xyz = [float(Tc[0, 3]), float(Tc[1, 3]), cz]             # up to a reachable carry height
+                    place_pose = [box_xyz[0], box_xyz[1], pz]                     # carry over, lower, set down
+                    print(f"  carried object hangs ~{down_extent*100:.0f}cm -> carry z={cz:.2f}, set-down z={pz:.2f} "
+                          f"(transit {transit_z:.2f}, rim {rim_z:.2f})")
                 did_sweep = False
                 if args.stream:
                     # CROSS-WELDED post-grasp sweep: lift -> place -> return as ONE continuous
