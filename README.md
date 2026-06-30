@@ -29,6 +29,33 @@ conventions and ROS2 bridge (siblings `../mycobot_mpc`, `../ros2node`).
 
 ---
 
+## Streaming control (online, 4 ms) + touch methods
+
+The per-command follower (~0.8 s dead-time, above) is superseded by an **online streaming**
+path that drives the arm at **4 ms (250 Hz)** from cuRobo trajectory chunks, plus a set of
+**touch / contact** methods. Full detail in **[TOUCH_METHODS.md](TOUCH_METHODS.md)**.
+
+```
+cuRobo planner (:9997) ── plan full traj, slice 0.4 s chunk every 0.1 s (sliding window)
+  online_planner_node.py ── /planner/weld_chunks ──▶ chunk_to_pi.py ──▶ Pi :9994
+  online_servo.py (Pi, 250 Hz): welds chunks → q_ref(t); target = q_ref(now+lead)
+    (feed-forward lead cancels the constant dead-time) + pure-PD.  Feedback on :9999.
+```
+
+**Touch methods** — `servo_touch.py --stream`:
+- `--open-touch` — open-loop descend to the detected top; the compliant cup presses. **Reliable** (controller tracks to ~1 mm).
+- `--torque-stop` — joint-torque rise (`pro600.joint{i}_torqfb`, now in the `:9999` stream).
+- `--gap-stop` / `--ring-px` / `--gap-descend` — depth gap; **proximity only** (fires ~+41 mm above wide tops).
+
+> **Key finding:** depth/vision contact-sensing is impossible here — the suction cup sits in
+> the D405 near-field blind spot, so its own depth is unmeasurable. Use open-loop or torque.
+
+`touch_chunk.py` + `plot_touch_chunk.py` run touch+return via the chunk path and record an
+mcap rosbag + D405/D435 frames + phase/contact, then plot trajectory/phase/contact/RGB.
+`step_response.py` measures the end-to-end dead-time.
+
+---
+
 ## A. Real pick-and-place
 
 Clear flat tabletop objects into a 25 cm bin, one by one. `real_multi.py` does one object
