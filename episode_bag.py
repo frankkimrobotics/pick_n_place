@@ -35,7 +35,87 @@ from rclpy.serialization import serialize_message
 from sensor_msgs.msg import CompressedImage, Image, JointState, CameraInfo
 from std_msgs.msg import String
 from builtin_interfaces.msg import Time as TimeMsg
+import array
 import rosbag2_py
+
+try:                                    # native .mcap writer (no rosbag2 mcap plugin needed)
+    from mcap_ros2.writer import Writer as _McapWriter
+    from rosbags.typesys import Stores, get_typestore
+    _HAVE_MCAP = True
+except Exception:                       # noqa: BLE001
+    _HAVE_MCAP = False
+_TS = None                              # lazy rosbags typestore (message definitions)
+
+
+class _N:
+    """duck-typed message: the mcap_ros2 encoder wants list fields, rclpy gives ndarrays."""
+
+
+def _conv(m):
+    if hasattr(m, "get_fields_and_field_types"):
+        o = _N()
+        for fn in m.get_fields_and_field_types():
+            setattr(o, fn, _conv(getattr(m, fn)))
+        return o
+    if isinstance(m, np.ndarray):
+        return m.tolist()
+    if isinstance(m, array.array):
+        return bytes(m) if m.typecode in ("b", "B") else m.tolist()
+    if isinstance(m, (bytes, bytearray)):
+        return bytes(m)
+    if isinstance(m, (list, tuple)):
+        return [_conv(x) for x in m]
+    return m
+
+
+class _McapBackend:
+    """Writes one .mcap FILE via mcap_ros2 + rosbags typestore (schemas)."""
+    used = "mcap"
+
+    def __init__(self, out_path, topics):
+        global _TS
+        if _TS is None:
+            _TS = get_typestore(Stores.ROS2_HUMBLE)
+        self.f = open(out_path, "wb")
+        self.w = _McapWriter(self.f)
+        self.schemas = {}
+        for name, typ in topics:
+            msgdef, _ = _TS.generate_msgdef(typ, ros_version=2)
+            self.schemas[name] = self.w.register_msgdef(typ, msgdef)
+
+    def write(self, topic, msg, ns):
+        self.w.write_message(topic=topic, schema=self.schemas[topic],
+                             message=_conv(msg), log_time=ns, publish_time=ns)
+
+    def finish(self):
+        self.w.finish(); self.f.close()
+
+
+class _Rosbag2Backend:
+    """Writes a rosbag2 directory (sqlite3) -- the fallback."""
+    def __init__(self, uri, topics, storage):
+        last = None
+        for sid in (([storage] if storage == "sqlite3" else [storage, "sqlite3"])):
+            try:
+                if os.path.isdir(uri):
+                    shutil.rmtree(uri)
+                w = rosbag2_py.SequentialWriter()
+                w.open(rosbag2_py.StorageOptions(uri=uri, storage_id=sid),
+                       rosbag2_py.ConverterOptions("", ""))
+                for name, typ in topics:
+                    w.create_topic(rosbag2_py.TopicMetadata(
+                        name=name, type=typ, serialization_format="cdr"))
+                self.w = w; self.used = sid
+                return
+            except Exception as e:  # noqa: BLE001
+                last = e
+        raise last
+
+    def write(self, topic, msg, ns):
+        self.w.write(topic, serialize_message(msg), ns)
+
+    def finish(self):
+        self.w = None               # rosbag2 flushes on drop
 
 _TOPICS = [
     ("/camera/color/image_raw", "sensor_msgs/msg/CompressedImage"),
@@ -81,31 +161,23 @@ class EpisodeBag:
 
     # ---- lifecycle ----
     def _open(self, uri):
-        ids = [self.storage] if self.storage == "sqlite3" else [self.storage, "sqlite3"]
-        last = None
-        for sid in ids:
+        if self.storage == "mcap" and _HAVE_MCAP:        # native .mcap file
+            out = uri if uri.endswith(".mcap") else uri + ".mcap"
             try:
-                if os.path.isdir(uri):       # a failed attempt may have created the dir
-                    shutil.rmtree(uri)
-                w = rosbag2_py.SequentialWriter()
-                w.open(rosbag2_py.StorageOptions(uri=uri, storage_id=sid),
-                       rosbag2_py.ConverterOptions("", ""))
-                for name, typ in _TOPICS:
-                    w.create_topic(rosbag2_py.TopicMetadata(
-                        name=name, type=typ, serialization_format="cdr"))
-                self._used_storage = sid
-                if sid != self.storage:
-                    print(f"  [bag] '{self.storage}' plugin unavailable; using '{sid}'")
-                return w
+                b = _McapBackend(out, _TOPICS)
+                self._used_storage = "mcap"; self._uri = out
+                return b
             except Exception as e:  # noqa: BLE001
-                last = e
-        raise last
+                print(f"  [bag] native mcap writer failed ({e}); falling back to sqlite3")
+        b = _Rosbag2Backend(uri, _TOPICS, "sqlite3")     # fallback
+        self._used_storage = b.used; self._uri = uri
+        if b.used != self.storage:
+            print(f"  [bag] '{self.storage}' unavailable; using '{b.used}'")
+        return b
 
     def start(self, uri, frame_getter=None):
-        """Open a bag at `uri` (a directory; removed first if present) and begin
-        recording. `frame_getter` is a callable -> (rgb, depth, K) or None."""
-        if os.path.isdir(uri):
-            shutil.rmtree(uri)
+        """Open a bag at `uri` and begin recording. mcap -> writes `uri`.mcap (one file);
+        sqlite3 -> a rosbag2 dir. `frame_getter` is a callable -> (rgb, depth, K) or None."""
         os.makedirs(os.path.dirname(uri) or ".", exist_ok=True)
         with self._lock:
             self._w = self._open(uri)
@@ -131,7 +203,12 @@ class EpisodeBag:
         with self._lock:
             counts = dict(self._counts)
             self._active = False
-            self._w = None          # drop the writer -> rosbag2 flushes + closes
+            w = self._w; self._w = None
+        if w is not None:
+            try:
+                w.finish()          # flush + close (mcap: finalize index; rosbag2: drop)
+            except Exception as e:  # noqa: BLE001
+                print(f"  [bag] finish error: {e}")
         print("  [bag] closed: " + ", ".join(
             f"{'/'.join(k.strip('/').split('/')[-2:])}={v}"
             for k, v in counts.items() if v))
@@ -142,7 +219,7 @@ class EpisodeBag:
         t = time.time() if t is None else t
         with self._lock:
             if self._active and self._w is not None:
-                self._w.write(topic, serialize_message(msg), int(t * 1e9))
+                self._w.write(topic, msg, int(t * 1e9))      # backend serializes
                 self._counts[topic] = self._counts.get(topic, 0) + 1
 
     def _on_fb(self, msg):
