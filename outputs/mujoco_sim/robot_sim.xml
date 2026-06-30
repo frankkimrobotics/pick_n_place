@@ -65,7 +65,7 @@
                                     </body>
                                     <body name="suction_cup" pos="0.000000 0.000000 0.000000" quat="0.707105 0.000000 0.707108 0.000000">
                                         <geom type="mesh" mesh="suction_cup" material="metal" contype="0" conaffinity="0"/>
-                                        <body name="tcp" pos="0.000000 0.000000 -0.145000" quat="-0.000004 1.000000 0.000000 0.000000">
+                                        <body name="tcp" pos="0.000000 0.000000 -0.115000" quat="-0.000004 1.000000 0.000000 0.000000">
                                             <site name="tcp" size="0.005" rgba="1 0 0 1"/>
                                             <site name="tip_rf" size="0.004" rgba="0 1 0 0.6"/>
                                         </body>

@@ -120,14 +120,20 @@ class Orch(Node):
                 continue
             time.sleep(0.5)
             self.rng = None                                             # drop stale range before the descent
-            self.stream(self.plan(goal_pose=[ox, oy, -0.02] + DOWN), self.a.v_des, watch=True, label="descend")
+            self.stream(self.plan(goal_pose=[ox, oy, -0.05] + DOWN), self.a.v_des, watch=True, label="descend")
             self.suction(True)                                              # range-finder contact -> grasp
-            self.stream(self.plan(goal_pose=[ox, oy, 0.16] + DOWN), 45, label="lift")
-            self.stream(self.plan(goal_pose=[bx, by, 0.14] + DOWN), 45, label="carry")
-            self.stream(self.plan(goal_pose=[bx, by, 0.05] + DOWN), 25, label="lower")
+            self.stream(self.plan(goal_pose=[ox, oy, 0.18] + DOWN), 45, label="lift")    # straight up, no twist
+            # PLACE = swing J1 ONLY over the bin, keeping the lifted base-like shape (no wrist/elbow twist).
+            # cuRobo plan_pose to the bin picks arbitrary IK branches (the twisting); we only borrow its J1.
+            lift_q = self.q.copy()
+            br = self.rpc({"type": "plan_pose", "start_q": [float(x) for x in lift_q],
+                           "goal_pose": [bx, by, 0.16] + DOWN, "max_attempts": 14})
+            carry_q = lift_q.copy()
+            carry_q[0] = (float(np.array(br["trajectory"])[-1][0]) if br.get("success")
+                          else lift_q[0] + np.arctan2(by, bx) - np.arctan2(oy, ox))    # bin bearing (J1)
+            self.stream(self.plan(goal_q=[float(x) for x in carry_q]), 40, label="carry (J1 swing)")
             self.suction(False)                                             # release into bin
-            time.sleep(0.4)
-            self.stream(self.plan(goal_pose=[bx, by, 0.16] + DOWN), 40, label="clear")
+            time.sleep(0.5)
         self.stream(self.plan(goal_q=list(map(float, C.BASE_Q))), 45, label="home")
         time.sleep(1.0)
         self.get_logger().info("== done ==")
