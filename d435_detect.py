@@ -101,8 +101,9 @@ def main():
     print(f"=== D435 detected {len(objs)} object(s) in base ===")
     for j, o in enumerate(objs):
         c = o["centroid"]
-        print(f"  [{j}] base XY [{c[0]:+.3f},{c[1]:+.3f}] z={c[2]:.3f} "
-              f"foot={o['foot']*100:.0f}cm h={o['height']*100:.0f}cm n={len(o['pts'])}")
+        print(f"  [{j}] base XY [{c[0]:+.3f},{c[1]:+.3f}] centroid_z={c[2]:.3f} "
+              f"TOP={o['hi'][2]:.3f} base_z={o['lo'][2]:.3f} "
+              f"foot={o['foot']*100:.0f}cm h={o['height']*100:.0f}cm flat={o['flatness']:.2f} n={len(o['pts'])}")
 
 
 if __name__ == "__main__":

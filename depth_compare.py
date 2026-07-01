@@ -71,7 +71,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("xyz", nargs=3, type=float)
     ap.add_argument("--into", type=float, default=0.015)
-    ap.add_argument("--ring", type=int, default=12, help="ring width around the dome (px)")
+    ap.add_argument("--grow", type=int, default=6, help="grow the dome mask by this many px to cover the FULL cup")
+    ap.add_argument("--ring-in", type=int, default=5, dest="ring_in", help="inner edge of the boundary ring (px OUTSIDE the cup)")
+    ap.add_argument("--ring", type=int, default=12, help="outer edge of the boundary ring (px OUTSIDE the cup)")
     ap.add_argument("--v-des", type=float, default=3.0)
     ap.add_argument("--serial", default="218622271300")
     ap.add_argument("--cup", default=os.path.join(C.OUT_DIR, "cup_mask.npz"))
@@ -83,8 +85,11 @@ def main():
         os.remove(os.path.join(a.out, f))
 
     cup = np.load(a.cup); rim = cup["rim"].astype(bool); ann = cup["ring"].astype(bool)
-    dome = cup["dome"].astype(bool) if "dome" in cup.files else cup["mask"].astype(bool)
-    ring = cv2.dilate(dome.astype(np.uint8), np.ones((a.ring * 2 + 1,) * 2, np.uint8)).astype(bool) & ~dome
+    dome0 = cup["dome"].astype(bool) if "dome" in cup.files else cup["mask"].astype(bool)
+    Kel = lambda r: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r * 2 + 1,) * 2)
+    dome = (cv2.dilate(dome0.astype(np.uint8), Kel(a.grow)) > 0)          # grow the dome to the FULL cup (~100mm)
+    ring = ((cv2.dilate(dome.astype(np.uint8), Kel(a.ring)) > 0)
+            & ~(cv2.dilate(dome.astype(np.uint8), Kel(a.ring_in)) > 0))   # ring OUTSIDE the cup (ring_in..ring px) = table/object
     mon = GapMonitor(a.serial, rim.shape[1], rim.shape[0], rim, ann, dome); mon.start()
     t0 = time.time()
     while not mon.ok and time.time() - t0 < 8:

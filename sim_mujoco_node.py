@@ -32,7 +32,7 @@ import mujoco
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Float64, String
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -83,23 +83,36 @@ class MujocoRobot(Node):
         self.d = mujoco.MjData(self.m)
         self.jadr = [self.m.joint(n).qposadr[0] for n in JOINT_NAMES]
         self.tcp_sid = self.m.site("tcp").id
-        self.obj_adr = self.m.joint("obj_free").qposadr[0]
-        # start at BASE_Q (URDF rad), object at its model rest pose
-        self.q = np.array(C.BASE_Q, float)
-        self._apply(self.q)
-        self._obj_rest = self.d.qpos[self.obj_adr:self.obj_adr + 7].copy()
+        self.rf_id = self.m.sensor("tip_range").id
+        # all freejoint objects (obj0_free, obj1_free, ...): (name, qposadr, half-height)
+        self.objs = []
+        i = 0
+        while True:
+            try:
+                adr = self.m.joint("obj%d_free" % i).qposadr[0]
+            except Exception:
+                break
+            gid = self.m.geom("g_object%d" % i).id
+            sz = self.m.geom_size[gid]
+            hh = float(sz[2] if self.m.geom_type[gid] == mujoco.mjtGeom.mjGEOM_BOX else sz[1])
+            self.objs.append(("object%d" % i, int(adr), hh)); i += 1
 
         self.lock = threading.Lock()
         self._queue = []                  # list of (traj_rad[N,6], dt)
         self.welder = TrajectoryWelder(dof=6, fine_dt=0.01)   # online streaming reference
         self._weld = False
-        self._attached = False
+        self._attached_adr = None         # qposadr of the grasped object (None = none held)
         self._rel = None                  # tcp->object relative transform when grasped
+        # start at BASE_Q (URDF rad), objects at their model rest poses
+        self.q = np.array(C.BASE_Q, float)
+        self._apply(self.q)
         self.fb_dt = 1.0 / fb_hz
         self.render_dt = 1.0 / render_hz
 
         self.pub_js = self.create_publisher(JointState, "/joint_states", 10)
         self.pub_fb = self.create_publisher(JointState, "/mycobot/drive_feedback", 50)
+        self.pub_rf = self.create_publisher(Float64, "/sim/tip_range", 10)      # range finder at cup tip
+        self.pub_obj = self.create_publisher(String, "/sim/objects", 10)        # object poses (JSON)
         self.create_subscription(String, "/mycobot/cmd/move", self._on_cmd, 10)
         self.create_subscription(Bool, "/mycobot/suction", self._on_suction, 10)
 
@@ -117,12 +130,12 @@ class MujocoRobot(Node):
     def _apply(self, q):
         for a, v in zip(self.jadr, q):
             self.d.qpos[a] = float(v)
-        if getattr(self, "_attached", False) and self._rel is not None:
+        if self._attached_adr is not None and self._rel is not None:
             mujoco.mj_forward(self.m, self.d)
             Ttcp = _T(self.d.site_xpos[self.tcp_sid], self.d.site_xmat[self.tcp_sid])
             Tobj = Ttcp @ self._rel
-            self.d.qpos[self.obj_adr:self.obj_adr + 3] = Tobj[:3, 3]
-            self.d.qpos[self.obj_adr + 3:self.obj_adr + 7] = _quat_wxyz(Tobj[:3, :3])
+            self.d.qpos[self._attached_adr:self._attached_adr + 3] = Tobj[:3, 3]
+            self.d.qpos[self._attached_adr + 3:self._attached_adr + 7] = _quat_wxyz(Tobj[:3, :3])
         mujoco.mj_forward(self.m, self.d)
 
     # ---- ROS callbacks (spin thread) ----
@@ -148,18 +161,24 @@ class MujocoRobot(Node):
     def _on_suction(self, msg):
         with self.lock:
             want = bool(msg.data)
-            if want and not self._attached:
-                Ttcp = _T(self.d.site_xpos[self.tcp_sid], self.d.site_xmat[self.tcp_sid])
-                op = self.d.qpos[self.obj_adr:self.obj_adr + 3]
-                oq = self.d.qpos[self.obj_adr + 3:self.obj_adr + 7]
-                Tobj = _T(op, _quat_to_mat(oq))
-                self._rel = np.linalg.inv(Ttcp) @ Tobj
-                self.get_logger().info("suction ON: object attached to tcp")
-            elif not want and self._attached:
-                self.get_logger().info("suction OFF: object released")
-            self._attached = want
-            if not want:
-                self._rel = None
+            if want and self._attached_adr is None:
+                tcp = self.d.site_xpos[self.tcp_sid]; best = None; bd = 0.065
+                for _, adr, _hh in self.objs:                    # nearest object under the tcp
+                    op = self.d.qpos[adr:adr + 3]
+                    dxy = float(np.hypot(op[0] - tcp[0], op[1] - tcp[1]))
+                    if op[2] < tcp[2] + 0.03 and dxy < bd:
+                        bd = dxy; best = adr
+                if best is not None:
+                    Ttcp = _T(self.d.site_xpos[self.tcp_sid], self.d.site_xmat[self.tcp_sid])
+                    op = self.d.qpos[best:best + 3]; oq = self.d.qpos[best + 3:best + 7]
+                    self._rel = np.linalg.inv(Ttcp) @ _T(op, _quat_to_mat(oq))
+                    self._attached_adr = best
+                    self.get_logger().info("suction ON: attached object @%d (dxy=%.3f)" % (best, bd))
+                else:
+                    self.get_logger().info("suction ON: no object under tcp")
+            elif not want and self._attached_adr is not None:
+                self.get_logger().info("suction OFF: released")
+                self._attached_adr = None; self._rel = None
 
     # ---- sim + feedback + render loop (single thread owns self.d) ----
     def _loop(self):
@@ -219,6 +238,10 @@ class MujocoRobot(Node):
         fb.position = [float(x) for x in deg]                     # LinuxCNC deg
         fb.velocity = [float(x) for x in vel]                     # deg/s
         self.pub_fb.publish(fb)
+        rf = Float64(); rf.data = float(self.d.sensordata[self.rf_id]); self.pub_rf.publish(rf)
+        with self.lock:
+            objs = [{"name": n, "xyz": [float(x) for x in self.d.qpos[a:a + 3]]} for n, a, _ in self.objs]
+        self.pub_obj.publish(String(data=json.dumps(objs)))
 
     def _grab(self):
         try:
