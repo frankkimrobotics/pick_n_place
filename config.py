@@ -49,11 +49,15 @@ T_TCP_CAM = np.array([
 # planned tcp matches the physical cup tip. Because camera pose is computed as
 # fk(tcp) @ T_tcp_cam, a consistent correction of (HANDEYE_TCP_LEN - PLANNER_TCP_LEN)
 # along the tcp +Z axis must be applied so perception stays accurate after the change.
-HANDEYE_TCP_LEN = 0.145          # tcp length when the hand-eye was calibrated
-PLANNER_TCP_LEN = 0.145          # current URDF/planner tcp length (must match the URDF).
-                                 # Restored to 0.145 after the 2026-06-27 floor touch-test
-                                 # (the 0.13 setting made grasps dive ~1.5 cm too deep).
-CAM_TCP_Z_SHIFT = HANDEYE_TCP_LEN - PLANNER_TCP_LEN   # now 0 -> tcp == hand-eye calib frame
+HANDEYE_TCP_LEN = 0.145          # tcp length when the hand-eye was calibrated (camera pose ref; unchanged)
+PLANNER_TCP_LEN = 0.135          # current URDF/planner tcp length (must match the URDF tcp_joint).
+                                 # RE-CALIBRATED 2026-07-01: a J2-shoulder-torque floor touch-test
+                                 # (calib_z.py) showed the suction cup had shortened ~10 mm (compression
+                                 # set from repeated presses) since 2026-06-27, so touches landed high /
+                                 # missed. URDF tcp_joint 0.145 -> 0.135; validated: cup now first-touches
+                                 # the table at model z ~ 0. Camera unchanged, so the 10 mm gap to
+                                 # HANDEYE_TCP_LEN is corrected below.
+CAM_TCP_Z_SHIFT = HANDEYE_TCP_LEN - PLANNER_TCP_LEN   # = 0.010 -> corrects fk(tcp)@T_tcp_cam for the shorter tcp
 
 # --------------------------------------------------------------------------- #
 # D405 colour intrinsics (from d405_intrinsics.json)
