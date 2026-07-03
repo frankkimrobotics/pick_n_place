@@ -534,18 +534,40 @@ def main():
             starts.append(t); t += jdt
         return starts
 
+    def _stream_settle(traj, dt, vmax, label, goal_rad=None):
+        """Route a planned trajectory through the WORKING weld-chunk path (publish_motion ->
+        --stream -> :9994 -> online_servo). The old execute() went to /mycobot/cmd/move ->
+        bridge -> :9998, which online_servo does NOT serve, so those transits never moved the
+        arm (reach_err was just the distance). Retime <= vmax deg/s (SLOW transit) + real settle."""
+        traj = fix_j6(traj)
+        sdt, peak = scale_traj(traj, dt, vmax, 2.0)
+        td = [list(map(float, rad_to_linuxcnc_deg(wp))) for wp in traj]
+        publish_motion({"trajectory": td, "traj_dt": sdt, "target_deg": td[-1], "controller": "pid"})
+        total = sdt * (len(traj) - 1)
+        goal = np.asarray(goal_rad if goal_rad is not None else traj[-1], float)
+        t0 = time.time(); dev = 99.0
+        while time.time() - t0 < total + 5.0:                  # generous: wait past motion + convergence
+            rclpy.spin_once(node, timeout_sec=0.02)
+            cq = state.q
+            if cq is None:
+                continue
+            dev = float(np.degrees(np.abs(np.asarray(cq[:6], float) - goal)).max())
+            if time.time() - t0 > total and dev < 3.0:         # only settle AFTER commanded time
+                break
+        print(f"    [{label}] {len(traj)} wpts ~{total:.1f}s @<= {vmax:.0f} deg/s | reach_err {dev:.1f} deg")
+        return dev < 6.0
+
     def goto(xyz, label, vmax):
         q = state.get_q()
         r = pc.plan_pose(list(map(float, q)), list(map(float, xyz)) + down, max_attempts=14)
         if not r.get("success"):
             print(f"  [{label}] PLAN FAILED"); return False
-        ex = execute(state, pub, fix_j6(r["trajectory"]), r["dt"], "pid", vmax, 2.0, label, track=track)
-        return ex.get("ok")
+        return _stream_settle(r["trajectory"], r["dt"], min(vmax, 8.0), label)
 
     def to_base():
         r = pc.plan_joint(list(map(float, state.get_q())), list(map(float, C.BASE_Q)))
         if r.get("success"):
-            execute(state, pub, fix_j6(r["trajectory"]), r["dt"], "pid", 22.0, 3.0, "to-base", track=track)
+            _stream_settle(r["trajectory"], r["dt"], 8.0, "to-base", goal_rad=C.BASE_Q)
 
     def _save_rec(base, idx, jr, frames, marks, info):
         import shutil
