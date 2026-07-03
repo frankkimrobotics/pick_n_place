@@ -37,11 +37,13 @@ OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
 # --------------------------------------------------------------------------- #
 # Hand-eye extrinsic  T_tcp_cam  (camera pose in tcp frame), from handeye_result.json
 # --------------------------------------------------------------------------- #
+# RE-CALIBRATED 2026-07-03 (calib_handeye.py, 5x7 ChArUco @ [0.4,0,0], 20 views, DANIILIDIS):
+# board-spread 16.3mm (prior extrinsic) -> 6.0mm; correction dpos=12.8mm drot=2.57deg.
 T_TCP_CAM = np.array([
-    [-0.9983998722356762, -0.055265655956255856, 0.011975073758070786, 0.01111958419898037],
-    [0.051808921950663604, -0.9788432303796386, -0.1979438454366913, 0.06128205328288515],
-    [0.02266121634194691, -0.19700669433214563, 0.9801402102057766, -0.09794176471947463],
-    [0.0, 0.0, 0.0, 1.0],
+    [-0.99781957, -0.06596721,  0.00210446,  0.01265501],
+    [ 0.06482786, -0.98557334, -0.1563411 ,  0.06511875],
+    [ 0.01238748, -0.15586378,  0.98770088, -0.11009472],
+    [ 0.0,          0.0,         0.0,          1.0],
 ], dtype=np.float64)
 
 # T_TCP_CAM was calibrated with the tcp at HANDEYE_TCP_LEN below the flange. The real
@@ -133,7 +135,7 @@ OBJECT_HEIGHT      = 0.040
 # bottom-centre (on the table). Frame note: the table top is at z = TABLE_Z = -0.10
 # in the robot base frame, so the rim is at z = TABLE_Z + 0.25 = 0.15.
 BOX_POSE_XYZ       = np.array([0.10, 0.40, TABLE_Z])   # bottom sits on the table
-BOX_INNER          = (0.23, 0.23, 0.25)  # inner W, D, H -> ~25 cm cube outer (1 cm walls)
+BOX_INNER          = (0.38, 0.28, 0.20)  # inner W(x), D(y), H(z) -> 0.4x0.3x0.2 outer bin (1 cm walls)
 BOX_WALL           = 0.010
 
 # Rendering / video
