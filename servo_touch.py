@@ -407,10 +407,12 @@ def main():
         if not r2.get("success"):
             return None
         p1 = np.array(r1["trajectory"]); p2 = np.array(r2["trajectory"])
-        # cap the approach speed to cuRobo's torque-FEASIBLE native peak (never speed past its plan);
-        # forcing a higher flat peak races motor-cmd past feedback -> following-error power-off.
+        # Old (reactive) controller faulted (following-error power-off) if commanded past cuRobo's
+        # native peak, so the approach was pinned to 0.9*nap (~8 deg/s). The FF controller tracks
+        # fast cleanly, so use the FULL requested approach speed -> fast to pregrasp, then v_des/
+        # v_contact keep the final descent gentle. The 56 deg/s ceiling guard below still protects.
         nap = float(np.degrees(np.max(np.abs(np.diff(p1, axis=0))) / r1["dt"])) if len(p1) > 1 else v_app_deg
-        v_app_eff = min(v_app_deg, 0.9 * nap)
+        v_app_eff = min(v_app_deg, 50.0)
         path = np.vstack([p1, p2[1:]]); junc = len(p1) - 1
         vc = np.radians(v_contact_deg) if v_contact_deg is not None else None
         traj, junc_t = _retime(path, junc, np.radians(v_app_eff), np.radians(v_des_deg), dt_ref, ramp,
