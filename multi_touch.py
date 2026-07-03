@@ -22,6 +22,8 @@ for p in (HERE, os.path.abspath(os.path.join(HERE, "..", "mycobot_mpc")),
           os.path.abspath(os.path.join(HERE, "..", "ros2node", "perception"))):
     sys.path.insert(0, p)
 import config as C
+import cup_region as CR
+CUP_REGION = os.path.join(C.OUT_DIR, "cup_region_fixed.npz")   # fixed cup(hull)+above-band masks
 from geometry import R_from_two_axes, R_to_quat_wxyz, make_T, quat_wxyz_to_R
 from joint_conventions import linuxcnc_deg_to_rad, rad_to_linuxcnc_deg
 from object_pointclouds import deproject_mask
@@ -73,7 +75,11 @@ def main():
     ap.add_argument("--scouts",
                     default="0.30,-0.15,0.30;0.30,0.0,0.30;0.30,0.15,0.30;0.43,-0.15,0.30;0.43,0.0,0.30;0.43,0.15,0.30",
                     help="';'-separated scout tip xyz poses to tile the table (wrist-cam FOV is small)")
-    ap.add_argument("--gap-px", type=int, default=6); ap.add_argument("--ring-w", type=int, default=12)
+    ap.add_argument("--step", type=float, default=0.004, help="descent step per tick (m)")
+    ap.add_argument("--contact-gap", type=float, default=0.0,
+                    help="TOUCH when (above_d - cup_d) <= this (m). Calibrated 2026-07-03: ~0 = just-touch")
+    ap.add_argument("--press", type=float, default=0.0,
+                    help="after contact, descend this much further to compress the cup for a SUCTION seal (m)")
     ap.add_argument("--dwell", type=float, default=1.2, help="hold-at-touch seconds")
     args = ap.parse_args()
 
@@ -87,11 +93,7 @@ def main():
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     for _ in range(12): pipe.wait_for_frames(2000)
 
-    cm = np.load(os.path.join(C.OUT_DIR, "cup_mask.npz")); cup = cm["mask"].astype(np.uint8)
-    def dil(m, r): return cv2.dilate(m, np.ones((2 * r + 1, 2 * r + 1), np.uint8))
-    inner = dil(cup, args.gap_px); outer = dil(cup, args.gap_px + args.ring_w)
-    oring = (outer > 0) & (inner == 0)                  # thin annulus, gapped off the rim (no shadow)
-    ry, rx = np.where(oring)
+    cup_m, above_m = CR.load(CUP_REGION)     # fixed: cup = near+dark hull; above = 12px band above the rim
     dargs = SimpleNamespace(xmin=0.15, xmax=0.55, ymin=-0.28, ymax=0.28, max_h=0.13, max_foot=0.18)
 
     def fk_T(qd):
@@ -102,16 +104,6 @@ def main():
         rgb = np.asanyarray(f.get_color_frame().get_data())
         depth = np.asanyarray(f.get_depth_frame().get_data()).astype(np.float32) * scale
         return rgb, depth
-    def clean_surface_z(qd, depth):
-        """base-z surface height under the cup from the offset ring: deproject + MAD reject flying px."""
-        Tbc = fk_T(qd); d = depth[ry, rx]; ok = (d > 0.05) & (d < 0.6)
-        if ok.sum() < 30: return None
-        dd = d[ok]; uu = rx[ok]; vv = ry[ok]
-        Xc = (uu - cx) * dd / fx; Yc = (vv - cy) * dd / fy
-        bz = (np.stack([Xc, Yc, dd, np.ones(len(dd))], 1) @ Tbc.T)[:, 2]
-        med = np.median(bz); mad = np.median(np.abs(bz - med)) + 1e-9
-        return float(np.median(bz[np.abs(bz - med) < 3 * 1.4826 * mad]))
-
     # ---- multi-pose scout: tile the table, merge + dedupe detections ----
     scouts = [[float(v) for v in p.split(",")] for p in args.scouts.split(";")]
     seen = []
@@ -139,23 +131,35 @@ def main():
         if not stream_to(pre, quat, args.v_approach): print("   approach failed, skip"); continue
         time.sleep(0.8)
         print(f"   wrist J6 = {read_q()[5]:+.1f} deg  (held ~base)")
-        # clean surface height from the offset ring, median over frames
-        ss = []
-        for _ in range(12):
-            _, d = grab(); s = clean_surface_z(read_q(), d)
-            if s is not None: ss.append(s)
-        if not ss: print("   no surface reading, skip"); continue
-        surf = float(np.median(ss))
-        target = max(surf - args.descend_below, args.abs_floor)   # SAFE-clamped FK touch target
-        print(f"   surface(offset-ring) = {surf:.4f}  (SAM3 {otop:.3f})  -> FK touch target {target:.4f}")
-        # two-phase slow descent: to just above, then gently to target
-        stream_to([float(oxy[0]), float(oxy[1]), float(surf + 0.008)], quat, args.v_des)
-        stream_to([float(oxy[0]), float(oxy[1]), float(target)], quat, args.v_touch)
-        tip = fk(read_q())[0]
-        print(f"   >>> TOUCH: FK tip z={tip[2]:.4f} (physical ~{tip[2]+args.descend_below:.4f} = surface {surf:.3f})  "
-              f"J6={read_q()[5]:+.1f}deg")
+        # cup(-hull) reference depth = constant (cup rigidly on the cam); median a few frames
+        cds = []
+        for _ in range(8):
+            _, d = grab(); cd, _ = CR.read_depths(d, cup_m, above_m)
+            if cd is not None: cds.append(cd)
+        if not cds: print("   no cup depth, skip"); continue
+        cup_d = float(np.median(cds))
+        # SLOW live descent: the object surface enters the above-band; TOUCH when its depth
+        # falls to the cup(-rim) depth. Depth-based -> no dependence on the TCP-offset.
+        z = float(otop + args.standoff); touched = False
+        while z > args.abs_floor:
+            _, d = grab(); _, surf_d = CR.read_depths(d, cup_m, above_m)
+            gap = (surf_d - cup_d) if surf_d is not None else None
+            if gap is not None and gap <= args.contact_gap:
+                tip = fk(read_q())[0]
+                print(f"   >>> TOUCH: above_d {surf_d:.3f} reached cup_d {cup_d:.3f} (gap {gap*1000:+.0f}mm) at FK z={tip[2]:.3f}")
+                if args.press > 0:                                 # compress cup for a suction seal
+                    pz = max(z - args.press, args.abs_floor)
+                    stream_to([float(oxy[0]), float(oxy[1]), pz], quat, args.v_touch)
+                    print(f"       pressed {args.press*1000:.0f}mm for seal -> FK z={fk(read_q())[0][2]:.3f}")
+                send_chunk({"hold": True}); touched = True; break
+            z -= args.step
+            print(f"   z={z:.3f}  above_d={surf_d:.3f}  cup_d={cup_d:.3f}" if surf_d is not None else f"   z={z:.3f}  above_d=?")
+            stream_to([float(oxy[0]), float(oxy[1]), z], quat, args.v_touch, settle=False)
+            time.sleep(0.45)
+        if not touched:
+            send_chunk({"hold": True}); print("   reached floor, no vision contact")
         time.sleep(args.dwell)
-        stream_to([float(oxy[0]), float(oxy[1]), float(surf + 0.10)], quat, 12.0)   # lift for transit
+        stream_to([float(oxy[0]), float(oxy[1]), float(otop + 0.10)], quat, 12.0)   # lift for transit
 
     print("\n[done] touched all objects; returning to base")
     r = rpc({"type": "plan_joint", "start_q": qrad(read_q()), "goal_q": [float(v) for v in C.BASE_Q], "max_attempts": 12})

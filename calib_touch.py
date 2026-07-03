@@ -21,6 +21,7 @@ for p in (HERE, os.path.abspath(os.path.join(HERE, "..", "mycobot_mpc")),
           os.path.abspath(os.path.join(HERE, "..", "ros2node", "perception"))):
     sys.path.insert(0, p)
 import config as C
+import cup_region as CR
 from geometry import R_from_two_axes, R_to_quat_wxyz, make_T, quat_wxyz_to_R
 from joint_conventions import linuxcnc_deg_to_rad, rad_to_linuxcnc_deg
 from object_pointclouds import deproject_mask
@@ -98,12 +99,16 @@ def main():
     time.sleep(0.8)
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     ys, xs = np.where(ring)
+    cup_m, above_m = CR.load(os.path.join(C.OUT_DIR, "cup_region_fixed.npz"))   # fixed cup(hull)+above-band
     qd = read_q(); pcur, qcur = fk(qd); tip = pcur
     Tbc = make_T(quat_wxyz_to_R(qcur), pcur) @ make_T(np.eye(3), [0, 0, C.CAM_TCP_Z_SHIFT]) @ C.T_TCP_CAM
-    rawd = []; basez = []
+    rawd = []; basez = []; cup_ds = []; surf_ds = []
     for _ in range(20):
         f = align.process(pipe.wait_for_frames(1000))
         depth = np.asanyarray(f.get_depth_frame().get_data()).astype(np.float32) * scale
+        cd, sd = CR.read_depths(depth, cup_m, above_m)
+        if cd is not None: cup_ds.append(cd)
+        if sd is not None: surf_ds.append(sd)
         d = depth[ys, xs]; ok = (d > 0.05) & (d < 0.5)
         dd = d[ok]; uu = xs[ok]; vv = ys[ok]
         rawd.extend(dd.tolist())
@@ -123,6 +128,12 @@ def main():
           f"{np.percentile(basez,90):.3f}")
     print(f"  CLEAN surface z = {surf_z:.4f}  ({len(clean)}/{len(basez)} px kept)")
     print(f"  => gap  tip - surface = {(tip[2]-surf_z)*1000:+.1f} mm  (should match what you SEE)")
+    # NEW cup-region signal (what multi_touch uses): cup(hull) vs above-band depth
+    cup_d = float(np.median(cup_ds)) if cup_ds else None
+    surf_d = float(np.median(surf_ds)) if surf_ds else None
+    if cup_d is not None and surf_d is not None:
+        print(f"  cup_region: cup_d={cup_d:.4f}  above_d={surf_d:.4f}  GAP(above-cup)={(surf_d-cup_d)*1000:+.1f} mm")
+        print(f"     -> when it JUST TOUCHES, set multi_touch --contact-gap to this GAP value")
     print("=" * 60)
     pipe.stop()
 
