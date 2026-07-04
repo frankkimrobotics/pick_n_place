@@ -64,36 +64,47 @@ graph LR
 
 ## 3. Calibrated multi-object touch — `multi_touch.py`  ⭐ (current best)
 
-Scans the table from several wrist-cam viewpoints, then touches each object's **center** at its
-own measured height, gently, using **clean cup-mask depth** (no torque, SAM-3 only for the scan).
+Scans the table from several wrist-cam viewpoints, then touches each object's **center** gently
+using a **DEPTH-BASED cup-region contact** — no torque, no per-object height guess, and **no
+TCP-offset dependence** (SAM-3 is used only for the coarse scan).
 
 ```mermaid
 graph TD
-  S["multi-pose SCOUT<br/>tile table, SAM-3 detect,<br/>dedupe <4cm"] --> L{"for each object"}
-  L --> A["fast approach → pregrasp<br/>(xy, top+5cm) @ ~26°/s"]
-  A --> M["measure CLEAN surface z<br/>offset-ring deproject + MAD<br/>(rim-gapped, no shadow)"]
-  M --> T["target = surface − 0.019<br/>(TCP offset), floor-clamped"]
-  T --> D["2-phase slow descent<br/>v_des 6 → v_touch 2.5°/s"]
-  D --> H["hold (touch) → lift"]
+  S["multi-pose SCOUT<br/>tile table, SAM-3 detect, dedupe <4cm"] --> L{"for each object"}
+  L --> A["fast approach → pregrasp @ ~26°/s"]
+  A --> M["cup_d = median depth over CUP-HULL mask<br/>(cup fixed to cam → ~constant 0.09m)"]
+  M --> D["SLOW live descent:<br/>above_d = depth over 12px band ABOVE cup rim"]
+  D --> T["TOUCH when above_d − cup_d ≤ --contact-gap (0)<br/>= object surface reaches the cup rim"]
+  T --> P["opt --press: descend further to compress cup (suction seal)"]
+  P --> H["hold → lift"]
   H --> L
   L -->|done| B["return to BASE_Q"]
 ```
 
-**Why each piece exists (all learned the hard way this session):**
-- **Offset ring** = cup mask dilated by a 6 px *gap* then a 12 px annulus → clears the rim
-  **shadow / flying pixels** that dragged the raw ring toward the cup depth. See `plot_masks.py` / `outputs/cup_masks.png`.
-- **MAD-clean deproject → base-z** → robust surface height (matches the J6-sweep to ~1 mm).
-- **`surface − 0.019`** → the calibrated **TCP offset** so the physical tip lands on the surface.
-- **safe absolute floor** (`−0.03 m`) → a bad detection can't strand it high or hit the table.
+**The cup-region** (`cup_region.py`, fixed masks in `outputs/cup_region_fixed.npz`):
+- **cup** = convex hull of NEAR(depth<0.20 m)+DARK(V<95) pixels in the bottom-center = the black
+  rubber dome to its rim (depth-robust, lighting-independent). `cup_d` = median depth over it (~0.09 m).
+- **above** = 12 px band directly above the hull = the object-approach zone. `above_d` = median depth over it.
+- **Contact = depth only:** `above_d` falls to `cup_d` as the object reaches the rim → fires at gap≈0
+  (calibrated just-touch). The camera compares object-vs-cup directly, so the ~19 mm TCP offset never enters.
+
+**Why depth, not torque** — validated 2026-07-04 (`table_touch_compare.py`, 5 random bare-table points):
+**depth fired 5/5, σ = 0.5 mm; torque fired 2/5 and only after ~12 mm of press** (the soft suction cup
+absorbs force → J2 torque barely rises). So torque contact is late + flaky on a suction cup; **depth is
+the canonical contact detector**, with torque kept only as a hard-press safety-stop.
 
 <details><summary>▸ args & internals</summary>
 
-- `--descend-below 0.019` (TCP offset), `--abs-floor -0.03`, `--scouts "x,y,z;…"` (6-pose tile),
-  `--v-approach/--v-des/--v-touch`, `--gap-px 6 --ring-w 12`, `--j6-zero` (⚠ see §7).
-- `clean_surface_z(qd,depth)`: deproject offset-ring px → base-z, reject via 3·MAD.
-- Ports: `:9997` plan, `:9994` chunk, `:9999` read joints. Direct sockets (no chunk_to_pi).
-- **Validated 2026-07-03:** 3 objects, heights 0.112 / 0.070 / 0.068 m, all centered + gentle.
+- `--contact-gap 0` (just-touch), `--press <m>` (suction seal), `--step 0.004`, `--v-touch 2.5`,
+  `--abs-floor -0.03`, `--scouts "x,y,z;…"` (6-pose tile). J6 held at base in `stream_to` (§7).
+- `cup_region.read_depths(depth,cup,above) → (cup_d, surf_d)`; rebuild via `build_cup_region(bgr,depth)`.
+- Ports: `:9997` plan, `:9994` chunk, `:9999` joints+torque. Direct sockets (no chunk_to_pi).
+- **Validated:** 4 objects (tops 0.058–0.113 m) touched at gap≈0, each at its own surface (FK z 0.051–0.094).
 </details>
+
+> **Bare-table touch** (no object): `table_touch.py` (random or `--xy` point → depth contact →
+> `--press` ~1 cm → torque safety-stop) and `table_touch_compare.py` (5 points, logs depth vs torque
+> contact FK-z). Both reuse `cup_region`, depth-only.
 
 ---
 
@@ -173,9 +184,16 @@ graph LR
 |--------|-------|--------|
 | `calib_handeye.py` | `T_TCP_CAM` | diverse joint poses of a fixed 5×7 ChArUco, DANIILIDIS |
 | `calib_z.py` | tcp length offset | slow descend, J2 shoulder-torque first-touch |
-| `calib_touch.py` | surface vs FK gap | hold tip at z, offset-ring deproject + MAD, step down |
-| `calib_fixed_static.py` | D435 / fixed-D405 extrinsics | static ChArUco to base |
+| `calib_touch.py` | contact-gap | hold tip at z, prints `cup_d`/`above_d`/gap to calibrate `--contact-gap` |
+| `calib_fixed_static.py` | D435 / fixed-D405 extrinsics | static ChArUco at a **measured** base position → **0.1–0.75 mm** spread |
+| `multi_cam_calib.py` | wrist hand-eye + 2 fixed cams | move→capture 3 cams→`calibrateHandEye(PARK)`→localize boards→fixed cams; from **randomly-placed** boards |
 | `plot_masks.py` | (viz) cup/rim/ring/dome + offset ring → `outputs/cup_masks.png` |
+
+> **Finalized extrinsics → `outputs/extrinsics_final.json`** (chose the more-accurate source per camera):
+> **wrist** = `config.T_TCP_CAM` (eye-in-hand); **both fixed cams** = the `calib_fixed_static` measured-board
+> result. The `multi_cam_calib` random-board method is elegant but **FK-anchored** → capped by the arm's
+> kinematics (~50 mm for fixed cams vs 0.1 mm measured), so it was **rejected** for the fixed cams. Board
+> generation (3 extra dicts, A4/Letter PDFs) in `outputs/calib_boards/`.
 
 > ⚠️ **`--j6-zero` does NOT work yet.** Nudging the goal yaw makes cuRobo **jump IK branches**
 > (J6 bounced 98°→−162°→34°→69°→137°→−85°). J6=0 needs a **joint-lock / branch-select in the

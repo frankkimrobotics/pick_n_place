@@ -1,0 +1,33 @@
+{
+  "note": "3 extra ChArUco boards for RGBD recalibration; distinct from the ORIGINAL (DICT_4X4_50, 5x7).",
+  "squares_XY": [
+    5,
+    7
+  ],
+  "square_m": 0.035,
+  "marker_m": 0.026,
+  "dpi": 300,
+  "boards": [
+    {
+      "name": "boardA",
+      "dict": "DICT_5X5_100",
+      "n_markers": 17,
+      "marker_ids": "0..16",
+      "file": "boardA_DICT_5X5_100.png"
+    },
+    {
+      "name": "boardB",
+      "dict": "DICT_6X6_100",
+      "n_markers": 17,
+      "marker_ids": "0..16",
+      "file": "boardB_DICT_6X6_100.png"
+    },
+    {
+      "name": "boardC",
+      "dict": "DICT_4X4_100",
+      "n_markers": 17,
+      "marker_ids": "0..16",
+      "file": "boardC_DICT_4X4_100.png"
+    }
+  ]
+}
