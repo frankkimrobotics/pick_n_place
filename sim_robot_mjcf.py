@@ -71,11 +71,17 @@ def _pose_attrs(T):
 
 
 def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
-          warp=False):
+          warp=False, objects=None, light_pos=(0.3, 0.1, 1.5), out_path=None):
     os.makedirs(MESH_DIR, exist_ok=True)
-    # bake the STL meshes into our sim mesh dir (reuse mujoco_export's baker)
+    # bake the STL meshes into our sim mesh dir (reuse mujoco_export's baker).
+    # Reuse existing bakes: parallel dataset workers otherwise clobber the
+    # shared STLs mid-write and other workers load torn files.
     mex.MESH_DIR = MESH_DIR
-    made = mex.bake_link_meshes()                      # {link: path}
+    made = {lk: os.path.join(MESH_DIR, f"{lk}.stl") for lk in mex.VIS_LINKS
+            if os.path.exists(os.path.join(MESH_DIR, f"{lk}.stl"))
+            and os.path.getsize(os.path.join(MESH_DIR, f"{lk}.stl")) > 100}
+    if len(made) < len(mex.VIS_LINKS):
+        made = mex.bake_link_meshes()                  # {link: path}
     urdf = yourdfpy.URDF.load(C.URDF_PATH, build_scene_graph=True, load_meshes=False)
 
     children = {}
@@ -182,14 +188,16 @@ def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
         f'size="{s[0]:.4f} {s[1]:.4f} {s[2]:.4f}" material="box"/>\n'
         for nm, s, p in walls)
 
-    objs = OBJECTS + (WARP_OBJECTS if warp else [])
+    objs = objects if objects is not None else OBJECTS + (WARP_OBJECTS if warp else [])
     obj_mats = "".join(
-        f'    <material name="o{i}" rgba="{rgba}"/>\n'
-        for i, (_, _, _, _, rgba) in enumerate(objs))
+        f'    <material name="o{i}" rgba="{o[4]}"/>\n'
+        for i, o in enumerate(objs))
     obj_bodies = "".join(
-        f'    <body name="{nm}" pos="{pos}"><freejoint name="obj{i}_free"/>\n'
-        f'      <geom name="g_{nm}" type="{shape}" size="{size}" material="o{i}" mass="0.05"/></body>\n'
-        for i, (nm, shape, size, pos, _) in enumerate(objs))
+        f'    <body name="{o[0]}" pos="{o[3]}"'
+        + (f' quat="{o[5]}"' if len(o) > 5 and o[5] else '') +
+        f'><freejoint name="obj{i}_free"/>\n'
+        f'      <geom name="g_{o[0]}" type="{o[1]}" size="{o[2]}" material="o{i}" mass="0.05"/></body>\n'
+        for i, o in enumerate(objs))
 
     # suction welds for the warp variant: inactive until the controller sets
     # eq_data[3:10] to the tcp->object relpose at grasp and flips eq_active
@@ -216,8 +224,9 @@ def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
 
     meshes = "".join(f'    <mesh name="{lk}" file="{lk}.stl"/>\n' for lk in made)
 
+    meshdir = MESH_DIR if out_path else "meshes"
     xml = f"""<mujoco model="mycobot_sim">
-  <compiler angle="radian" meshdir="meshes" autolimits="true"/>
+  <compiler angle="radian" meshdir="{meshdir}" autolimits="true"/>
   <option timestep="0.002" gravity="0 0 -9.81"/>
   <visual><global offwidth="1280" offheight="960"/>
     <headlight diffuse="0.6 0.6 0.6" ambient="0.4 0.4 0.4"/><map znear="0.01"/></visual>
@@ -229,7 +238,7 @@ def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
     <material name="table" rgba="0.55 0.55 0.58 1"/>
 {obj_mats}{meshes}  </asset>
   <worldbody>
-    <light pos="0.3 0.1 1.5" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+    <light pos="{light_pos[0]:g} {light_pos[1]:g} {light_pos[2]:g}" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
     <geom name="floor" type="plane" size="2 2 0.1" pos="0 0 -0.1200" material="grid"/>
     <geom name="table" type="box" pos="0.38 0.00 -0.0100" size="0.20 0.22 0.01" material="table"/>
     <!-- place bin at [0.10,0.40], floor top at 0.0, ~12 cm walls -->
@@ -249,7 +258,7 @@ def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
 </mujoco>
 """
     os.makedirs(SIM_DIR, exist_ok=True)
-    out = os.path.join(SIM_DIR, "robot_warp.xml" if warp else "robot_sim.xml")
+    out = out_path or os.path.join(SIM_DIR, "robot_warp.xml" if warp else "robot_sim.xml")
     with open(out, "w") as f:
         f.write(xml)
     print(f"[sim-mjcf] wrote {out}  ({len(made)} link meshes, root='{root}')")
