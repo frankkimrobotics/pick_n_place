@@ -119,11 +119,14 @@ def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
                 L.append(f'{ind}<geom name="cup_tip" type="sphere" size="0.008" '
                          f'rgba="0.25 0.25 0.28 1"/>')
                 # wrist D405 from the calibrated hand-eye extrinsic (OpenCV
-                # optical frame -> MuJoCo camera: flip y,z)
+                # optical frame -> MuJoCo camera: flip y,z). Nudged 12 mm
+                # forward along the optical axis, sim-render only: at the real
+                # extrinsic the mount-ring mesh clips the left edge of the FOV
+                # as a gray bar. Perception math keeps using config.T_TCP_CAM.
                 Tc = np.asarray(C.T_TCP_CAM, float)
                 Rmj = Tc[:3, :3] @ np.diag([1.0, -1.0, -1.0])
                 qc = R_to_quat_wxyz(Rmj)
-                p = Tc[:3, 3]
+                p = Tc[:3, 3] + Tc[:3, :3] @ np.array([0.0, 0.0, 0.012])
                 L.append(f'{ind}<camera name="wrist_d405" '
                          f'pos="{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}" '
                          f'quat="{qc[0]:.6f} {qc[1]:.6f} {qc[2]:.6f} {qc[3]:.6f}" '
