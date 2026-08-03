@@ -56,6 +56,11 @@ OBJECTS = [
     ("object5", "cylinder", "0.028 0.030", "0.460 -0.085 0.030", "0.90 0.80 0.16 1"),
     ("object6", "cylinder", "0.024 0.028", "0.300 0.095 0.028", "0.40 0.76 0.75 1"),
 ]
+# warp-only extras: a curved (sphere) object for press-to-seal tests -- a cup
+# pressing off-centre on it slides and shoves it away under real contact
+WARP_OBJECTS = [
+    ("object7", "sphere", "0.030", "0.300 -0.020 0.030", "0.95 0.30 0.55 1"),
+]
 
 
 def _pose_attrs(T):
@@ -78,15 +83,41 @@ def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
         children.setdefault(j.parent, []).append(j)
     root = urdf.base_link
 
+    link_by_name = {l.name: l for l in urdf.robot.links}
+
+    def _inertial_xml(link, ind):
+        """Bake the URDF <inertial> (rotated into the body frame) so mj_inverse
+        RNEA uses the same masses/inertias the cuRobo planner does, instead of
+        mesh-density guesses."""
+        li = link_by_name.get(link)
+        li = getattr(li, "inertial", None)
+        if li is None or li.mass is None or li.mass < 1e-6:
+            return None
+        T = np.asarray(li.origin if li.origin is not None else np.eye(4), float)
+        R, p = T[:3, :3], T[:3, 3]
+        I = R @ np.asarray(li.inertia, float) @ R.T
+        return (f'{ind}<inertial pos="{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}" '
+                f'mass="{li.mass:.6f}" fullinertia="{I[0,0]:.3e} {I[1,1]:.3e} '
+                f'{I[2,2]:.3e} {I[0,1]:.3e} {I[0,2]:.3e} {I[1,2]:.3e}"/>')
+
     def emit(link, depth):
         ind = "    " * (depth + 2)
         L = []
+        if warp:
+            ine = _inertial_xml(link, ind)
+            if ine:
+                L.append(ine)
         if link in made:
             L.append(f'{ind}<geom type="mesh" mesh="{link}" material="metal" '
                      f'contype="0" conaffinity="0"/>')
         if link == "tcp" or link.endswith("tcp"):
             L.append(f'{ind}<site name="tcp" size="0.005" rgba="1 0 0 1"/>')
             L.append(f'{ind}<site name="tip_rf" size="0.004" rgba="0 1 0 0.6"/>')
+            if warp:
+                # the only contact geom on the arm: the cup tip, so press-to-seal
+                # is a real dynamic interaction (robot meshes stay contactless)
+                L.append(f'{ind}<geom name="cup_tip" type="sphere" size="0.008" '
+                         f'rgba="0.25 0.25 0.28 1"/>')
         for j in children.get(link, []):
             T = np.asarray(j.origin if j.origin is not None else np.eye(4), float).copy()
             if j.child in SIM_TIP_Z:
@@ -138,19 +169,20 @@ def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
         f'size="{s[0]:.4f} {s[1]:.4f} {s[2]:.4f}" material="box"/>\n'
         for nm, s, p in walls)
 
+    objs = OBJECTS + (WARP_OBJECTS if warp else [])
     obj_mats = "".join(
         f'    <material name="o{i}" rgba="{rgba}"/>\n'
-        for i, (_, _, _, _, rgba) in enumerate(OBJECTS))
+        for i, (_, _, _, _, rgba) in enumerate(objs))
     obj_bodies = "".join(
         f'    <body name="{nm}" pos="{pos}"><freejoint name="obj{i}_free"/>\n'
         f'      <geom name="g_{nm}" type="{shape}" size="{size}" material="o{i}" mass="0.05"/></body>\n'
-        for i, (nm, shape, size, pos, _) in enumerate(OBJECTS))
+        for i, (nm, shape, size, pos, _) in enumerate(objs))
 
     # suction welds for the warp variant: inactive until the controller sets
     # eq_data[3:10] to the tcp->object relpose at grasp and flips eq_active
     welds = "".join(
         f'    <weld name="suction_{nm}" body1="tcp" body2="{nm}" active="false" '
-        f'solref="0.005 1"/>\n' for nm, *_ in OBJECTS)
+        f'solref="0.005 1"/>\n' for nm, *_ in objs)
     equality = f"  <equality>\n{welds}  </equality>\n" if warp else ""
 
     meshes = "".join(f'    <mesh name="{lk}" file="{lk}.stl"/>\n' for lk in made)
