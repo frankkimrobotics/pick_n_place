@@ -20,7 +20,7 @@ from joint_conventions import linuxcnc_deg_to_rad, rad_to_linuxcnc_deg
 
 PI = "10.0.0.27"
 DOWN = list(R_to_quat_wxyz(R_from_two_axes(np.array([0, 0, -1.0]))))
-TCP_NOW = 0.145   # current modeled cup-tip offset below the flange (URDF)
+TCP_NOW = 0.135   # active URDF tcp (recalibrated 2026-07-01)
 
 
 def rpc(d):

@@ -96,6 +96,15 @@
     <body name="object6" pos="0.300 0.095 0.028"><freejoint name="obj6_free"/>
       <geom name="g_object6" type="cylinder" size="0.024 0.028" material="o6" mass="0.05"/></body>
   </worldbody>
+  <equality>
+    <weld name="suction_object0" body1="tcp" body2="object0" active="false" solref="0.005 1"/>
+    <weld name="suction_object1" body1="tcp" body2="object1" active="false" solref="0.005 1"/>
+    <weld name="suction_object2" body1="tcp" body2="object2" active="false" solref="0.005 1"/>
+    <weld name="suction_object3" body1="tcp" body2="object3" active="false" solref="0.005 1"/>
+    <weld name="suction_object4" body1="tcp" body2="object4" active="false" solref="0.005 1"/>
+    <weld name="suction_object5" body1="tcp" body2="object5" active="false" solref="0.005 1"/>
+    <weld name="suction_object6" body1="tcp" body2="object6" active="false" solref="0.005 1"/>
+  </equality>
   <actuator>
     <position name="act_joint1" joint="joint1" kp="80" ctrlrange="-6.5 6.5"/>
     <position name="act_joint2" joint="joint2" kp="80" ctrlrange="-6.5 6.5"/>

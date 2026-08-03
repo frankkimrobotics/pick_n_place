@@ -67,12 +67,14 @@ def main():
     import rclpy, pyrealsense2 as rs
     from std_msgs.msg import String
     from multiview_fuse import pick_res
-    from perturb_loop import PlannerClient, RobotState, execute
+    from perturb_loop import PlannerClient, RobotState, execute, scale_traj
+    from joint_conventions import rad_to_linuxcnc_deg
 
     board = make_board(args.square, args.marker)
     pc = PlannerClient()
     rclpy.init(); node = rclpy.create_node("calib_handeye")
     pub = node.create_publisher(String, "/mycobot/cmd/move", 10); state = RobotState(node)
+    chunk_pub = node.create_publisher(String, "/planner/weld_chunks", 10)  # working path -> chunk_to_pi -> :9994
     track = {"ramp_time": 0.15, "pos_gain": 1.0, "vff_scale": 1.0}
     SH = make_T(np.eye(3), [0, 0, C.CAM_TCP_Z_SHIFT])
 
@@ -141,8 +143,23 @@ def main():
         r = pc.plan_joint(list(map(float, state.get_q())), list(map(float, qg)))
         if not r.get("success"):
             return False
-        execute(state, pub, np.array(r["trajectory"]), r["dt"], "pid", args.vmax, 2.0, label, track=track)
-        return True
+        # route through the weld-chunk stream (:9994); the old execute()->/mycobot/cmd/move->:9998
+        # path is dead when online_servo (not robot_hal) owns the arm, so the arm never moved.
+        traj = np.array(r["trajectory"]); sdt, _ = scale_traj(traj, r["dt"], args.vmax, 2.0)
+        td = [list(map(float, rad_to_linuxcnc_deg(wp))) for wp in traj]
+        chunk_pub.publish(String(data=json.dumps(
+            {"trajectory": td, "traj_dt": sdt, "target_deg": td[-1], "weld": True,
+             "t_anchor": time.time() + 0.10})))
+        total = sdt * (len(traj) - 1); goal = traj[-1]; t0 = time.time(); dev = 99.0
+        while time.time() - t0 < total + 5.0:
+            rclpy.spin_once(node, timeout_sec=0.02)
+            cq = state.q
+            if cq is None:
+                continue
+            dev = float(np.degrees(np.abs(np.asarray(cq[:6], float) - goal)).max())
+            if time.time() - t0 > total and dev < 2.0:
+                break
+        return dev < 5.0
 
     def sample(label):
         time.sleep(0.4)

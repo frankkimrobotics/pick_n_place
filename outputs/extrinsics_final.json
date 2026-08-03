@@ -1,0 +1,127 @@
+{
+  "note": "Finalized camera extrinsics (2026-07-03). Per camera, chose the MORE ACCURATE source.",
+  "frame_convention": "T_base_cam = base<-cam ; optical +X right, +Y down, +Z fwd",
+  "wrist_d405": {
+    "serial": "218622271300",
+    "type": "eye-in-hand (moves with arm)",
+    "camera_pose_formula": "T_base_cam = fk_T(q) @ make_T(I,[0,0,CAM_TCP_Z_SHIFT]) @ T_TCP_CAM",
+    "T_TCP_CAM": [
+      [
+        -0.99781957,
+        -0.06596721,
+        0.00210446,
+        0.01265501
+      ],
+      [
+        0.06482786,
+        -0.98557334,
+        -0.1563411,
+        0.06511875
+      ],
+      [
+        0.01238748,
+        -0.15586378,
+        0.98770088,
+        -0.11009472
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "CAM_TCP_Z_SHIFT": 0.009999999999999981,
+    "source": "config.py hand-eye recalib 2026-07-03 (ChArUco, 6.0mm board-spread); cross-validated 8-14px",
+    "chosen": "KEPT (validated). Random-board hand-eye agreed within ~16mm at the ~10px FK floor -> no improvement."
+  },
+  "fixed_d435": {
+    "serial": "043422070101",
+    "type": "fixed/static",
+    "T_base_cam": [
+      [
+        0.06743584155911876,
+        0.8912525799967199,
+        -0.44846543447896176,
+        0.6260500870499714
+      ],
+      [
+        0.9977037574439458,
+        -0.06307402050478322,
+        0.024675500391976274,
+        -0.04566856913452909
+      ],
+      [
+        -0.006294414622953648,
+        -0.44909966219821706,
+        -0.8934594975475953,
+        0.6454475363464486
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "cam_pos_base": [
+      0.6260500870499714,
+      -0.04566856913452909,
+      0.6454475363464486
+    ],
+    "rpy_xyz_deg": [
+      -153.31349560229847,
+      0.360645773870959,
+      86.13319967377693
+    ],
+    "source": "static KNOWN-board calib (0.40px reproj, 0.09mm spread)",
+    "chosen": "KEPT. Random-board (FK-anchored) was 54mm/4.9deg off with 9mm spread -> far less accurate."
+  },
+  "fixed_d405": {
+    "serial": "218622277013",
+    "type": "fixed/static",
+    "T_base_cam": [
+      [
+        -0.8772302393678729,
+        0.29994124242715675,
+        -0.37483644197147914,
+        0.6881042624918317
+      ],
+      [
+        0.4799115358898085,
+        0.5278474075664171,
+        -0.7007581837162502,
+        0.43426234299364785
+      ],
+      [
+        -0.012329836108784877,
+        -0.7946146018144056,
+        -0.6069889700191134,
+        0.4284764158332601
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "cam_pos_base": [
+      0.6881042624918317,
+      0.43426234299364785,
+      0.4284764158332601
+    ],
+    "rpy_xyz_deg": [
+      -127.37542977309893,
+      0.7064654719446964,
+      151.31799287238357
+    ],
+    "source": "static KNOWN-board calib (0.48px reproj, 0.75mm spread)",
+    "chosen": "KEPT. Random-board was 62mm/4.9deg off -> far less accurate."
+  },
+  "rejected_random_board": {
+    "method": "multi_cam_calib.py wrist-FK-anchored, 32mm square",
+    "why": "FK-anchored base frame -> capped by robot kinematic accuracy (~10px). Fine for wrist hand-eye, but fixed cams inherit+amplify to ~50-60mm.",
+    "data": "outputs/multicam_calib_20260703_231133/ (re-solvable)"
+  }
+}
