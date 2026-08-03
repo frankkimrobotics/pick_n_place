@@ -44,6 +44,12 @@ class Orch(Node):
         self.create_subscription(String, "/sim/objects", self._on_objs, 10)
         self.pub_cmd = self.create_publisher(String, "/mycobot/cmd/move", 10)
         self.pub_suc = self.create_publisher(Bool, "/mycobot/suction", 10)
+        self.pub_reset = self.create_publisher(String, "/sim/reset", 10)   # randomize objects (capture)
+        self.pub_phase = self.create_publisher(String, "/phase", 10)       # episode / stage labels
+        self.prng = np.random.default_rng(getattr(a, "seed", 0))   # object randomization (NOT self.rng=range)
+
+    def phase(self, p):
+        self.pub_phase.publish(String(data=str(p)))
 
     def _on_objs(self, m):
         try:
@@ -103,40 +109,58 @@ class Orch(Node):
     def suction(self, on):
         self.pub_suc.publish(Bool(data=bool(on))); time.sleep(0.5)
 
+    def _pick_object(self, o, i, bx, by):
+        ox, oy, oz = o["xyz"]
+        self.get_logger().info(f"  == object {i}: {o['name']} @ [{ox:.3f},{oy:.3f},{oz:.3f}] ==")
+        self.phase("reach")
+        if self.stream(self.plan(goal_pose=[ox, oy, oz + 0.075] + DOWN), 45, label="pregrasp") == "fail":
+            return
+        time.sleep(0.5)
+        self.rng = None                                                 # drop stale range before the descent
+        self.phase("descend")
+        self.stream(self.plan(goal_pose=[ox, oy, -0.05] + DOWN), self.a.v_des, watch=True, label="descend")
+        self.phase("grasp"); self.suction(True)                         # range-finder contact -> grasp
+        self.phase("lift")
+        self.stream(self.plan(goal_pose=[ox, oy, 0.18] + DOWN), 45, label="lift")     # straight up, no twist
+        lift_q = self.q.copy()
+        br = self.rpc({"type": "plan_pose", "start_q": [float(x) for x in lift_q],
+                       "goal_pose": [bx, by, 0.16] + DOWN, "max_attempts": 14})
+        carry_q = lift_q.copy()
+        carry_q[0] = (float(np.array(br["trajectory"])[-1][0]) if br.get("success")
+                      else lift_q[0] + np.arctan2(by, bx) - np.arctan2(oy, ox))        # bin bearing (J1)
+        self.phase("carry")
+        self.stream(self.plan(goal_q=[float(x) for x in carry_q]), 40, label="carry (J1 swing)")
+        self.phase("place"); time.sleep(0.3)
+        self.phase("release"); self.suction(False)                      # release into bin
+        time.sleep(0.5)
+
     def run(self):
         spin = threading.Thread(target=lambda: rclpy.spin(self), daemon=True); spin.start()
         t0 = time.time()
-        while (self.q is None or not self.objs) and time.time() - t0 < 20:
+        while self.q is None and time.time() - t0 < 20:
             time.sleep(0.1)
         if self.q is None:
-            self.get_logger().error("no /joint_states / objects"); return
-        snap = list(self.objs)[: self.a.max_objects]
+            self.get_logger().error("no /joint_states"); return
         bx, by = [float(v) for v in self.a.bin.split(",")]
-        self.get_logger().info(f"picking {len(snap)} objects -> bin [{bx},{by}]")
-        for i, o in enumerate(snap):
-            ox, oy, oz = o["xyz"]
-            self.get_logger().info(f"\n== object {i}: {o['name']} @ [{ox:.3f},{oy:.3f},{oz:.3f}] ==")
-            if self.stream(self.plan(goal_pose=[ox, oy, oz + 0.075] + DOWN), 45, label="pregrasp") == "fail":
-                continue
-            time.sleep(0.5)
-            self.rng = None                                             # drop stale range before the descent
-            self.stream(self.plan(goal_pose=[ox, oy, -0.05] + DOWN), self.a.v_des, watch=True, label="descend")
-            self.suction(True)                                              # range-finder contact -> grasp
-            self.stream(self.plan(goal_pose=[ox, oy, 0.18] + DOWN), 45, label="lift")    # straight up, no twist
-            # PLACE = swing J1 ONLY over the bin, keeping the lifted base-like shape (no wrist/elbow twist).
-            # cuRobo plan_pose to the bin picks arbitrary IK branches (the twisting); we only borrow its J1.
-            lift_q = self.q.copy()
-            br = self.rpc({"type": "plan_pose", "start_q": [float(x) for x in lift_q],
-                           "goal_pose": [bx, by, 0.16] + DOWN, "max_attempts": 14})
-            carry_q = lift_q.copy()
-            carry_q[0] = (float(np.array(br["trajectory"])[-1][0]) if br.get("success")
-                          else lift_q[0] + np.arctan2(by, bx) - np.arctan2(oy, ox))    # bin bearing (J1)
-            self.stream(self.plan(goal_q=[float(x) for x in carry_q]), 40, label="carry (J1 swing)")
-            self.suction(False)                                             # release into bin
-            time.sleep(0.5)
-        self.stream(self.plan(goal_q=list(map(float, C.BASE_Q))), 45, label="home")
-        time.sleep(1.0)
-        self.get_logger().info("== done ==")
+        n_ep = getattr(self.a, "episodes", 1)
+        for ep in range(n_ep):
+            if getattr(self.a, "capture", False):                       # randomize objects for this episode
+                n = int(self.prng.integers(self.a.min_objects, self.a.max_objects + 1))
+                self.objs = []
+                self.pub_reset.publish(String(data=json.dumps({"seed": self.a.seed + ep, "n": n})))
+                time.sleep(1.5)
+            tw = time.time()
+            while not self.objs and time.time() - tw < 10:
+                time.sleep(0.1)
+            snap = [o for o in list(self.objs) if o["xyz"][2] > -0.5][: self.a.max_objects]  # skip parked
+            self.get_logger().info(f"\n### episode {ep+1}/{n_ep}: {len(snap)} objects -> bin [{bx},{by}] ###")
+            self.phase("start")
+            for i, o in enumerate(snap):
+                self._pick_object(o, i, bx, by)
+            self.phase("home")
+            self.stream(self.plan(goal_q=list(map(float, C.BASE_Q))), 45, label="home")
+            self.phase("end"); time.sleep(1.0)
+        self.get_logger().info("== all episodes done ==")
 
 
 def main():
@@ -144,7 +168,11 @@ def main():
     ap.add_argument("--contact", type=float, default=0.008, help="range-finder contact threshold (m)")
     ap.add_argument("--v-des", type=float, default=14.0, help="descent speed (deg/s)")
     ap.add_argument("--bin", default="0.10,0.40", help="place bin centre x,y")
+    ap.add_argument("--episodes", type=int, default=1, help="number of randomized episodes to run")
+    ap.add_argument("--min-objects", type=int, default=3)
     ap.add_argument("--max-objects", type=int, default=5)
+    ap.add_argument("--capture", action="store_true", help="publish /sim/reset randomization (pair with sim node --capture)")
+    ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     rclpy.init()
     node = Orch(a)
