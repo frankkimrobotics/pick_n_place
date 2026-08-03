@@ -118,6 +118,16 @@ def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
                 # is a real dynamic interaction (robot meshes stay contactless)
                 L.append(f'{ind}<geom name="cup_tip" type="sphere" size="0.008" '
                          f'rgba="0.25 0.25 0.28 1"/>')
+                # wrist D405 from the calibrated hand-eye extrinsic (OpenCV
+                # optical frame -> MuJoCo camera: flip y,z)
+                Tc = np.asarray(C.T_TCP_CAM, float)
+                Rmj = Tc[:3, :3] @ np.diag([1.0, -1.0, -1.0])
+                qc = R_to_quat_wxyz(Rmj)
+                p = Tc[:3, 3]
+                L.append(f'{ind}<camera name="wrist_d405" '
+                         f'pos="{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}" '
+                         f'quat="{qc[0]:.6f} {qc[1]:.6f} {qc[2]:.6f} {qc[3]:.6f}" '
+                         f'fovy="58.0"/>')
         for j in children.get(link, []):
             T = np.asarray(j.origin if j.origin is not None else np.eye(4), float).copy()
             if j.child in SIM_TIP_Z:
@@ -185,6 +195,22 @@ def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
         f'solref="0.005 1"/>\n' for nm, *_ in objs)
     equality = f"  <equality>\n{welds}  </equality>\n" if warp else ""
 
+    # fixed D435 on the far side of the table (opposite the robot), centred on
+    # that edge at 0.6 m, aimed at the table centre. MuJoCo cameras look along
+    # -z with +y up: build the frame from the aim direction.
+    d435 = ""
+    if warp:
+        cam_p = np.array([0.66, 0.0, 0.60])
+        aim = np.array([0.38, 0.0, 0.03])
+        f = aim - cam_p; f /= np.linalg.norm(f)
+        zc = -f
+        xc = np.cross([0.0, 0.0, 1.0], zc); xc /= np.linalg.norm(xc)
+        yc = np.cross(zc, xc)
+        d435 = (f'    <camera name="fixed_d435" '
+                f'pos="{cam_p[0]:.3f} {cam_p[1]:.3f} {cam_p[2]:.3f}" '
+                f'xyaxes="{xc[0]:.4f} {xc[1]:.4f} {xc[2]:.4f} '
+                f'{yc[0]:.4f} {yc[1]:.4f} {yc[2]:.4f}" fovy="42.0"/>\n')
+
     meshes = "".join(f'    <mesh name="{lk}" file="{lk}.stl"/>\n' for lk in made)
 
     xml = f"""<mujoco model="mycobot_sim">
@@ -207,7 +233,7 @@ def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
 {wall_geoms}    <camera name="iso" pos="1.05 -0.55 0.78" xyaxes="0.45 0.89 0 -0.5 0.25 0.83"/>
     <camera name="front" pos="0.38 -0.85 0.45" xyaxes="1 0 0 0 0.45 0.89"/>
     <camera name="top" pos="0.38 0.0 0.9" xyaxes="1 0 0 0 1 0"/>
-    <body name="{root}" pos="0 0 0">
+{d435}    <body name="{root}" pos="0 0 0">
 {chr(10).join(body_tree)}
     </body>
     <!-- cluttered objects on the table (kinematic; freejoints) -->

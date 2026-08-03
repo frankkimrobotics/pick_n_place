@@ -61,7 +61,12 @@ SEAL_DEG = 25.0                 # ...and the contact normal must align with the 
 # (the rangefinder can't seal-check: pressed 15mm in, the ray origin sits inside
 # the object and MuJoCo rays skip the containing geom -- it reads the table)
 
-R_DOWN = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1.0]])  # tcp z-axis down
+# tool orientation: z-axis down, yawed +90 deg about world z so the wrist
+# D405 (mounted outside the wrist, 10 deg inward tilt) sits over the table
+# interior viewing the scene rather than off its edge
+R_FLAT = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1.0]])   # tcp z-axis down, yaw 0
+_RZ90 = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1.0]])
+R_DOWN = _RZ90 @ R_FLAT
 
 # elbow-safety joint box (matches the cuRobo planner constraint): |joint2|<=70deg
 # and |joint3|<=145deg keep the link2/link3 chain above the table plane
