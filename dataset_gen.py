@@ -9,7 +9,12 @@ is clear. Recorded at 10 Hz throughout:
   - joint angles q[6], velocities qd[6]
   - tip rangefinder value, suction state, active target index
 Per-scene meta.json: every object's shape, OBB half-extents, colour, initial
-pose, final pose, picked/in-bin outcome, light position, seed.
+pose, final pose, picked/in-bin outcome, light position, seed; plus a "picks"
+array with one entry per pick ATTEMPT (in execution order): 10 Hz frame range
+(start/latch/release/end), the nominal grasp pose (planned IK target: object
+top + cup radius, top-down quat, and the 15 mm press target) and the executed
+grasp pose (tcp site pos/quat captured at the instant the suction latched,
+plus the object pose then), success flag and fail reason.
 
 Batching note: mujoco_warp batches identical models -- every scene here is a
 DIFFERENT model (object count/dims), and the wall-clock is dominated by
@@ -126,7 +131,10 @@ def run_scene(args):
     vopt.sitegroup[:] = 0
     rf_adr = m.sensor_adr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SENSOR, "tip_range")]
     tcp_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "tcp")
+    tcp_sid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "tcp")
     cup_gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "cup_tip")
+    quat_down = np.zeros(4)
+    mujoco.mju_mat2Quat(quat_down, np.asarray(demo["R_DOWN"], float).ravel())
 
     every = int(round(1.0 / (REC_HZ * demo["CTRL_DT"])))
     wr405 = imageio.get_writer(os.path.join(sdir, "d405_rgb.mp4"), fps=REC_HZ, quality=8)
@@ -163,14 +171,23 @@ def run_scene(args):
             state["tick"] += 1
             record(d)
 
-    def pick_object(oi):
+    picks = []
+
+    def pick_object(oi, attempt):
         o = objs[oi]
         bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, o["name"])
         eq_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_EQUALITY, f"suction_{o['name']}")
         p_now = d.xpos[bid].copy()
         top = p_now[2] + o["half_extents"][2]
+        pk = dict(object=oi, attempt=attempt, frame_start=len(rec["t"]),
+                  frame_latch=-1, frame_release=-1, frame_end=-1,
+                  grasp_nominal=None, grasp_executed=None, success=False,
+                  fail_reason=None)
+        picks.append(pk)
         if not (TABLE_X[0] - 0.06 < p_now[0] < TABLE_X[1] + 0.06
                 and TABLE_Y[0] - 0.08 < p_now[1] < TABLE_Y[1] + 0.08):
+            pk["frame_end"] = len(rec["t"])
+            pk["fail_reason"] = "off_table"
             return False                                   # left the table
         rngd = np.random.default_rng(idx * 131 + oi)
         drop = BIN_XY + rngd.uniform(-0.06, 0.06, 2)
@@ -184,7 +201,14 @@ def run_scene(args):
                          R_DOWN, q_grasp)
         q_bin, e4 = ik(m, dik, "tcp", [drop[0], drop[1], 0.42], R_DOWN, q_hov)
         q_drop, e5 = ik(m, dik, "tcp", [drop[0], drop[1], 0.22], R_DOWN, q_bin)
+        pk["grasp_nominal"] = dict(
+            pos=[round(float(v), 5) for v in (p_now[0], p_now[1], top + CUP_R)],
+            press_pos=[round(float(v), 5) for v in (p_now[0], p_now[1],
+                                                    top + CUP_R - PRESS)],
+            quat=[round(float(v), 5) for v in quat_down])
         if max(e1, e2, e3, e4, e5) > 0.003:
+            pk["frame_end"] = len(rec["t"])
+            pk["fail_reason"] = "ik"
             return False
         qref = []
         seg(qref, q0, q_hov, 2.0)
@@ -208,25 +232,40 @@ def run_scene(args):
                     demo["_latch_weld"](m, d, eq_id, tcp_bid, bid)
                     state["suction"] = 1
                     state["target"] = oi
+                    eq = np.zeros(4)
+                    mujoco.mju_mat2Quat(eq, d.site_xmat[tcp_sid])
+                    pk["frame_latch"] = len(rec["t"])
+                    pk["grasp_executed"] = dict(
+                        pos=[round(float(v), 5) for v in d.site_xpos[tcp_sid]],
+                        quat=[round(float(v), 5) for v in eq],
+                        obj_pos=[round(float(v), 5) for v in d.xpos[bid]])
             if k == i_rel and state["suction"]:
                 d.eq_active[eq_id] = 0
                 state["suction"] = 0
                 state["target"] = -1
+                pk["frame_release"] = len(rec["t"])
 
         run_ref(sched, on_tick)
         state["suction"] = 0
         d.eq_active[eq_id] = 0
+        pk["frame_end"] = len(rec["t"])
+        if pk["frame_latch"] < 0:
+            pk["fail_reason"] = "no_seal"
         p = d.xpos[bid]
-        return bool(abs(p[0] - BIN_XY[0]) < BIN_HALF
-                    and abs(p[1] - BIN_XY[1]) < BIN_HALF and p[2] < 0.12)
+        ok = bool(abs(p[0] - BIN_XY[0]) < BIN_HALF
+                  and abs(p[1] - BIN_XY[1]) < BIN_HALF and p[2] < 0.12)
+        pk["success"] = ok
+        if not ok and pk["fail_reason"] is None:
+            pk["fail_reason"] = "missed_bin"
+        return ok
 
     results = []
     order = sorted(range(len(objs)),
                    key=lambda i: np.hypot(*(np.array(objs[i]["pos"][:2]))))
     for oi in order:
         ok = False
-        for _ in range(1 + MAX_RETRY):
-            ok = pick_object(oi)
+        for att in range(1 + MAX_RETRY):
+            ok = pick_object(oi, att)
             if ok:
                 break
         results.append((oi, ok))
@@ -241,7 +280,7 @@ def run_scene(args):
         np.savez_compressed(os.path.join(sdir, f"{cam.split('_')[-1]}_depth_mm.npz"),
                             depth=np.stack(depth[cam]) if depth[cam] else np.zeros((0, H, W), np.uint16))
     meta = dict(scene=idx, seed=idx * 7919 + 13, light_pos=list(light),
-                rec_hz=REC_HZ, n_objects=len(objs), objects=[])
+                rec_hz=REC_HZ, n_objects=len(objs), objects=[], picks=picks)
     for oi, o in enumerate(objs):
         bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, o["name"])
         ok = dict(results).get(oi, False)
