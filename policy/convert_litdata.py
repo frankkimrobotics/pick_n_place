@@ -14,6 +14,9 @@ One sample per policy step of every SUCCESSFUL pick episode (meta.json
                       q[t+1..t+16] at s = 0,0.1,..,1.5 with a light P-spline
                       ridge (LAMBDA on CP 2nd differences, see below).
                       Evaluate the spline at any rate (e.g. 4 ms) for qref.
+    ctrl_pts_eef[16,6] -- same B-spline fit on the UMI-style RELATIVE EEF
+                      trajectory: pose at t+j in the current (time-t) tcp
+                      frame, encoded [dpos(3), rotvec(3)]
     suction_cmd[16] -- suction state at t+1..t+16 (uint8)
   ids: scene, pick, object, t  (frame index within the scene stream)
 
@@ -84,6 +87,15 @@ for _i in range(N_CTRL - 2):
 FIT_MAT = np.linalg.solve(BASIS.T @ BASIS + LAMBDA * _D2.T @ _D2, BASIS.T)
 
 
+def quat_to_mat(q):
+    """wxyz quat -> rotation matrix."""
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+
+
 def read_video_jpegs(path):
     cap = cv2.VideoCapture(path)
     out = []
@@ -118,6 +130,15 @@ def scene_samples(sdir):
             tp = max(f0, tt - 1)
             fut = q[tt + 1: tt + 1 + HORIZON]               # (16, 6)
             ctrl = (FIT_MAT @ fut).astype(np.float32)       # (16, 6)
+            # UMI-style relative EEF chunk: pose at t+j expressed in the
+            # CURRENT (time t) tcp frame -- [dpos(3), rotvec(3)]
+            R_t = quat_to_mat(equat[tt])
+            rel = np.zeros((HORIZON, 6), np.float32)
+            for j in range(HORIZON):
+                k = tt + 1 + j
+                rel[j, :3] = R_t.T @ (epos[k] - epos[tt])
+                rel[j, 3:] = cv2.Rodrigues(R_t.T @ quat_to_mat(equat[k]))[0].ravel()
+            ctrl_eef = (FIT_MAT @ rel).astype(np.float32)   # (16, 6)
             yield dict(
                 scene=scene, pick=pi, object=pk["object"], t=tt,
                 d405_jpg=[j405[tp], j405[tt]],
@@ -125,7 +146,7 @@ def scene_samples(sdir):
                 q=q[[tp, tt]], qd=qd[[tp, tt]],
                 eef_pos=epos[[tp, tt]], eef_quat=equat[[tp, tt]],
                 suction=suc[[tp, tt]], rangefinder=rf[[tp, tt]],
-                ctrl_pts=ctrl,
+                ctrl_pts=ctrl, ctrl_pts_eef=ctrl_eef,
                 suction_cmd=suc[tt + 1: tt + 1 + HORIZON].copy(),
             )
 
@@ -164,6 +185,9 @@ def main():
                    "on s in [0,1.5], where s=0 is absolute time t+0.1 s "
                    "(the first action) -- qref(t+0.1+s); suction_cmd is "
                    "per-0.1s state at t+0.1..t+1.6",
+            action_eef="ctrl_pts_eef: same spline over UMI-style relative EEF "
+                       "trajectory [dpos(3) m, rotvec(3) rad] of pose t+j "
+                       "expressed in the time-t tcp frame",
             images="d405_jpg/d435_jpg: [t-1, t] JPEG bytes, 432x240 BGR-encoded",
             quat="wxyz", n_scenes=len(scenes)), f, indent=1)
 
