@@ -43,22 +43,22 @@
         <body name="base" pos="0.000000 0.000000 0.000000" quat="1.000000 0.000000 0.000000 0.000000">
             <geom type="mesh" mesh="base" material="metal" contype="0" conaffinity="0"/>
             <body name="link1" pos="0.000000 0.000000 0.229340" quat="1.000000 0.000000 0.000000 0.000000">
-                <joint name="joint1" type="hinge" axis="0.0000 0.0000 1.0000" range="-3.1416 3.1416" damping="1.0"/>
+                <joint name="joint1" type="hinge" axis="0.0000 0.0000 1.0000" range="-3.1416 3.1416" damping="1.0" armature="0.15"/>
                 <geom type="mesh" mesh="link1" material="metal" contype="0" conaffinity="0"/>
                 <body name="link2" pos="0.000000 0.000000 0.000000" quat="-0.500023 -0.499975 0.500025 -0.499977">
-                    <joint name="joint2" type="hinge" axis="0.0000 0.0000 -1.0000" range="-3.1416 3.1416" damping="1.0"/>
+                    <joint name="joint2" type="hinge" axis="0.0000 0.0000 -1.0000" range="-3.1416 3.1416" damping="1.0" armature="0.15"/>
                     <geom type="mesh" mesh="link2" material="metal" contype="0" conaffinity="0"/>
                     <body name="link3" pos="0.270000 0.000000 0.000000" quat="1.000000 0.000000 0.000000 0.000000">
-                        <joint name="joint3" type="hinge" axis="0.0000 0.0000 -1.0000" range="-2.6100 2.6180" damping="1.0"/>
+                        <joint name="joint3" type="hinge" axis="0.0000 0.0000 -1.0000" range="-2.6100 2.6180" damping="1.0" armature="0.15"/>
                         <geom type="mesh" mesh="link3" material="metal" contype="0" conaffinity="0"/>
                         <body name="link4" pos="0.267000 0.000000 -0.074500" quat="0.707105 0.000000 0.000000 0.707108">
-                            <joint name="joint4" type="hinge" axis="0.0000 0.0000 -1.0000" range="-2.9670 2.9670" damping="1.0"/>
+                            <joint name="joint4" type="hinge" axis="0.0000 0.0000 -1.0000" range="-2.9670 2.9670" damping="1.0" armature="0.15"/>
                             <geom type="mesh" mesh="link4" material="metal" contype="0" conaffinity="0"/>
                             <body name="link5" pos="0.000000 -0.095000 0.002000" quat="0.500048 0.500000 -0.500000 0.499952">
-                                <joint name="joint5" type="hinge" axis="0.0000 0.0000 1.0000" range="-2.9300 2.9321" damping="1.0"/>
+                                <joint name="joint5" type="hinge" axis="0.0000 0.0000 1.0000" range="-2.9300 2.9321" damping="1.0" armature="0.15"/>
                                 <geom type="mesh" mesh="link5" material="metal" contype="0" conaffinity="0"/>
                                 <body name="link6" pos="-0.054000 0.000000 0.000000" quat="0.707141 -0.707073 0.000000 0.000000">
-                                    <joint name="joint6" type="hinge" axis="-1.0000 0.0000 0.0000" range="-3.0300 3.0368" damping="1.0"/>
+                                    <joint name="joint6" type="hinge" axis="-1.0000 0.0000 0.0000" range="-3.0300 3.0368" damping="1.0" armature="0.15"/>
                                     <geom type="mesh" mesh="link6" material="metal" contype="0" conaffinity="0"/>
                                     <body name="camera_mount" pos="-0.003000 -0.003000 0.000000" quat="0.000003 -0.707105 0.000003 0.707108">
                                         <geom type="mesh" mesh="camera_mount" material="metal" contype="0" conaffinity="0"/>
@@ -106,12 +106,12 @@
     <weld name="suction_object6" body1="tcp" body2="object6" active="false" solref="0.005 1"/>
   </equality>
   <actuator>
-    <position name="act_joint1" joint="joint1" kp="80" ctrlrange="-6.5 6.5"/>
-    <position name="act_joint2" joint="joint2" kp="80" ctrlrange="-6.5 6.5"/>
-    <position name="act_joint3" joint="joint3" kp="80" ctrlrange="-6.5 6.5"/>
-    <position name="act_joint4" joint="joint4" kp="80" ctrlrange="-6.5 6.5"/>
-    <position name="act_joint5" joint="joint5" kp="80" ctrlrange="-6.5 6.5"/>
-    <position name="act_joint6" joint="joint6" kp="80" ctrlrange="-6.5 6.5"/>
+    <motor name="act_joint1" joint="joint1" ctrlrange="-100 100"/>
+    <motor name="act_joint2" joint="joint2" ctrlrange="-100 100"/>
+    <motor name="act_joint3" joint="joint3" ctrlrange="-100 100"/>
+    <motor name="act_joint4" joint="joint4" ctrlrange="-100 100"/>
+    <motor name="act_joint5" joint="joint5" ctrlrange="-100 100"/>
+    <motor name="act_joint6" joint="joint6" ctrlrange="-100 100"/>
   </actuator>
   <sensor>
     <rangefinder name="tip_range" site="tip_rf"/>
