@@ -273,6 +273,8 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--vision_lr", type=float, default=3e-5)
     ap.add_argument("--dit_depth", type=int, default=6)
+    ap.add_argument("--resume", default=None,
+                    help="ckpt to continue from (net/ctx/ema/opt/step)")
     a = ap.parse_args()
     dev = "cuda"
     torch.manual_seed(0)
@@ -329,10 +331,25 @@ def main():
     ema = ({i: {k: v.detach().clone().float() for k, v in m.state_dict().items()}
             for i, m in enumerate(mods)} if a.model in ("dp", "cfm") else None)
 
+    start_step = 0
+    if a.resume:
+        ck = torch.load(a.resume, map_location=dev, weights_only=False)
+        net.load_state_dict(ck["net"])
+        ctxnet.load_state_dict(ck["ctx"])
+        if ck.get("ema") is not None and ema is not None:
+            ema = {int(i): {k: v.to(dev) for k, v in st.items()}
+                   for i, st in ck["ema"].items()}
+        if ck.get("opt") is not None:
+            opt.load_state_dict(ck["opt"])
+        start_step = int(ck.get("step", 0))
+        print(f"[{run}] resumed {a.resume} at step {start_step}", flush=True)
+
     warm = 2000
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, s / warm) * 0.5 *
         (1 + math.cos(math.pi * min(1.0, max(0, s - warm) / max(1, a.steps - warm)))))
+    for _ in range(start_step):
+        sched.step()
     log = open(os.path.join(rdir, "log.jsonl"), "a")
     json.dump(dict(args=vars(a), spec=spec, train=len(tr_idx), val=len(va_idx)),
               open(os.path.join(rdir, "run.json"), "w"), indent=1)
@@ -340,7 +357,8 @@ def main():
     def save_ckpt(tag, step):
         torch.save(dict(model=a.model, action=a.action, step=step,
                         lo=lo.cpu(), hi=hi.cpu(), spec=spec,
-                        net=net.state_dict(), ctx=ctxnet.state_dict(), ema=ema),
+                        net=net.state_dict(), ctx=ctxnet.state_dict(), ema=ema,
+                        opt=opt.state_dict()),
                    os.path.join(rdir, f"ckpt_{tag}.pt"))
 
     @torch.no_grad()
@@ -373,7 +391,7 @@ def main():
                 break
         return float(np.mean(errs))
 
-    step, t0, done = 0, time.time(), False
+    step, t0, done = start_step, time.time(), False
     while step < a.steps and not done:
         for imgs, prop, goal, act in dl:
             if step >= a.steps:
@@ -415,7 +433,7 @@ def main():
                             ema[i][k].mul_(decay).add_(cur[k].float(),
                                                        alpha=1 - decay)
             if step % 100 == 0:
-                sps = (step + 1) / (time.time() - t0)
+                sps = (step - start_step + 1) / (time.time() - t0)
                 log.write(json.dumps({"step": step, "loss": float(loss),
                                       "sps": sps}) + "\n")
                 log.flush()
@@ -423,7 +441,7 @@ def main():
                 v = eval_mse()
                 log.write(json.dumps({"step": step, "eval_mse": v}) + "\n")
                 log.flush()
-                sps = (step + 1) / (time.time() - t0)
+                sps = (step - start_step + 1) / (time.time() - t0)
                 eta_h = (a.steps - step) / max(sps, 1e-9) / 3600
                 print(f"[{run}] step {step}/{a.steps} loss {float(loss):.4f} "
                       f"eval_mse {v:.5f} {sps:.1f} it/s eta {eta_h:.1f}h",
