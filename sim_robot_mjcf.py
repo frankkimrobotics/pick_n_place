@@ -7,14 +7,25 @@ MuJoCo computes FK itself. MuJoCo can't read the URDF's DAE meshes, so we:
   1. reuse mujoco_export.bake_link_meshes() (DAE->STL, baked into each link frame),
   2. walk the URDF tree (yourdfpy) emitting nested <body> with <joint type="hinge">
      for the revolute joints and the baked mesh as each link's <geom>,
-  3. add a ground, light, camera, a free-joint pick object, and the place-box walls.
+  3. add a ground, light, cameras, the cluttered pick objects, the place-box
+     walls, the tip rangefinder (tip_rf site + sensor) and position actuators.
 
 Joint order in qpos is joint1..joint6 (URDF radians). The tcp tool frame is a
 <site> so the node can read the tip pose. Set data.qpos[:6] + mj_forward for FK.
 
+The sim tcp/eef bodies OVERRIDE the URDF origins (-0.135/-0.105): in the twin
+the tip sits at the VISIBLE suction surface, cup-frame z=-0.115 (eef -0.105),
+so the red dot + rangefinder originate at the mushroom tip and contact depth is
+right (see commit 7bf3b0b). The planner keeps the URDF's calibrated -0.135.
+
+build() writes outputs/mujoco_sim/robot_sim.xml (the ROS2 twin, kinematic
+attach for suction). build_warp() writes robot_warp.xml for mujoco_warp: same
+model plus per-object <weld> equality constraints (inactive; the runtime sets
+eq_data relpose at grasp and flips eq_active) so suction is real physics that
+survives GPU-batched stepping.
+
 Run in the curobo2 env (needs yourdfpy + trimesh):
-    /home/lisc-frank/miniconda3/envs/curobo2/bin/python sim_robot_mjcf.py
-Writes outputs/mujoco_sim/robot_sim.xml + meshes/.
+    /home/lisc-frank/miniconda3/envs/curobo2/bin/python sim_robot_mjcf.py [--warp]
 """
 import os
 import sys
@@ -32,6 +43,20 @@ SIM_DIR = os.path.join(C.OUT_DIR, "mujoco_sim")
 MESH_DIR = os.path.join(SIM_DIR, "meshes")
 REVOLUTE = {"revolute", "continuous"}
 
+# sim-only tip override (visible cup surface, not the planner's calibrated tcp)
+SIM_TIP_Z = {"tcp": -0.115, "eef": -0.105}
+
+# cluttered objects on the table: name, shape, size, pos, rgba
+OBJECTS = [
+    ("object0", "cylinder", "0.026 0.030", "0.340 0.050 0.030", "0.85 0.35 0.24 1"),
+    ("object1", "box",      "0.025 0.025 0.040", "0.405 -0.055 0.040", "0.30 0.69 0.31 1"),
+    ("object2", "cylinder", "0.030 0.025", "0.375 0.105 0.025", "0.20 0.55 0.86 1"),
+    ("object3", "cylinder", "0.022 0.035", "0.445 0.030 0.035", "0.95 0.61 0.07 1"),
+    ("object4", "box",      "0.030 0.030 0.022", "0.330 -0.110 0.022", "0.61 0.35 0.71 1"),
+    ("object5", "cylinder", "0.028 0.030", "0.460 -0.085 0.030", "0.90 0.80 0.16 1"),
+    ("object6", "cylinder", "0.024 0.028", "0.300 0.095 0.028", "0.40 0.76 0.75 1"),
+]
+
 
 def _pose_attrs(T):
     p = T[:3, 3]
@@ -40,8 +65,8 @@ def _pose_attrs(T):
             f'quat="{q[0]:.6f} {q[1]:.6f} {q[2]:.6f} {q[3]:.6f}"')
 
 
-def build(box_xyz=(0.20, 0.30, 0.0), box_fp=0.20, box_h=0.12, box_wall=0.01,
-          obj_xyz=(0.30, 0.0, 0.03), obj_r=0.03, obj_h=0.06):
+def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
+          warp=False):
     os.makedirs(MESH_DIR, exist_ok=True)
     # bake the STL meshes into our sim mesh dir (reuse mujoco_export's baker)
     mex.MESH_DIR = MESH_DIR
@@ -61,8 +86,11 @@ def build(box_xyz=(0.20, 0.30, 0.0), box_fp=0.20, box_h=0.12, box_wall=0.01,
                      f'contype="0" conaffinity="0"/>')
         if link == "tcp" or link.endswith("tcp"):
             L.append(f'{ind}<site name="tcp" size="0.005" rgba="1 0 0 1"/>')
+            L.append(f'{ind}<site name="tip_rf" size="0.004" rgba="0 1 0 0.6"/>')
         for j in children.get(link, []):
-            T = np.asarray(j.origin if j.origin is not None else np.eye(4))
+            T = np.asarray(j.origin if j.origin is not None else np.eye(4), float).copy()
+            if j.child in SIM_TIP_Z:
+                T[2, 3] = SIM_TIP_Z[j.child]
             L.append(f'{ind}<body name="{j.child}" {_pose_attrs(T)}>')
             if j.type in REVOLUTE:
                 ax = np.asarray(j.axis, float)
@@ -79,8 +107,8 @@ def build(box_xyz=(0.20, 0.30, 0.0), box_fp=0.20, box_h=0.12, box_wall=0.01,
 
     body_tree = emit(root, 0)
 
-    # actuators only for the 6 revolute joints (position servos; the node also
-    # supports direct qpos playback, but actuators let it be stepped if wanted)
+    # position servos on the 6 revolute joints (the ROS2 node uses direct qpos
+    # playback; mujoco_warp steps real dynamics through these)
     act = "".join(
         f'    <position name="act_{n}" joint="{n}" kp="80" '
         f'ctrlrange="-6.5 6.5"/>\n' for n in [f"joint{i}" for i in range(1, 7)])
@@ -89,19 +117,33 @@ def build(box_xyz=(0.20, 0.30, 0.0), box_fp=0.20, box_h=0.12, box_wall=0.01,
     h = box_fp / 2.0
     t = box_wall
     walls = [
-        ("floor", (box_fp/2+t, box_fp/2+t, t/2), (bx, by, bz - t/2)),
-        ("xm", (t/2, box_fp/2+t, box_h/2), (bx-(h+t/2), by, bz+box_h/2)),
-        ("xp", (t/2, box_fp/2+t, box_h/2), (bx+(h+t/2), by, bz+box_h/2)),
-        ("ym", (box_fp/2, t/2, box_h/2), (bx, by-(h+t/2), bz+box_h/2)),
-        ("yp", (box_fp/2, t/2, box_h/2), (bx, by+(h+t/2), bz+box_h/2)),
+        ("floor", (h, h, t/2), (bx, by, bz - t/2)),
+        ("xm", (t/2, h, box_h/2), (bx-(h+t/2), by, bz+box_h/2)),
+        ("xp", (t/2, h, box_h/2), (bx+(h+t/2), by, bz+box_h/2)),
+        ("ym", (h, t/2, box_h/2), (bx, by-(h+t/2), bz+box_h/2)),
+        ("yp", (h, t/2, box_h/2), (bx, by+(h+t/2), bz+box_h/2)),
     ]
     wall_geoms = "".join(
         f'    <geom name="box_{nm}" type="box" pos="{p[0]:.4f} {p[1]:.4f} {p[2]:.4f}" '
         f'size="{s[0]:.4f} {s[1]:.4f} {s[2]:.4f}" material="box"/>\n'
         for nm, s, p in walls)
 
+    obj_mats = "".join(
+        f'    <material name="o{i}" rgba="{rgba}"/>\n'
+        for i, (_, _, _, _, rgba) in enumerate(OBJECTS))
+    obj_bodies = "".join(
+        f'    <body name="{nm}" pos="{pos}"><freejoint name="obj{i}_free"/>\n'
+        f'      <geom name="g_{nm}" type="{shape}" size="{size}" material="o{i}" mass="0.05"/></body>\n'
+        for i, (nm, shape, size, pos, _) in enumerate(OBJECTS))
+
+    # suction welds for the warp variant: inactive until the controller sets
+    # eq_data[3:10] to the tcp->object relpose at grasp and flips eq_active
+    welds = "".join(
+        f'    <weld name="suction_{nm}" body1="tcp" body2="{nm}" active="false" '
+        f'solref="0.005 1"/>\n' for nm, *_ in OBJECTS)
+    equality = f"  <equality>\n{welds}  </equality>\n" if warp else ""
+
     meshes = "".join(f'    <mesh name="{lk}" file="{lk}.stl"/>\n' for lk in made)
-    tz = C.TABLE_Z if hasattr(C, "TABLE_Z") else 0.0
 
     xml = f"""<mujoco model="mycobot_sim">
   <compiler angle="radian" meshdir="meshes" autolimits="true"/>
@@ -112,30 +154,31 @@ def build(box_xyz=(0.20, 0.30, 0.0), box_fp=0.20, box_h=0.12, box_wall=0.01,
     <texture name="grid" type="2d" builtin="checker" rgb1=".2 .3 .4" rgb2=".1 .15 .2" width="300" height="300"/>
     <material name="grid" texture="grid" texrepeat="8 8" reflectance=".1"/>
     <material name="metal" rgba="0.7 0.72 0.75 1"/>
-    <material name="obj" rgba="0.85 0.35 0.24 1"/>
     <material name="box" rgba="0.27 0.43 0.78 1"/>
-    <material name="table" rgba="0.6 0.6 0.62 1"/>
-{meshes}  </asset>
+    <material name="table" rgba="0.55 0.55 0.58 1"/>
+{obj_mats}{meshes}  </asset>
   <worldbody>
     <light pos="0.3 0.1 1.5" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
-    <geom name="floor" type="plane" size="2 2 0.1" pos="0 0 {tz-0.02:.4f}" material="grid"/>
-    <geom name="table" type="box" pos="0.30 0.10 {tz-0.01:.4f}" size="0.35 0.35 0.01" material="table"/>
+    <geom name="floor" type="plane" size="2 2 0.1" pos="0 0 -0.1200" material="grid"/>
+    <geom name="table" type="box" pos="0.38 0.00 -0.0100" size="0.20 0.22 0.01" material="table"/>
+    <!-- place bin at [0.10,0.40], floor top at 0.0, ~12 cm walls -->
 {wall_geoms}    <camera name="iso" pos="1.05 -0.55 0.78" xyaxes="0.45 0.89 0 -0.5 0.25 0.83"/>
-    <camera name="front" pos="0.30 -0.95 0.55" xyaxes="1 0 0 0 0.5 0.87"/>
+    <camera name="front" pos="0.38 -0.85 0.45" xyaxes="1 0 0 0 0.45 0.89"/>
+    <camera name="top" pos="0.38 0.0 0.9" xyaxes="1 0 0 0 1 0"/>
     <body name="{root}" pos="0 0 0">
 {chr(10).join(body_tree)}
     </body>
-    <body name="object" pos="{obj_xyz[0]:.4f} {obj_xyz[1]:.4f} {obj_xyz[2]:.4f}">
-      <freejoint name="obj_free"/>
-      <geom name="object" type="cylinder" size="{obj_r:.4f} {obj_h/2:.4f}" material="obj" mass="0.05"/>
-    </body>
-  </worldbody>
-  <actuator>
+    <!-- cluttered objects on the table (kinematic; freejoints) -->
+{obj_bodies}  </worldbody>
+{equality}  <actuator>
 {act}  </actuator>
+  <sensor>
+    <rangefinder name="tip_range" site="tip_rf"/>
+  </sensor>
 </mujoco>
 """
     os.makedirs(SIM_DIR, exist_ok=True)
-    out = os.path.join(SIM_DIR, "robot_sim.xml")
+    out = os.path.join(SIM_DIR, "robot_warp.xml" if warp else "robot_sim.xml")
     with open(out, "w") as f:
         f.write(xml)
     print(f"[sim-mjcf] wrote {out}  ({len(made)} link meshes, root='{root}')")
@@ -143,4 +186,4 @@ def build(box_xyz=(0.20, 0.30, 0.0), box_fp=0.20, box_h=0.12, box_wall=0.01,
 
 
 if __name__ == "__main__":
-    build()
+    build(warp="--warp" in sys.argv)
