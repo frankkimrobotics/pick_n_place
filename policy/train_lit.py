@@ -132,6 +132,10 @@ class VisionEncoder(nn.Module):
             "ViT-B-16-quickgelu", pretrained="openai")
         self.visual = model.visual
         self.visual.output_tokens = True
+        try:                       # activation memory: 4 imgs/sample x batch
+            self.visual.set_grad_checkpointing(True)
+        except Exception:
+            pass
         self.proj_cls = nn.Linear(512, d_model)
         self.proj_patch = nn.Linear(768, d_model)
 
