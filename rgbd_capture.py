@@ -38,14 +38,20 @@ def main():
     m = mujoco.MjModel.from_xml_path(demo["XML"])
     sched = demo["build_schedule"](m)
     ren = mujoco.Renderer(m, height=H, width=W)
+    # a real camera sees geometry only: kill visualization decor (the yellow
+    # rangefinder ray and the tcp/tip site markers render into BOTH the RGB
+    # and depth passes otherwise)
+    vopt = mujoco.MjvOption()
+    vopt.flags[mujoco.mjtVisFlag.mjVIS_RANGEFINDER] = 0
+    vopt.sitegroup[:] = 0
     writer = imageio.get_writer(OUT, fps=FPS, quality=8)
     every = int(round(1.0 / (FPS * demo["CTRL_DT"])))
 
     def grab(d, cam):
-        ren.update_scene(d, camera=cam)
+        ren.update_scene(d, camera=cam, scene_option=vopt)
         rgb = ren.render().copy()
         ren.enable_depth_rendering()
-        ren.update_scene(d, camera=cam)
+        ren.update_scene(d, camera=cam, scene_option=vopt)
         depth = ren.render().copy()
         ren.disable_depth_rendering()
         return rgb, depth_vis(depth, *RANGES[cam])
