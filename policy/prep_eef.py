@@ -16,6 +16,8 @@ d = mujoco.MjData(m)
 sid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "tcp")
 
 for sdir in sorted(glob.glob(os.path.join(DS, "scene_*"))):
+    if os.path.exists(os.path.join(sdir, "eef.npz")):
+        continue
     t = np.load(os.path.join(sdir, "traj.npz"))
     q = t["q"]
     pos = np.zeros((len(q), 3))
