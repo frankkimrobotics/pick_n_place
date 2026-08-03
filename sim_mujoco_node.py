@@ -77,7 +77,7 @@ def _quat_wxyz(R):
 
 
 class MujocoRobot(Node):
-    def __init__(self, xml, video=None, cam="iso", fb_hz=50.0, render_hz=20.0):
+    def __init__(self, xml, video=None, cam="iso", fb_hz=50.0, render_hz=20.0, capture_dir=None, seed=0):
         super().__init__("sim_mujoco_robot")
         self.m = mujoco.MjModel.from_xml_path(xml)
         self.d = mujoco.MjData(self.m)
@@ -96,6 +96,11 @@ class MujocoRobot(Node):
             sz = self.m.geom_size[gid]
             hh = float(sz[2] if self.m.geom_type[gid] == mujoco.mjtGeom.mjGEOM_BOX else sz[1])
             self.objs.append(("object%d" % i, int(adr), hh)); i += 1
+        try:                                             # sim table-top z (objects rest on it; NOT config TABLE_Z)
+            tg = self.m.geom("table").id
+            self._table_top = float(self.m.geom_pos[tg][2] + self.m.geom_size[tg][2])
+        except Exception:
+            self._table_top = 0.0
 
         self.lock = threading.Lock()
         self._queue = []                  # list of (traj_rad[N,6], dt)
@@ -115,11 +120,26 @@ class MujocoRobot(Node):
         self.pub_obj = self.create_publisher(String, "/sim/objects", 10)        # object poses (JSON)
         self.create_subscription(String, "/mycobot/cmd/move", self._on_cmd, 10)
         self.create_subscription(Bool, "/mycobot/suction", self._on_suction, 10)
+        # vision detection on request (top-down seg render -> base-frame grasp XY)
+        self._scan_req = False
+        self.create_subscription(String, "/sim/scan", lambda m: setattr(self, "_scan_req", True), 10)
+        self.pub_det = self.create_publisher(String, "/sim/detections", 10)
 
         self.cam = cam
         self.video = video
         self._renderer = mujoco.Renderer(self.m, 480, 640) if video else None  # osmesa: keep small/fast
         self._vw = None
+        # ---- optional data capture (wrist+fixed cams -> canonical episodes) ----
+        self.capture = None; self._phase = "idle"; self._reset_req = None; self._t_cap = 0.0; self._phase_cmd = []
+        self._rng = np.random.default_rng(seed); self._ep_ctr = 0
+        if capture_dir:
+            sys.path.insert(0, os.path.join(HERE, "il", "sim"))
+            from capture_logger import CaptureLogger, randomize_objects
+            self._randomize = randomize_objects
+            self.capture = CaptureLogger(self.m, capture_dir)
+            self.create_subscription(String, "/phase", self._on_phase, 10)
+            self.create_subscription(String, "/sim/reset", self._on_reset, 10)
+            self.get_logger().info(f"capture ON -> {capture_dir}")
         self._stop = threading.Event()
         self._sim = threading.Thread(target=self._loop, daemon=True)
         self._sim.start()
@@ -175,10 +195,38 @@ class MujocoRobot(Node):
                     self._attached_adr = best
                     self.get_logger().info("suction ON: attached object @%d (dxy=%.3f)" % (best, bd))
                 else:
-                    self.get_logger().info("suction ON: no object under tcp")
+                    near = min(self.objs, key=lambda o: float(np.hypot(self.d.qpos[o[1]] - tcp[0], self.d.qpos[o[1] + 1] - tcp[1])))
+                    op = self.d.qpos[near[1]:near[1] + 3]
+                    self.get_logger().info(
+                        f"suction ON: no object under tcp | tcp=[{tcp[0]:.3f},{tcp[1]:.3f},{tcp[2]:.3f}] "
+                        f"nearest {near[0]} op=[{op[0]:.3f},{op[1]:.3f},{op[2]:.3f}] "
+                        f"dxy={np.hypot(op[0]-tcp[0], op[1]-tcp[1])*1000:.0f}mm  need op_z<{tcp[2]+0.03:.3f}")
             elif not want and self._attached_adr is not None:
                 self.get_logger().info("suction OFF: released")
                 self._attached_adr = None; self._rel = None
+
+    # ---- capture control (episodes are delimited by /phase start|end) ----
+    def _on_phase(self, msg):
+        p = msg.data.strip()
+        if p in ("start", "end"):
+            with self.lock:
+                self._phase_cmd.append(p)              # QUEUE (apply in order on the sim thread)
+        else:
+            self._phase = p
+
+    def _on_reset(self, msg):
+        try:
+            c = json.loads(msg.data)
+        except Exception:
+            c = {}
+        with self.lock:
+            self._reset_req = (int(c.get("seed", 0)), int(c.get("n", 3)))
+
+    def _cap_tick(self, now):
+        if self.capture is not None and self.capture.active and now - self._t_cap >= 0.1:
+            with self.lock:
+                q = self.q.copy(); suc = self._attached_adr is not None
+            self.capture.tick(self.d, q, suc, self._phase); self._t_cap = now
 
     # ---- sim + feedback + render loop (single thread owns self.d) ----
     def _loop(self):
@@ -186,6 +234,29 @@ class MujocoRobot(Node):
         last_q = self.q.copy()
         last_fb_t = time.time()
         while not self._stop.is_set():
+            if self._reset_req is not None:             # apply a pending episode reset (sim thread owns d)
+                with self.lock:
+                    seed, n = self._reset_req; self._reset_req = None
+                    self._kept = self._randomize(self.d, self.objs, n, np.random.default_rng(seed),
+                                                 table_z=self._table_top)
+                    self.q = np.array(C.BASE_Q, float); self._apply(self.q)
+            if self._scan_req:                          # vision detect on the sim thread (owns d + renders)
+                self._scan_req = False
+                sys.path.insert(0, os.path.join(HERE, "il", "sim"))
+                from detect_sim import detect_objects
+                with self.lock:
+                    dets = detect_objects(self.m, self.d, self.objs, cam="top", table_z=self._table_top)
+                self.pub_det.publish(String(data=json.dumps(dets)))
+                self.get_logger().info(f"scan -> {len(dets)} detections")
+            while self._phase_cmd:                       # drain the episode start/stop queue (sim thread)
+                with self.lock:
+                    pc = self._phase_cmd.pop(0)
+                if pc == "start":
+                    self._ep_ctr += 1
+                    self.capture.start(f"ep{self._ep_ctr:04d}_{int(time.time())}", {"kept": getattr(self, "_kept", [])})
+                    self._phase = "start"
+                elif pc == "end":
+                    self.capture.stop(True)
             if self._weld:                              # streaming mode: track the welded ref
                 now = time.time()
                 with self.lock:
@@ -197,6 +268,7 @@ class MujocoRobot(Node):
                     last_q = self.q.copy(); last_fb_t = now; t_fb = now
                 if self._renderer is not None and now - t_rd >= self.render_dt:
                     self._grab(); t_rd = now
+                self._cap_tick(now)
                 time.sleep(0.005)
                 continue
             with self.lock:
@@ -223,6 +295,7 @@ class MujocoRobot(Node):
                     last_q = self.q.copy(); last_fb_t = now; t_fb = now
                 if self._renderer is not None and now - t_rd >= 0.1:   # idle: slow frames
                     self._grab(); t_rd = now
+                self._cap_tick(now)
                 time.sleep(0.005)
 
     def _publish_fb(self, last_q, dt):
@@ -278,9 +351,18 @@ def main():
     ap.add_argument("--video", default=os.path.join(C.OUT_DIR, "mujoco_sim", "episode.mp4"))
     ap.add_argument("--camera", default="iso")
     ap.add_argument("--no-video", action="store_true")
+    ap.add_argument("--capture", default="", help="dir for canonical episodes (enables wrist+fixed capture)")
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    xml = args.xml
+    if args.capture:                                    # inject wrist+fixed cameras, use that model
+        sys.path.insert(0, os.path.join(HERE, "il", "sim"))
+        from capture_cameras import build_capture_xml
+        xml = os.path.join(C.OUT_DIR, "mujoco_sim", "robot_sim_capture.xml")
+        build_capture_xml(args.xml, xml)
     rclpy.init()
-    node = MujocoRobot(args.xml, video=None if args.no_video else args.video, cam=args.camera)
+    node = MujocoRobot(xml, video=None if args.no_video else args.video, cam=args.camera,
+                       capture_dir=(args.capture or None), seed=args.seed)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

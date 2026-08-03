@@ -13,7 +13,7 @@ Solve:  T_base_cam = T_base_board @ inv(T_cam_board)
 import json, time, numpy as np, cv2, pyrealsense2 as rs
 from scipy.spatial.transform import Rotation as Rsc
 
-SQUARE, MARKER = 0.035, 0.026
+SQUARE, MARKER = 0.032, 0.032 * 26.0 / 35.0        # printed 32 mm square (was 35 mm design), ~24 mm marker
 SQUARES = (5, 7)                       # squaresX=5 (board X), squaresY=7 (board Y)
 DICT = cv2.aruco.DICT_4X4_50
 CENTER_BASE = np.array([0.4, 0.0, 0.0])
