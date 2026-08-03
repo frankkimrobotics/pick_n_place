@@ -98,20 +98,30 @@ def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
                 if j.limit is not None and j.limit.lower is not None:
                     lo, hi = float(j.limit.lower), float(j.limit.upper)
                 rng = f' range="{lo:.4f} {hi:.4f}"' if lo is not None else ' limited="false"'
+                # warp variant: reflected rotor inertia of the harmonic drives
+                # (~1e-4 kg m^2 * gear^2). Without it the coupled link modes have
+                # near-zero modal inertia and discrete-time PD limit-cycles.
+                arm = ' armature="0.15"' if warp else ''
                 L.append(f'{ind}    <joint name="{j.name}" type="hinge" '
                          f'axis="{ax[0]:.4f} {ax[1]:.4f} {ax[2]:.4f}"{rng} '
-                         f'damping="1.0"/>')
+                         f'damping="1.0"{arm}/>')
             L += emit(j.child, depth + 1)
             L.append(f'{ind}</body>')
         return L
 
     body_tree = emit(root, 0)
 
-    # position servos on the 6 revolute joints (the ROS2 node uses direct qpos
-    # playback; mujoco_warp steps real dynamics through these)
-    act = "".join(
-        f'    <position name="act_{n}" joint="{n}" kp="80" '
-        f'ctrlrange="-6.5 6.5"/>\n' for n in [f"joint{i}" for i in range(1, 7)])
+    # robot_sim.xml keeps position servos (the ROS2 node uses direct qpos
+    # playback); the warp variant exposes raw torque motors so the controller
+    # can run PD + inverse-dynamics feedforward at the 4ms tick
+    if warp:
+        act = "".join(
+            f'    <motor name="act_{n}" joint="{n}" '
+            f'ctrlrange="-100 100"/>\n' for n in [f"joint{i}" for i in range(1, 7)])
+    else:
+        act = "".join(
+            f'    <position name="act_{n}" joint="{n}" kp="80" '
+            f'ctrlrange="-6.5 6.5"/>\n' for n in [f"joint{i}" for i in range(1, 7)])
 
     bx, by, bz = box_xyz
     h = box_fp / 2.0
