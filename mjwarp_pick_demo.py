@@ -7,14 +7,21 @@ over the 2 ms physics substeps. The arm starts from config.START_Q (= BASE_Q,
 the camera-down base pose the real pick-and-place starts from; HOME_Q is the
 LinuxCNC mechanical home with the arm straight up).
 
-Phase A (CPU mujoco, mj_step): gentle pick cycle on object0 -- hover, slow
-descend until the tip rangefinder reads contact, activate the suction weld
-(eq_data relpose = tcp->object pose at grasp, eq_active on), lift, swing over
-the bin, descend, release, retreat. Reports worst-case joint tracking error.
+Grasp strategy is PRESS-TO-SEAL: detecting "cup touched the object" from
+range alone is unreliable, so once the grasp pose is computed the reference
+pushes PRESS_M (15 mm) further along the suction approach axis and only then
+applies suction. The cup tip is a real collision sphere (the only contact
+geom on the arm), so the press is dynamics: the object is squeezed against
+the table, and on a curved object an off-centre press slides the cup off and
+shoves the object away. The rangefinder is a seal CHECK at press end (must
+read < SEAL_MM), not the grasp trigger.
 
-Phase B (mujoco_warp, GPU): run the identical reference + weld schedule
-closed-loop in a batch of NWORLD identical worlds; every world must land
-object0 in the bin and world0 must track the CPU run.
+Phase A (CPU mujoco, mj_step): pick cycle on object0 (flat-top cylinder).
+Phase A2: press test on object7 (sphere) with a lateral offset -- must show
+the object dynamically escaping and the seal check failing.
+Phase B (mujoco_warp, GPU): identical reference + weld schedule closed-loop
+in NWORLD identical worlds; every world must land object0 in the bin and
+world0 must track the CPU run.
 
 Run in the mjwarp env:
     conda activate mjwarp && python mjwarp_pick_demo.py
@@ -38,8 +45,6 @@ NSUB = int(round(CTRL_DT / DT))
 Q_START = np.asarray(C.START_Q, float)
 # PD gains are inertia-scaled in build_schedule(): KP_i = M_ii * W_BW^2,
 # KD_i = 2 * ZETA * M_ii * W_BW  (computed-torque shape, diagonal approx).
-# Wrist joints get higher bandwidth: their inertia is tiny, so the same rad/s
-# costs little torque, and the weld latch dumps the payload weight on joint5.
 W_BW = np.array([40.0, 40.0, 40.0, 60.0, 90.0, 90.0])
 ZETA = 1.1
 TAU_MAX = 100.0
@@ -49,7 +54,12 @@ BIN_HALF = 0.15
 OBJ = "object0"
 OBJ_TOP = 0.060                 # cylinder pos z 0.030 + half height 0.030
 HOVER = 0.12                    # tip clearance above object top for hover
-CONTACT_MM = 8.0                # rangefinder threshold to latch suction
+CUP_R = 0.008                   # cup tip collision sphere radius
+PRESS_M = 0.015                 # press-to-seal: push 15 mm past the grasp pose
+SEAL_N = 2.0                    # seal check: cup contact force at press end must exceed this
+SEAL_DEG = 25.0                 # ...and the contact normal must align with the cup axis
+# (the rangefinder can't seal-check: pressed 15mm in, the ray origin sits inside
+# the object and MuJoCo rays skip the containing geom -- it reads the table)
 
 R_DOWN = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1.0]])  # tcp z-axis down
 
@@ -115,50 +125,19 @@ def _seg(out, q_from, q_to, seconds):
         out.append((1 - a) * q_from + a * q_to)
 
 
-def build_schedule(m):
-    """IK waypoints + 4ms reference (qref, qdref, qddref, tau_ff) and phase indices."""
-    d = mujoco.MjData(m)
-    mujoco.mj_forward(m, d)
-    obj_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, OBJ)
-    obj_p = d.xpos[obj_bid].copy()
-
-    dik = mujoco.MjData(m)
-    q_hover, e1 = ik(m, dik, "tcp", obj_p + [0, 0, OBJ_TOP - obj_p[2] + HOVER],
-                     R_DOWN, Q_START)
-    # descend endpoint 6mm above the top: suction latches at 8mm range, so the
-    # welded object gets pressed at most ~2mm into the table before the dwell
-    q_touch, e2 = ik(m, dik, "tcp", obj_p + [0, 0, OBJ_TOP - obj_p[2] + 0.006],
-                     R_DOWN, q_hover)
-    # carry above the 0.30m bin walls: object hangs ~0.09m below the tcp
-    q_bin, e3 = ik(m, dik, "tcp", [BIN_XY[0], BIN_XY[1], 0.42], R_DOWN, q_hover)
-    q_drop, e4 = ik(m, dik, "tcp", [BIN_XY[0], BIN_XY[1], 0.20], R_DOWN, q_bin)
-    print(f"[ik] residuals hover {e1:.4f} touch {e2:.4f} bin {e3:.4f} drop {e4:.4f} m")
-
-    qref = []
-    _seg(qref, Q_START, q_hover, 2.5)
-    i_descend_start = len(qref)
-    _seg(qref, q_hover, q_touch, 2.5)         # gentle: 2.5 s descend
-    i_descend_end = len(qref)
-    _seg(qref, q_touch, q_touch, 0.3)         # dwell at contact
-    _seg(qref, q_touch, q_hover, 1.5)         # lift
-    _seg(qref, q_hover, q_bin, 2.5)           # carry
-    _seg(qref, q_bin, q_drop, 1.0)            # move down over bin
-    i_release = len(qref)                     # release here
-    _seg(qref, q_drop, q_bin, 1.0)            # retreat
-    _seg(qref, q_bin, q_bin, 1.5)             # settle
-    qref = np.array(qref)
+def _gains_and_ff(m, d0, qref):
+    """mj_inverse feedforward + gain-scheduled diagonal PD along the reference."""
     qdref = np.gradient(qref, CTRL_DT, axis=0)
     qddref = np.gradient(qdref, CTRL_DT, axis=0)
     # box-smooth the accel so segment-boundary finite-diff spikes don't slam tau_ff
     kern = np.ones(9) / 9.0
     qddref = np.stack([np.convolve(qddref[:, j], kern, mode="same")
                        for j in range(6)], axis=1)
-
-    # inverse-dynamics feedforward on the reference (same model, objects at rest)
     dinv = mujoco.MjData(m)
     tau_ff = np.zeros_like(qref)
+    Mii = np.zeros_like(qref)
     for k in range(len(qref)):
-        dinv.qpos[:] = d.qpos
+        dinv.qpos[:] = d0.qpos
         dinv.qvel[:] = 0
         dinv.qacc[:] = 0
         dinv.qpos[:6] = qref[k]
@@ -166,28 +145,60 @@ def build_schedule(m):
         dinv.qacc[:6] = qddref[k]
         mujoco.mj_inverse(m, dinv)
         tau_ff[k] = dinv.qfrc_inverse[:6]
-    # gain-scheduled computed-torque PD: per-tick diagonal of M(qref_k), so
-    # joint1 is stiff when the arm is extended (I ~1.5) yet stable near home
-    # where its inertia collapses to ~0.02
-    dm = mujoco.MjData(m)
-    Mii = np.zeros_like(qref)
-    for k in range(len(qref)):
-        dm.qpos[:6] = qref[k]
-        mujoco.mj_forward(m, dm)
         for i in range(6):
             e = np.zeros(m.nv); r = np.zeros(m.nv)
             e[i] = 1.0
-            mujoco.mj_mulM(m, dm, r, e)
+            mujoco.mj_mulM(m, dinv, r, e)
             Mii[k, i] = r[i]
+    # gain-scheduled computed-torque PD: per-tick diagonal of M(qref_k), so
+    # joint1 is stiff when the arm is extended yet stable near home where its
+    # inertia collapses
     Mii = np.maximum(Mii, 0.005)
-    kp = Mii * W_BW ** 2
-    kd = 2.0 * ZETA * Mii * W_BW
+    return qdref, tau_ff, Mii * W_BW ** 2, 2.0 * ZETA * Mii * W_BW
+
+
+def build_schedule(m):
+    """IK waypoints + 4ms reference (qref, qdref, tau_ff, gains) + phase indices."""
+    d = mujoco.MjData(m)
+    mujoco.mj_forward(m, d)
+    obj_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, OBJ)
+    obj_p = d.xpos[obj_bid].copy()
+    grasp_z = OBJ_TOP + CUP_R              # cup surface touching the flat top
+
+    dik = mujoco.MjData(m)
+    q_hover, e1 = ik(m, dik, "tcp", [obj_p[0], obj_p[1], OBJ_TOP + HOVER],
+                     R_DOWN, Q_START)
+    q_grasp, e2 = ik(m, dik, "tcp", [obj_p[0], obj_p[1], grasp_z], R_DOWN, q_hover)
+    # press-to-seal: 15 mm past the grasp pose along the approach axis (down)
+    q_press, e3 = ik(m, dik, "tcp", [obj_p[0], obj_p[1], grasp_z - PRESS_M],
+                     R_DOWN, q_grasp)
+    # carry above the 0.30m bin walls: object hangs ~0.09m below the tcp
+    q_bin, e4 = ik(m, dik, "tcp", [BIN_XY[0], BIN_XY[1], 0.42], R_DOWN, q_hover)
+    q_drop, e5 = ik(m, dik, "tcp", [BIN_XY[0], BIN_XY[1], 0.20], R_DOWN, q_bin)
+    print(f"[ik] residuals hover {e1:.4f} grasp {e2:.4f} press {e3:.4f} "
+          f"bin {e4:.4f} drop {e5:.4f} m")
+
+    qref = []
+    _seg(qref, Q_START, q_hover, 2.5)
+    i_descend_start = len(qref)
+    _seg(qref, q_hover, q_grasp, 2.0)         # gentle descend to the grasp pose
+    i_grasp_end = len(qref)
+    _seg(qref, q_grasp, q_press, 0.8)         # press 15 mm, slow
+    i_press_end = len(qref)                   # suction applied here (seal check)
+    _seg(qref, q_press, q_press, 0.4)         # dwell under press
+    _seg(qref, q_press, q_hover, 1.5)         # lift
+    _seg(qref, q_hover, q_bin, 2.5)           # carry
+    _seg(qref, q_bin, q_drop, 1.0)            # move down over bin
+    i_release = len(qref)                     # release here
+    _seg(qref, q_drop, q_bin, 1.0)            # retreat
+    _seg(qref, q_bin, q_bin, 1.5)             # settle
+    qref = np.array(qref)
+    qdref, tau_ff, kp, kd = _gains_and_ff(m, d, qref)
     print(f"[plan] {len(qref)} ticks ({len(qref)*CTRL_DT:.1f} s), "
-          f"|tau_ff| max {np.abs(tau_ff).max():.1f} Nm, "
-          f"KP range {np.round(kp.min(axis=0), 1)} .. {np.round(kp.max(axis=0), 1)}")
+          f"|tau_ff| max {np.abs(tau_ff).max():.1f} Nm")
     return dict(qref=qref, qdref=qdref, tau_ff=tau_ff, kp=kp, kd=kd,
-                i_descend_start=i_descend_start, i_descend_end=i_descend_end,
-                i_release=i_release)
+                i_descend_start=i_descend_start, i_grasp_end=i_grasp_end,
+                i_press_end=i_press_end, i_release=i_release)
 
 
 def pd_tau(sched, k, q, qd):
@@ -197,41 +208,76 @@ def pd_tau(sched, k, q, qd):
                    -TAU_MAX, TAU_MAX)
 
 
+def _cup_normal_force(m, d, cup_gid):
+    return _cup_contact(m, d, cup_gid)[0]
+
+
+def _cup_contact(m, d, cup_gid):
+    """Total normal force on the cup tip + tilt of the strongest contact's
+    normal vs the cup approach axis (deg). A suction cup only seals when it
+    presses roughly face-on: force alone can't distinguish a seal from the
+    cup skidding along the flank of a curved object."""
+    tip_sid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "tip_rf")
+    axis = d.site_xmat[tip_sid].reshape(3, 3)[:, 2]     # cup approach direction
+    f_tot, f_best, ang = 0.0, 0.0, 180.0
+    buf = np.zeros(6)
+    for i in range(d.ncon):
+        c = d.contact[i]
+        if cup_gid in (c.geom1, c.geom2):
+            mujoco.mj_contactForce(m, d, i, buf)
+            fn = abs(buf[0])
+            f_tot += fn
+            if fn > f_best:
+                f_best = fn
+                n = np.asarray(c.frame[:3])
+                ang = np.degrees(np.arccos(min(1.0, abs(float(n @ axis)))))
+    return f_tot, ang
+
+
+def _latch_weld(m, d, eq_id, tcp_bid, obj_bid):
+    p1 = d.xpos[tcp_bid]; R1 = d.xmat[tcp_bid].reshape(3, 3)
+    p2 = d.xpos[obj_bid]; R2 = d.xmat[obj_bid].reshape(3, 3)
+    rq = np.zeros(4)
+    mujoco.mju_mat2Quat(rq, (R1.T @ R2).ravel())
+    m.eq_data[eq_id, :3] = 0
+    m.eq_data[eq_id, 3:6] = R1.T @ (p2 - p1)
+    m.eq_data[eq_id, 6:10] = rq
+    d.eq_active[eq_id] = 1
+    return m.eq_data[eq_id].copy()
+
+
 def run_cpu(m, sched, frame_cb=None):
-    """Closed-loop 4ms PD+ff pick cycle on CPU. Returns weld tick + logs."""
+    """Closed-loop 4ms PD+ff press-to-seal pick cycle on CPU."""
     d = mujoco.MjData(m)
     tcp_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "tcp")
     obj_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, OBJ)
     eq_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_EQUALITY, f"suction_{OBJ}")
     rf_adr = m.sensor_adr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SENSOR, "tip_range")]
+    cup_gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "cup_tip")
     d.qpos[:6] = Q_START
     mujoco.mj_forward(m, d)
 
     qref = sched["qref"]
     weld_tick = -1
     eq_data_at_weld = None
+    press_force = 0.0
     qlog = np.zeros_like(qref)
     for k in range(len(qref)):
-        # suction may only latch during the descend (the rangefinder ray sweeps
-        # other objects during the fast swing -- welding there flings them)
-        if weld_tick < 0 and sched["i_descend_start"] <= k <= sched["i_descend_end"] + 100:
-            rng = d.sensordata[rf_adr]
-            if 0 <= rng * 1000.0 < CONTACT_MM:
-                p1 = d.xpos[tcp_bid]; R1 = d.xmat[tcp_bid].reshape(3, 3)
-                p2 = d.xpos[obj_bid]; R2 = d.xmat[obj_bid].reshape(3, 3)
-                rq = np.zeros(4)
-                mujoco.mju_mat2Quat(rq, (R1.T @ R2).ravel())
-                m.eq_data[eq_id, :3] = 0
-                m.eq_data[eq_id, 3:6] = R1.T @ (p2 - p1)
-                m.eq_data[eq_id, 6:10] = rq
-                d.eq_active[eq_id] = 1
+        if sched["i_grasp_end"] <= k <= sched["i_press_end"]:
+            press_force = max(press_force, _cup_normal_force(m, d, cup_gid))
+        if k == sched["i_press_end"]:
+            f_now, tilt = _cup_contact(m, d, cup_gid)
+            if f_now > SEAL_N and tilt < SEAL_DEG:
+                eq_data_at_weld = _latch_weld(m, d, eq_id, tcp_bid, obj_bid)
                 weld_tick = k
-                eq_data_at_weld = m.eq_data[eq_id].copy()
-                print(f"[cpu] contact at tick {k} (t={k*CTRL_DT:.2f}s, "
-                      f"range {rng*1000:.1f} mm) -> suction ON")
+                print(f"[cpu] press done (t={k*CTRL_DT:.2f}s, force {f_now:.1f} N, "
+                      f"tilt {tilt:.0f} deg) -> seal OK, suction ON")
+            else:
+                print(f"[cpu] press done but seal FAILED (force {f_now:.1f} N, "
+                      f"tilt {tilt:.0f} deg) -- no suction")
         if k == sched["i_release"] and weld_tick >= 0:
             d.eq_active[eq_id] = 0
-            print(f"[cpu] release at tick {k} (t={k*CTRL_DT:.2f}s) -> suction OFF")
+            print(f"[cpu] release at t={k*CTRL_DT:.2f}s -> suction OFF")
         # reference held over the 4ms tick; feedback closes at the physics rate
         # (like the real drives' inner servo loop under the 4ms stream)
         for _ in range(NSUB):
@@ -241,23 +287,70 @@ def run_cpu(m, sched, frame_cb=None):
         if frame_cb is not None:
             frame_cb(d, k, weld_tick)
     err = np.abs(qlog - qref)
-    # contact-critical phases: descend..lift-start and drop..end (grasp & place);
-    # the fast mid-carry swing tolerates a larger transient
+    # contact-critical tracking windows: approach-to-grasp, post-latch lift,
+    # and drop/release. The press itself is intentional force application
+    # (the reference is unreachable by design), so it is excluded.
     crit = np.zeros(len(qref), dtype=bool)
-    crit[sched["i_descend_start"]:sched["i_descend_end"] + 450] = True   # descend+dwell+lift
-    crit[sched["i_release"] - 250:] = True                               # drop, release, settle
+    crit[sched["i_descend_start"]:sched["i_grasp_end"]] = True
+    crit[sched["i_press_end"] + 150:sched["i_press_end"] + 500] = True
+    crit[sched["i_release"] - 250:] = True
     err_crit = float(np.degrees(err[crit].max()))
-    print(f"[cpu] tracking error: max {np.degrees(err.max()):.3f} deg "
-          f"(per-joint max {np.round(np.degrees(err.max(axis=0)), 3)}), "
+    print(f"[cpu] tracking error: max {np.degrees(err.max()):.3f} deg, "
           f"rms {np.degrees(np.sqrt((err**2).mean())):.4f} deg, "
-          f"grasp/place phases max {err_crit:.3f} deg")
+          f"grasp/lift/place phases max {err_crit:.3f} deg")
     fp = d.xpos[obj_bid]
     in_bin = (abs(fp[0] - BIN_XY[0]) < BIN_HALF and abs(fp[1] - BIN_XY[1]) < BIN_HALF
               and fp[2] < 0.10)
     print(f"[cpu] {OBJ} final pos {np.round(fp, 3)}  in_bin={in_bin}")
     return dict(weld_tick=weld_tick, eq_data=eq_data_at_weld, qlog=qlog,
                 in_bin=in_bin, track_max_deg=float(np.degrees(err.max())),
-                track_crit_deg=err_crit)
+                track_crit_deg=err_crit, press_force=press_force)
+
+
+def press_test(m, obj="object7", lateral=0.012, frame_cb=None):
+    """Press-to-seal attempt on a curved object with a lateral aim offset.
+    Under real contact the cup slides off the sphere and shoves it away;
+    the seal check must then fail. Returns (displacement_m, sealed)."""
+    d = mujoco.MjData(m)
+    obj_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, obj)
+    cup_gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "cup_tip")
+    mujoco.mj_forward(m, d)
+    p0 = d.xpos[obj_bid].copy()
+    top = p0[2] + 0.030                       # sphere radius
+    aim = [p0[0] + lateral, p0[1]]
+
+    dik = mujoco.MjData(m)
+    q_hover, _ = ik(m, dik, "tcp", [aim[0], aim[1], top + HOVER], R_DOWN, Q_START)
+    q_grasp, _ = ik(m, dik, "tcp", [aim[0], aim[1], top + CUP_R], R_DOWN, q_hover)
+    q_press, _ = ik(m, dik, "tcp", [aim[0], aim[1], top + CUP_R - PRESS_M],
+                    R_DOWN, q_grasp)
+    qref = []
+    _seg(qref, Q_START, q_hover, 2.0)
+    _seg(qref, q_hover, q_grasp, 1.5)
+    _seg(qref, q_grasp, q_press, 0.8)
+    i_press_end = len(qref)
+    _seg(qref, q_press, q_press, 0.4)
+    qref = np.array(qref)
+    qdref, tau_ff, kp, kd = _gains_and_ff(m, d, qref)
+    sched = dict(qref=qref, qdref=qdref, tau_ff=tau_ff, kp=kp, kd=kd)
+
+    d.qpos[:6] = Q_START
+    mujoco.mj_forward(m, d)
+    sealed = False
+    for k in range(len(qref)):
+        if k == i_press_end:
+            f_now, tilt = _cup_contact(m, d, cup_gid)
+            sealed = f_now > SEAL_N and tilt < SEAL_DEG
+        for _ in range(NSUB):
+            d.ctrl[:6] = pd_tau(sched, k, d.qpos[:6], d.qvel[:6])
+            mujoco.mj_step(m, d)
+        if frame_cb is not None:
+            frame_cb(d, k, -1)
+    disp = float(np.linalg.norm(d.xpos[obj_bid][:2] - p0[:2]))
+    print(f"[press-test] curved {obj}, aim offset {lateral*1000:.0f} mm: "
+          f"object displaced {disp*1000:.1f} mm, seal "
+          f"{'OK (unexpected!)' if sealed else 'FAILED as expected'}")
+    return disp, sealed
 
 
 def main():
@@ -265,9 +358,11 @@ def main():
     sched = build_schedule(m)
     res = run_cpu(m, sched)
     if res["weld_tick"] < 0:
-        print("[cpu] FAIL: never reached contact"); sys.exit(1)
+        print("[cpu] FAIL: seal check failed on the flat object"); sys.exit(1)
     if not res["in_bin"]:
         print("[cpu] FAIL: object not in bin"); sys.exit(1)
+
+    disp, sealed = press_test(m)
 
     # -------- Phase B: mujoco_warp, closed-loop batch with the same schedule
     import time
@@ -321,7 +416,8 @@ def main():
     qerr = np.abs(qpos[0, :6] - res["qlog"][-1]).max()
     print(f"[warp] in_bin {ok}/{NWORLD}   world0 final joint err vs CPU {qerr:.4f} rad")
     passed = (ok == NWORLD and qerr < 0.05 and res["track_max_deg"] < 3.0
-              and res["track_crit_deg"] < 1.0)
+              and res["track_crit_deg"] < 1.0 and res["press_force"] > 1.0
+              and disp > 0.010 and not sealed)
     print("PASS" if passed else "FAIL")
     sys.exit(0 if passed else 1)
 
