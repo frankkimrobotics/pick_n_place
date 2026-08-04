@@ -126,6 +126,10 @@ class PickEnv:
         self.phi_approach = torch.zeros(N, device=device)
         self.phi_transport = torch.zeros(N, device=device)
         self.phi_lift = torch.zeros(N, device=device)
+        self.RKEYS = ["approach", "align", "press", "seal", "lift",
+                      "transport", "place", "drop", "chatter", "act",
+                      "time", "table_slam", "off_table"]
+        self.ep_comp = torch.zeros(N, len(self.RKEYS), device=device)
         self.bin_pos = torch.tensor([*BIN_XY, 0.0], device=device, dtype=torch.float32)
         self.reset(torch.ones(N, dtype=torch.bool, device=device))
 
@@ -169,6 +173,7 @@ class PickEnv:
         self.t_step[idx] = 0
         self.sealed[idx] = False
         self.ever_sealed[idx] = False
+        self.ep_comp[idx] = 0.0
         self.q_target[idx] = self.qpos[idx, :6]
         mjw.forward(self.m, self.d)
         tcp, _ = self._tcp()
@@ -293,7 +298,8 @@ class PickEnv:
     def reward(self, want, latched_now, released, broke, tcp_before, obj_before, a):
         """Staged, potential-based pick-and-place reward. See RL_SAC_PLAN.md."""
         N = self.nworld
-        r = torch.full((N,), W["time"], device=self.device)
+        C = {}
+        C["time"] = torch.full((N,), W["time"], device=self.device)
         tcp, R = self._tcp()
         op = self._obj_pos()
         gp = self._grasp_point()
@@ -301,39 +307,39 @@ class PickEnv:
 
         # 1 approach (potential delta, pre-seal only)
         phi_a = -torch.norm(tcp - gp, dim=-1)
-        r = r + W["approach"] * torch.where(self.sealed, torch.zeros_like(phi_a),
-                                            phi_a - self.phi_approach)
+        C["approach"] = W["approach"] * torch.where(self.sealed, torch.zeros_like(phi_a),
+                                                    phi_a - self.phi_approach)
         self.phi_approach = phi_a
         # 2 alignment near contact (within 3 cm, pre-seal)
         near = (~self.sealed) & (torch.norm(tcp - gp, dim=-1) < 0.03)
         align = (-R[:, 2, 2]).clamp(0, 1)               # 1 = cup facing down
-        r = r + W["align"] * near.float() * align / CTRL_HZ
+        C["align"] = W["align"] * near.float() * align / CTRL_HZ
         # 3 press quality while commanding suction near the object
         press = near & want & (tcp[:, 2] < gp[:, 2])
-        r = r + W["press"] * press.float() / CTRL_HZ
+        C["press"] = W["press"] * press.float() / CTRL_HZ
         # 4 seal event (one-time)
-        r = r + W["seal"] * latched_now.float()
+        C["seal"] = W["seal"] * latched_now.float()
         # 5 lift while sealed (potential on capped height)
         phi_l = lift_h / 0.10
-        r = r + W["lift"] * self.sealed.float() * (phi_l - self.phi_lift)
+        C["lift"] = W["lift"] * self.sealed.float() * (phi_l - self.phi_lift)
         self.phi_lift = torch.where(self.sealed, phi_l, self.phi_lift)
         # 6 transport while sealed and lifted
         phi_t = -torch.norm(op[:, :2] - self.bin_pos[:2], dim=-1)
         carrying = self.sealed & (lift_h > 0.05)
-        r = r + W["transport"] * carrying.float() * (phi_t - self.phi_transport)
+        C["transport"] = W["transport"] * carrying.float() * (phi_t - self.phi_transport)
         self.phi_transport = phi_t
         # 7 drop penalty: released or broke while far from bin and airborne
         over_bin = (torch.abs(op[:, 0] - self.bin_pos[0]) < BIN_HALF) & \
                    (torch.abs(op[:, 1] - self.bin_pos[1]) < BIN_HALF)
         bad_drop = (released | broke) & (lift_h > 0.02) & ~over_bin
-        r = r + W["drop"] * bad_drop.float()
+        C["drop"] = W["drop"] * bad_drop.float()
         # 8 suction chatter: commanding far from the object
-        r = r + W["chatter"] * (want & ~self.sealed &
-                                (torch.norm(tcp - gp, dim=-1) > 0.03)).float()
+        C["chatter"] = W["chatter"] * (want & ~self.sealed &
+                                       (torch.norm(tcp - gp, dim=-1) > 0.03)).float()
         # 9 action penalty
-        r = r + W["act"] * a[:, :6].pow(2).sum(-1)
+        C["act"] = W["act"] * a[:, :6].pow(2).sum(-1)
         # 10 table slam: cup below table plane proxy
-        r = r + W["table_slam"] * (tcp[:, 2] < 0.004).float()
+        C["table_slam"] = W["table_slam"] * (tcp[:, 2] < 0.004).float()
 
         # terminal conditions
         placed = self.ever_sealed & ~self.sealed & over_bin & \
@@ -343,11 +349,16 @@ class PickEnv:
               (op[:, 1] < TABLE_Y[0] - 0.10) | (op[:, 1] > TABLE_Y[1] + 0.10)
         off = off & ~over_bin
         timeout = self.t_step >= EP_LEN
-        r = r + W["place"] * placed.float() + W["off_table"] * off.float()
+        C["place"] = W["place"] * placed.float()
+        C["off_table"] = W["off_table"] * off.float()
         done = placed | off | timeout
+        comp = torch.stack([C[k] for k in self.RKEYS], dim=-1)
+        self.ep_comp += comp
+        r = comp.sum(-1)
         info = dict(placed=placed, sealed=self.sealed.clone(),
                     ever_sealed=self.ever_sealed.clone(), off=off,
-                    timeout=timeout)
+                    timeout=timeout, ep_comp=self.ep_comp.clone(),
+                    ep_len=self.t_step.clone())
         return r, done, info
 
 
