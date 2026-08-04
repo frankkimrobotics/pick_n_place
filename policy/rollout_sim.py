@@ -137,10 +137,12 @@ def main():
                     help="dataset dir (spec for --untrained)")
     ap.add_argument("--scene", type=int, default=700)
     ap.add_argument("--out", default=os.path.expanduser("~/pnp_rollouts"))
-    ap.add_argument("--exec_steps", type=int, default=2,
-                    help="0.1 s action steps executed per inference "
-                         "(2 = 5 Hz re-planning; TRT-measured inference is "
-                         "13 ms, so even 1 is feasible on-robot)")
+    ap.add_argument("--exec_steps", type=int, default=10,
+                    help="0.1 s action steps executed per inference. Rate "
+                         "sweep on DP@25k: 5 Hz sealed 0/5 (re-plan dither), "
+                         "1 Hz sealed 5/5 with the longest suction holds -- "
+                         "slow re-planning wins until chunk consistency "
+                         "improves; revisit on mature checkpoints")
     ap.add_argument("--blend_s", type=float, default=0.2,
                     help="min-jerk decay horizon of the splice alignment offset")
     ap.add_argument("--ensemble", type=int, default=0,
