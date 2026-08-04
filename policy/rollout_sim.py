@@ -55,6 +55,32 @@ W, H = 424, 240
 REC_HZ = 10
 
 
+def cup_contact_with(m, d, cup_gid, tip_sid, target_bid):
+    """Like demo _cup_contact but counts ONLY contacts between the cup tip
+    and the TARGET body. The generic check let the cup 'seal' against the
+    table or a neighbouring object while the weld attached the target --
+    which then lifted at a distance (unphysical)."""
+    import mujoco
+    axis = d.site_xmat[tip_sid].reshape(3, 3)[:, 2]
+    f_tot, f_best, ang = 0.0, 0.0, 180.0
+    buf = np.zeros(6)
+    for i in range(d.ncon):
+        c = d.contact[i]
+        if cup_gid not in (c.geom1, c.geom2):
+            continue
+        other = c.geom2 if c.geom1 == cup_gid else c.geom1
+        if m.geom_bodyid[other] != target_bid:
+            continue
+        mujoco.mj_contactForce(m, d, i, buf)
+        fn = abs(buf[0])
+        f_tot += fn
+        if fn > f_best:
+            f_best = fn
+            n = np.asarray(c.frame[:3])
+            ang = np.degrees(np.arccos(min(1.0, abs(float(n @ axis)))))
+    return f_tot, ang
+
+
 def jpeg_domain(rgb):
     """Match the dataset pixel pipeline: 424x240 render -> 432x240 (ffmpeg
     macroblock resize) -> JPEG q90 roundtrip -> bytes."""
@@ -188,6 +214,7 @@ def main():
     tcp_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "tcp")
     tcp_sid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "tcp")
     cup_gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "cup_tip")
+    tip_sid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "tip_rf")
     CTRL_DT, NSUB = 0.001, 1
     demo["CTRL_DT"] = CTRL_DT         # _gains_and_ff differentiates with this
     ticks_per_step = int(round(0.1 / CTRL_DT))               # 100
@@ -308,7 +335,7 @@ def main():
             for k in range(len(qref)):
                 cmd = bool(suc_cmd[min(k // ticks_per_step, 15)])
                 if cmd and not latched:
-                    f, tilt = demo["_cup_contact"](m, d, cup_gid)
+                    f, tilt = cup_contact_with(m, d, cup_gid, tip_sid, bid)
                     if f > demo["SEAL_N"] and tilt < demo["SEAL_DEG"]:
                         demo["_latch_weld"](m, d, eq_id, tcp_bid, bid)
                         latched = was_latched = True
