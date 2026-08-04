@@ -137,9 +137,11 @@ def main():
                     help="dataset dir (spec for --untrained)")
     ap.add_argument("--scene", type=int, default=700)
     ap.add_argument("--out", default=os.path.expanduser("~/pnp_rollouts"))
-    ap.add_argument("--exec_steps", type=int, default=8,
-                    help="0.1 s action steps executed per inference")
-    ap.add_argument("--blend_s", type=float, default=0.3,
+    ap.add_argument("--exec_steps", type=int, default=2,
+                    help="0.1 s action steps executed per inference "
+                         "(2 = 5 Hz re-planning; TRT-measured inference is "
+                         "13 ms, so even 1 is feasible on-robot)")
+    ap.add_argument("--blend_s", type=float, default=0.2,
                     help="min-jerk decay horizon of the splice alignment offset")
     ap.add_argument("--steps_max", type=int, default=150,
                     help="max policy steps per pick episode")
