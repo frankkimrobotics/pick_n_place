@@ -93,6 +93,10 @@ def jpeg_domain(rgb):
 class Policy:
     def __init__(self, a, dev):
         self.dev = dev
+        self.eps0 = None
+        if a.frozen_noise:
+            g = torch.Generator(device="cpu").manual_seed(7)
+            self.eps0 = torch.randn(1, tl.TA, tl.ADIM, generator=g).to(dev)
         if a.ckpt:
             ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
             self.model, self.action = ck["model"], ck["action"]
@@ -137,13 +141,15 @@ class Policy:
                             enabled=self.dev == "cuda"):
             ctx = self.ctx(imgs, prop, goal)
             if self.model == "dp":
-                x = torch.randn(1, tl.TA, tl.ADIM, device=self.dev)
+                x = (self.eps0.clone() if self.eps0 is not None
+                     else torch.randn(1, tl.TA, tl.ADIM, device=self.dev))
                 for t in self.isched.timesteps:
                     tb = t.expand(1).to(self.dev)
                     x = self.isched.step(self.net(x, tb, ctx).float(),
                                          t, x).prev_sample
             elif self.model == "cfm":
-                x = torch.randn(1, tl.TA, tl.ADIM, device=self.dev)
+                x = (self.eps0.clone() if self.eps0 is not None
+                     else torch.randn(1, tl.TA, tl.ADIM, device=self.dev))
                 for k in range(16):
                     tb = torch.full((1,), k / 16, device=self.dev)
                     x = x + self.net(x, tb * 50, ctx).float() / 16
@@ -171,6 +177,11 @@ def main():
                          "improves; revisit on mature checkpoints")
     ap.add_argument("--blend_s", type=float, default=0.2,
                     help="min-jerk decay horizon of the splice alignment offset")
+    ap.add_argument("--frozen_noise", action="store_true",
+                    help="reuse one fixed initial noise for every DP/CFM "
+                         "inference: consecutive chunks become deterministic "
+                         "continuations (no plan-switching dither), while "
+                         "observations still update every re-plan")
     ap.add_argument("--suction_off_n", type=int, default=5,
                     help="consecutive 0.1 s off-commands required to release "
                          "an engaged latch (hysteresis; demos never flicker "
