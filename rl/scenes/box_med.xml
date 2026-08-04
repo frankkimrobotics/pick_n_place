@@ -1,5 +1,5 @@
 <mujoco model="mycobot_sim">
-  <compiler angle="radian" meshdir="/home/lisc-frank/Desktop/2026/pick_and_place/outputs/mujoco_sim/meshes" autolimits="true"/>
+  <compiler angle="radian" meshdir="meshes" autolimits="true"/>
   <option timestep="0.002" gravity="0 0 -9.81"/>
   <visual><global offwidth="1280" offheight="960"/>
     <headlight diffuse="0.6 0.6 0.6" ambient="0.4 0.4 0.4"/><map znear="0.01"/></visual>
