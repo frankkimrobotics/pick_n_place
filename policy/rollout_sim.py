@@ -143,6 +143,10 @@ def main():
                          "13 ms, so even 1 is feasible on-robot)")
     ap.add_argument("--blend_s", type=float, default=0.2,
                     help="min-jerk decay horizon of the splice alignment offset")
+    ap.add_argument("--ensemble", type=int, default=0,
+                    help="temporal ensembling: infer at 10 Hz (1 step/chunk) "
+                         "and average the N most recent overlapping chunks "
+                         "at each tick (ACT-style); overrides --exec_steps")
     ap.add_argument("--steps_max", type=int, default=150,
                     help="max policy steps per pick episode")
     ap.add_argument("--gpu", type=int, default=0)
@@ -184,12 +188,23 @@ def main():
     spec = pol.spec
     # true phase: at elapsed tau the intended action is spline(tau - 0.1)
     # (s=0 encodes t+0.1); clamp holds the first/last knot at the edges
+    if a.ensemble:
+        a.exec_steps = 1
     exec_tau = np.arange(0, a.exec_steps * 0.1, CTRL_DT)
     dense_s = np.clip(exec_tau - 0.1, 0.0, None)
     DENSE = np.stack([cl.bspline_basis(s) for s in dense_s])
     # min-jerk decay weight for the splice alignment offset
     u = np.clip(exec_tau / max(a.blend_s, 1e-6), 0.0, 1.0)
     BLEND_W = 1.0 - (10 * u**3 - 15 * u**4 + 6 * u**5)       # 1 -> 0, smooth
+    if a.ensemble:
+        # basis rows for a chunk aged `g` steps over one 0.1 s window:
+        # its phase there is s = (g-1)*0.1 + tick*dt (newest chunk g=0
+        # clamps to s=0 -- its first action applies at t+0.1)
+        ENS_BASIS = np.stack([
+            np.stack([cl.bspline_basis(min(max((g - 1) * 0.1 + kk * CTRL_DT,
+                                               0.0), 1.5))
+                      for kk in range(len(exec_tau))])
+            for g in range(a.ensemble)])                 # (N, ticks, 16)
 
     def render_cam(cam):
         ren.update_scene(d, camera=cam, scene_option=vopt)
@@ -220,6 +235,7 @@ def main():
                                   f"suction_{o['name']}")
         latched = was_latched = False
         prev = None
+        chunks = []                      # temporal-ensemble buffer
         t0 = time.time()
         for step in range(a.steps_max):
             # ---- observation (training domain) ----
@@ -244,8 +260,20 @@ def main():
             jpgs = [prev[0], j405, prev[1], j435]
             ctrl, suc_cmd = pol(jpgs, prop, goal)
 
-            # ---- execute first exec_steps of the chunk at 4 ms ----
-            qref = DENSE @ ctrl                              # (n_ticks, 6)
+            if a.ensemble:
+                chunks.append((ctrl, suc_cmd))
+                if len(chunks) > a.ensemble:
+                    chunks.pop(0)
+                # average the overlapping chunks at each tick (uniform
+                # weights, ACT-style temporal ensembling); newest is last
+                qs, sc = [], []
+                for g, (c_, s_) in enumerate(reversed(chunks)):
+                    qs.append(ENS_BASIS[g, :len(exec_tau)] @ c_)
+                    sc.append(float(s_[min(g, 15)]))
+                qref = np.mean(qs, axis=0)
+                suc_cmd = np.full(16, np.mean(sc) > 0.5, dtype=bool)
+            else:
+                qref = DENSE @ ctrl                          # (n_ticks, 6)
             # splice alignment: shift the whole window so it starts exactly
             # at the current joint state, decaying to the raw chunk
             qref = qref + BLEND_W[:, None] * (d.qpos[:6] - qref[0])
