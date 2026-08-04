@@ -197,12 +197,31 @@ def main():
     # (s=0 encodes t+0.1); clamp holds the first/last knot at the edges
     if a.ensemble:
         a.exec_steps = 1
-    exec_tau = np.arange(0, a.exec_steps * 0.1, CTRL_DT)
+    # two extra ticks beyond the exec window so the C1 bridge has a
+    # landing point + slope even when the window is a single step
+    exec_tau = np.arange(0, a.exec_steps * 0.1 + 2 * CTRL_DT, CTRL_DT)
+    n_exec = len(exec_tau) - 2
     dense_s = np.clip(exec_tau - 0.1, 0.0, None)
     DENSE = np.stack([cl.bspline_basis(s) for s in dense_s])
-    # min-jerk decay weight for the splice alignment offset
-    u = np.clip(exec_tau / max(a.blend_s, 1e-6), 0.0, 1.0)
-    BLEND_W = 1.0 - (10 * u**3 - 15 * u**4 + 6 * u**5)       # 1 -> 0, smooth
+    # C1 splice bridge: the first BRIDGE_T of every window is a cubic
+    # Hermite from the CURRENT (q, qd) onto the chunk -- position AND
+    # velocity continuous, so re-inference produces no stall/jitter
+    # (the raw chunk is flat for its first 0.1 s: spline s=0 encodes t+0.1)
+    NB = min(int(round(0.1 / CTRL_DT)), n_exec)
+    _bt = np.arange(NB) * CTRL_DT / (NB * CTRL_DT)
+    H00 = 2 * _bt**3 - 3 * _bt**2 + 1
+    H10 = (_bt**3 - 2 * _bt**2 + _bt) * (NB * CTRL_DT)
+    H01 = -2 * _bt**3 + 3 * _bt**2
+    H11 = (_bt**3 - _bt**2) * (NB * CTRL_DT)
+
+    def bridge(qref_ext, q_now, qd_now):
+        """qref_ext has n_exec+2 rows; returns n_exec rows, C1 at both ends."""
+        p1 = qref_ext[NB]
+        v1 = (qref_ext[NB + 1] - qref_ext[NB]) / CTRL_DT
+        out = qref_ext[:n_exec].copy()
+        out[:NB] = (H00[:, None] * q_now + H10[:, None] * qd_now
+                    + H01[:, None] * p1 + H11[:, None] * v1)
+        return out
     if a.ensemble:
         # basis rows for a chunk aged `g` steps over one 0.1 s window:
         # its phase there is s = (g-1)*0.1 + tick*dt (newest chunk g=0
@@ -211,7 +230,7 @@ def main():
             np.stack([cl.bspline_basis(min(max((g - 1) * 0.1 + kk * CTRL_DT,
                                                0.0), 1.5))
                       for kk in range(len(exec_tau))])
-            for g in range(a.ensemble)])                 # (N, ticks, 16)
+            for g in range(a.ensemble)])                 # (N, ticks+2, 16)
 
     def render_cam(cam):
         ren.update_scene(d, camera=cam, scene_option=vopt)
@@ -278,13 +297,10 @@ def main():
                 for g, (c_, s_) in enumerate(reversed(chunks)):
                     qs.append(ENS_BASIS[g, :len(exec_tau)] @ c_)
                     sc.append(float(s_[min(g, 15)]))
-                qref = np.mean(qs, axis=0)
+                qref = bridge(np.mean(qs, axis=0), d.qpos[:6], d.qvel[:6])
                 suc_cmd = np.full(16, np.mean(sc) > 0.5, dtype=bool)
             else:
-                qref = DENSE @ ctrl                          # (n_ticks, 6)
-            # splice alignment: shift the whole window so it starts exactly
-            # at the current joint state, decaying to the raw chunk
-            qref = qref + BLEND_W[:, None] * (d.qpos[:6] - qref[0])
+                qref = bridge(DENSE @ ctrl, d.qpos[:6], d.qvel[:6])
             qdref, tau_ff, kp, kd = demo["_gains_and_ff"](m, d, qref)
             sched = dict(qref=qref, qdref=qdref, tau_ff=tau_ff, kp=kp, kd=kd)
             prev = (j405, j435, q_now, qd_now)
