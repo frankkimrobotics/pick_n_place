@@ -146,14 +146,58 @@ def main():
 
     # ---- IK waypoints (repo primitives) ----
     q_hover, e1 = ik(m, dik, "tcp", [g[0], g[1], g[2] + 0.10], R_DOWN, q_now)
-    q_touch0, e2 = ik(m, dik, "tcp", [g[0], g[1], g[2] + CUP_R + 0.02], R_DOWN, q_hover)
-    assert max(e1, e2) < 0.005, f"IK failed ({e1:.4f}, {e2:.4f})"
+    assert e1 < 0.005, f"IK failed ({e1:.4f})"
 
     print("[pick] hover")
     move(to_lcnc(q_hover), dur(q_now, q_hover), a.execute)
     snap(run_dir, "1_hover.jpg")
 
+    # ---- closed-loop visual centering: re-image from hover and correct;
+    # the camera keeps voting, so FK slip bias cancels out ----
+    def estimate_from_here(q_at):
+        dd1 = open(f"{SHM}/pnp_wrist_depth.npy", "rb").read()
+        time.sleep(0.8)
+        dd2 = open(f"{SHM}/pnp_wrist_depth.npy", "rb").read()
+        dmx = np.frombuffer(dd2, np.uint16).reshape(intr["h"], intr["w"]).astype(np.float32) * 1e-4
+        vv = dmx > 0.05
+        vv[190:, :] = False; vv[:, :30] = False; vv[:, -30:] = False
+        tb = float(np.median(dmx[vv]))
+        mk = (vv & (dmx < tb - 0.012) & (dmx > tb - 0.12)).astype(np.uint8)
+        nn, lb, st, ct = cv2.connectedComponentsWithStats(mk, 8)
+        if nn <= 1:
+            return None
+        bb = 1 + int(np.argmax(st[1:, 4]))
+        uu, vvv = ct[bb]
+        zz = float(np.median(dmx[lb == bb]))
+        pr = np.array([(uu - intr["ppx"]) / intr["fx"] * zz,
+                       (vvv - intr["ppy"]) / intr["fy"] * zz, zz])
+        pmj = np.array([pr[0], -pr[1], -pr[2]])
+        d.qpos[:6] = q_at
+        mujoco.mj_forward(m, d)
+        return d.cam_xpos[cid] + d.cam_xmat[cid].reshape(3, 3) @ pmj
+
+    q_cur = q_hover.copy()
+    for it in range(3):
+        g_new = estimate_from_here(q_cur)
+        if g_new is None:
+            print("  [center] object lost from view"); break
+        corr = np.linalg.norm(g_new[:2] - g[:2])
+        g = g_new
+        q_c, e = ik(m, dik, "tcp", [g[0], g[1], g[2] + 0.10], R_DOWN, q_cur)
+        if e > 0.005:
+            break
+        print(f"  [center] iter {it}: obj at {np.round(g,4).tolist()} "
+              f"(moved {1000*corr:.0f} mm)")
+        move(to_lcnc(q_c), max(4.0, dur(q_cur, q_c)), a.execute)
+        q_cur = q_c
+        if corr < 0.004 and it > 0:
+            break
+    q_hover = q_cur
+    snap(run_dir, "1b_centered.jpg")
+
     print("[pick] pre-contact (+2 cm nominal)")
+    q_touch0, e2 = ik(m, dik, "tcp", [g[0], g[1], g[2] + CUP_R + 0.02], R_DOWN, q_hover)
+    assert e2 < 0.005, f"IK failed ({e2:.4f})"
     move(to_lcnc(q_touch0), dur(q_hover, q_touch0), a.execute)
     snap(run_dir, "2_precontact.jpg")
 
@@ -163,7 +207,7 @@ def main():
     contact = False
     target_z = g[2] + CUP_R + 0.02
     for step in range(8):                       # up to 6.4 cm of travel
-        target_z -= 0.008
+        target_z -= 0.006
         q_next, e = ik(m, dik, "tcp", [g[0], g[1], target_z], R_DOWN, q_ref)
         if e > 0.005:
             print("[pick] IK limit during descent")
@@ -173,7 +217,7 @@ def main():
         _, tau = feedback()
         dtau = np.abs(tau - tau_free)[:4].max()
         print(f"  descent step {step}: z={target_z:.4f} dtau={dtau:.2f}")
-        if a.execute and dtau > max(0.8, 0.25 * np.abs(tau_free[:4]).max()):
+        if a.execute and dtau > 0.15:
             print("[pick] CONTACT detected (torque)")
             contact = True
             break
