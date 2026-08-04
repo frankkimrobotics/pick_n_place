@@ -137,12 +137,19 @@ def main():
                     help="dataset dir (spec for --untrained)")
     ap.add_argument("--scene", type=int, default=700)
     ap.add_argument("--out", default=os.path.expanduser("~/pnp_rollouts"))
-    ap.add_argument("--exec_steps", type=int, default=2,
-                    help="0.1 s action steps executed per inference "
-                         "(2 = 5 Hz re-planning; TRT-measured inference is "
-                         "13 ms, so even 1 is feasible on-robot)")
+    ap.add_argument("--exec_steps", type=int, default=10,
+                    help="0.1 s action steps executed per inference. Rate "
+                         "sweep on DP@25k: 5 Hz sealed 0/5 (re-plan dither), "
+                         "1 Hz sealed 5/5 with the longest suction holds -- "
+                         "slow re-planning wins until chunk consistency "
+                         "improves; revisit on mature checkpoints")
     ap.add_argument("--blend_s", type=float, default=0.2,
                     help="min-jerk decay horizon of the splice alignment offset")
+    ap.add_argument("--suction_off_n", type=int, default=5,
+                    help="consecutive 0.1 s off-commands required to release "
+                         "an engaged latch (hysteresis; demos never flicker "
+                         "-- suction is one contiguous span per pick). "
+                         "0 disables debouncing")
     ap.add_argument("--ensemble", type=int, default=0,
                     help="temporal ensembling: infer at 10 Hz (1 step/chunk) "
                          "and average the N most recent overlapping chunks "
@@ -235,6 +242,7 @@ def main():
                                   f"suction_{o['name']}")
         latched = was_latched = False
         prev = None
+        off_count = 0                    # suction-release debounce counter
         chunks = []                      # temporal-ensemble buffer
         t0 = time.time()
         for step in range(a.steps_max):
@@ -288,7 +296,11 @@ def main():
                     if f > demo["SEAL_N"] and tilt < demo["SEAL_DEG"]:
                         demo["_latch_weld"](m, d, eq_id, tcp_bid, bid)
                         latched = was_latched = True
-                if not cmd and latched:
+                        off_count = 0
+                if latched and k % ticks_per_step == 0:
+                    off_count = 0 if cmd else off_count + 1
+                if not cmd and latched and (a.suction_off_n == 0
+                                            or off_count >= a.suction_off_n):
                     d.eq_active[eq_id] = 0
                     latched = False
                 for _ in range(NSUB):
