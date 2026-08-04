@@ -58,8 +58,12 @@ from joint_conventions import (linuxcnc_deg_to_rad,        # noqa: E402
 WRIST_SER = "218622271300"
 FIXED_SER = "043422070101"
 SUCTION_PIN = "pro600.digital_out00"
-J_LO = np.radians([-175, -85, -70, -145, -175, -175])
-J_HI = np.radians([175, 85, 70, 145, 175, 175])
+# tightened to the demo task envelope (real cell has a WALL behind the
+# robot: j1 below -30 URDF leans the upper arm backward over the base)
+# widened after run 1: the shoulder slip means the physical goal needs
+# MORE forward reach than FK predicts; z-floor guard remains the true stop
+J_LO = np.radians([-60, -30, 0, -60, -135, -60])
+J_HI = np.radians([60, 78, 70, 45, -45, 60])
 
 
 class Robot:
@@ -77,16 +81,29 @@ class Robot:
         return np.array(linuxcnc_deg_to_rad(d["joints_deg"]), float)
 
     def send_chunk(self, traj_rad, dt):
-        deg = [list(map(float, rad_to_linuxcnc_deg(w))) for w in traj_rad]
-        msg = {"trajectory": deg, "traj_dt": dt, "target_deg": deg[-1],
-               "weld": True, "t_anchor": time.time() + 0.1}
-        if not self.execute:
-            print(f"  [dry] chunk {len(deg)} pts dt={dt*1000:.0f}ms "
-                  f"first={np.round(deg[0],1)} last={np.round(deg[-1],1)}")
-            return
-        k = socket.create_connection((self.pi, 9994), timeout=3)
-        k.sendall((json.dumps(msg) + "\n").encode())
-        k.close()
+        """SAFE SPLINE FOLLOWER: walk the pid controller along the (already
+        accel/vel-clamped, z-floor-truncated) spline via sub-targets every
+        SUB_T seconds, so motion follows the smooth chunk shape rather than
+        one point-to-point jump. Blocks for the window duration."""
+        SUB_T = 1.0
+        n = len(traj_rad)
+        step = max(1, int(round(SUB_T / dt)))
+        idx = list(range(step, n, step)) + [n - 1]
+        for i in idx:
+            tgt = list(map(float, rad_to_linuxcnc_deg(traj_rad[i])))
+            dur = float((i - (idx[idx.index(i) - 1] if idx.index(i) else 0)) * dt)
+            if not self.execute:
+                print(f"  [dry] sub-target {np.round(tgt, 1)} over {dur:.1f}s")
+                continue
+            k = socket.create_connection((self.pi, 9998), timeout=3)
+            k.sendall((json.dumps({"target_deg": tgt, "duration": dur,
+                                   "controller": "pid"}) + "\n").encode())
+            try:
+                k.settimeout(2); k.recv(256)
+            except Exception:
+                pass
+            k.close()
+            time.sleep(dur)
 
     def set_suction(self, on):
         on = int(on)
@@ -222,11 +239,28 @@ def main():
             p1 = qref[min(NB, len(qref) - 1)]
             w = np.linspace(0, 1, NB)[:, None]
             qref[:NB] = (1 - (3 * w**2 - 2 * w**3)) * q + (3 * w**2 - 2 * w**3) * p1
-            # clamps: joint box + per-tick velocity
+            # clamps: joint box + per-tick velocity + acceleration
             qref = np.clip(qref, J_LO, J_HI)
             vmax = np.radians(a.max_vel_deg) * DT_STREAM
+            amax = vmax / 4.0                      # reach vmax over ~0.2 s
+            dq_prev = np.zeros(6)
             for k in range(1, len(qref)):
-                qref[k] = qref[k - 1] + np.clip(qref[k] - qref[k - 1], -vmax, vmax)
+                dq = np.clip(qref[k] - qref[k - 1], -vmax, vmax)
+                dq = np.clip(dq, dq_prev - amax, dq_prev + amax)
+                qref[k] = qref[k - 1] + dq
+                dq_prev = dq
+            # FK z-floor: truncate the window at the first sample whose tcp
+            # dips below the goal press floor (goal_z - 25 mm)
+            z_floor = g_pos[2] - 0.025
+            n_ok = len(qref)
+            for k in range(0, len(qref), 4):
+                pz, _ = tcp_pose(qref[k])
+                if pz[2] < z_floor:
+                    n_ok = max(NB + 1, k)
+                    print(f"  [safe] z-floor truncation at sample {k} "
+                          f"(tcp z {pz[2]:.3f} < {z_floor:.3f})")
+                    break
+            qref = qref[:n_ok]
             demand = np.degrees(np.abs(np.diff(qref, axis=0)).max()) / DT_STREAM
             log.append(dict(step=step, q=q.tolist(), range=frames["range"],
                             goal=goal.tolist(), suction=int(latched_cmd),

@@ -40,6 +40,12 @@ def put(path, data):
 def main():
     wrist = start(WRIST_SER, 30, depth=True)
     fixed = start(FIXED_SER, 15)
+    # publish wrist depth intrinsics once (for goal estimation deprojection)
+    import json
+    prof = wrist.get_active_profile().get_stream(rs.stream.depth)                .as_video_stream_profile().get_intrinsics()
+    with open(f"{SHM}/pnp_wrist_intr.json", "w") as f:
+        json.dump(dict(fx=prof.fx, fy=prof.fy, ppx=prof.ppx, ppy=prof.ppy,
+                       w=prof.width, h=prof.height), f)
     print("[cam_server] running", flush=True)
     n = 0
     while True:
@@ -50,6 +56,9 @@ def main():
         ok, buf = cv2.imencode(".jpg", col, [cv2.IMWRITE_JPEG_QUALITY, 95])
         put(f"{SHM}/pnp_wrist.jpg", buf.tobytes())
         put(f"{SHM}/pnp_range.txt", f"{rng:.4f}".encode())
+        if dep and n % 5 == 0:
+            dm = np.asanyarray(dep.get_data()).astype(np.uint16)
+            put(f"{SHM}/pnp_wrist_depth.npy", dm.tobytes())
         f2 = fixed.wait_for_frames(2000)
         col2 = np.asanyarray(f2.get_color_frame().get_data())
         ok, buf2 = cv2.imencode(".jpg", col2, [cv2.IMWRITE_JPEG_QUALITY, 95])
