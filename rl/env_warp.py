@@ -49,6 +49,7 @@ TABLE_X = (0.24, 0.52)
 TABLE_Y = (-0.16, 0.16)
 DQ_MAX = np.radians(2.0)   # per-decision joint delta clamp
 EP_LEN = 150
+EP_LEN_ATTACH = 40
 
 W = dict(approach=1.0, align=0.3, press=0.5, seal=5.0, lift=2.0,
          transport=1.5, place=10.0, drop=-2.0, chatter=-0.05,
@@ -74,9 +75,14 @@ def build_scene_xml(half_extents, kind, out_xml, seed=0):
 
 class PickEnv:
     def __init__(self, nworld=1024, device="cuda:0", seed=0,
-                 xml=None, half_extents=(0.025, 0.025, 0.02), kind="box"):
+                 xml=None, half_extents=(0.025, 0.025, 0.02), kind="box",
+                 mode="full"):
+        """mode='attach': staged sub-task -- episodes START with the cup
+        hovering 2-4 cm above the (jittered) grasp point; success = seal +
+        hold + 2 cm lift within a 40-step episode. mode='full': whole task."""
         self.nworld = nworld
         self.device = device
+        self.mode = mode
         self.rng = np.random.default_rng(seed)
         if xml is None:
             xml = os.path.join(HERE, "_scene_rl.xml")
@@ -94,6 +100,14 @@ class PickEnv:
         self.obj_mass = float(M.body_mass[self.bid_obj])
         import config as C
         self.q_home = np.asarray(C.START_Q, float)
+        # canonical hover for attach mode (CPU IK once)
+        demo = {"__file__": os.path.join(ROOT, "mjwarp_pick_demo.py")}
+        exec(open(demo["__file__"]).read().split("if __name__")[0], demo)
+        dik = mujoco.MjData(self.mjm)
+        self.q_hover, _e = demo["ik"](
+            self.mjm, dik, "tcp",
+            [0.38, 0.0, float(half_extents[2]) + CUP_R + 0.05],
+            demo["R_DOWN"], self.q_home)
         mjd.qpos[:6] = self.q_home
         mujoco.mj_forward(self.mjm, mjd)
         # PD gains (fixed diagonal; simpler than per-tick gain scheduling)
@@ -175,6 +189,27 @@ class PickEnv:
         self.ever_sealed[idx] = False
         self.ep_comp[idx] = 0.0
         self.q_target[idx] = self.qpos[idx, :6]
+        if self.mode == "attach":
+            # place the ARM near the grasp: per-world CPU IK is too slow, so
+            # use a canonical pre-solved hover configuration for the object at
+            # scene center and correct the object to sit UNDER the cup instead:
+            # sample cup-relative offsets and put the object there.
+            self.qpos[idx, :6] = torch.tensor(
+                self.q_hover + self.rng.normal(0, 0.015, size=(idx.numel(), 6)),
+                device=self.device, dtype=torch.float32)
+            mjw.forward(self.m, self.d)
+            tcp, _ = self._tcp()
+            off = torch.tensor(self.rng.uniform(
+                [-0.015, -0.015], [0.015, 0.015], size=(idx.numel(), 2)),
+                device=self.device, dtype=torch.float32)
+            hover = torch.tensor(self.rng.uniform(0.02, 0.04, size=idx.numel()),
+                                 device=self.device, dtype=torch.float32)
+            qa = self.jadr_obj
+            self.qpos[idx, qa:qa + 2] = tcp[idx, :2] + off
+            self.qpos[idx, qa + 2] = (tcp[idx, 2] - hover
+                                      - float(self.half[2]) - CUP_R).clamp(
+                min=float(self.half[2]) + 0.001)
+            self.q_target[idx] = self.qpos[idx, :6]
         mjw.forward(self.m, self.d)
         tcp, _ = self._tcp()
         self.phi_approach[idx] = -torch.norm(
@@ -348,7 +383,11 @@ class PickEnv:
         off = (op[:, 0] < TABLE_X[0] - 0.08) | (op[:, 0] > TABLE_X[1] + 0.08) | \
               (op[:, 1] < TABLE_Y[0] - 0.10) | (op[:, 1] > TABLE_Y[1] + 0.10)
         off = off & ~over_bin
-        timeout = self.t_step >= EP_LEN
+        if self.mode == "attach":
+            placed = self.sealed & (lift_h > 0.02)      # success = seal + lift
+            timeout = self.t_step >= EP_LEN_ATTACH
+        else:
+            timeout = self.t_step >= EP_LEN
         C["place"] = W["place"] * placed.float()
         C["off_table"] = W["off_table"] * off.float()
         done = placed | off | timeout
