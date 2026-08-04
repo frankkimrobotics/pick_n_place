@@ -252,13 +252,29 @@ def main():
     H01 = -2 * _bt**3 + 3 * _bt**2
     H11 = (_bt**3 - _bt**2) * (NB * CTRL_DT)
 
-    def bridge(qref_ext, q_now, qd_now):
-        """qref_ext has n_exec+2 rows; returns n_exec rows, C1 at both ends."""
+    def bridge(qref_ext, anchor):
+        """qref_ext has n_exec+2 rows; returns n_exec rows. QUINTIC entry
+        blend matching (pos, vel, accel) of the previously COMMANDED
+        reference (anchor) -> C2-continuous command signal across splices;
+        the PD owns tracking error. anchor = (p0, v0, a0)."""
+        p0, v0, a0 = anchor
         p1 = qref_ext[NB]
         v1 = (qref_ext[NB + 1] - qref_ext[NB]) / CTRL_DT
+        a1 = (qref_ext[NB + 1] - 2 * qref_ext[NB] + qref_ext[NB - 1]) / CTRL_DT**2 \
+            if NB >= 1 else np.zeros(6)
+        T = NB * CTRL_DT
+        tt = (np.arange(NB) * CTRL_DT)[:, None]
+        # quintic coefficients per joint (boundary p,v,a both ends)
+        c0, c1, c2 = p0, v0, a0 / 2.0
+        d_p = p1 - (c0 + c1 * T + c2 * T**2)
+        d_v = v1 - (c1 + 2 * c2 * T)
+        d_a = a1 - 2 * c2
+        c3 = (10 * d_p - 4 * T * d_v + 0.5 * T**2 * d_a) / T**3
+        c4 = (-15 * d_p + 7 * T * d_v - T**2 * d_a) / T**4
+        c5 = (6 * d_p - 3 * T * d_v + 0.5 * T**2 * d_a) / T**5
         out = qref_ext[:n_exec].copy()
-        out[:NB] = (H00[:, None] * q_now + H10[:, None] * qd_now
-                    + H01[:, None] * p1 + H11[:, None] * v1)
+        out[:NB] = (c0 + c1 * tt + c2 * tt**2 + c3 * tt**3
+                    + c4 * tt**4 + c5 * tt**5)
         return out
     if a.ensemble:
         # basis rows for a chunk aged `g` steps over one 0.1 s window:
@@ -301,6 +317,7 @@ def main():
         prev = None
         off_count = 0                    # suction-release debounce counter
         chunks = []                      # temporal-ensemble buffer
+        ref_tail = None                  # last 3 samples of commanded ref
         t0 = time.time()
         for step in range(a.steps_max):
             # ---- observation (training domain) ----
@@ -335,10 +352,23 @@ def main():
                 for g, (c_, s_) in enumerate(reversed(chunks)):
                     qs.append(ENS_BASIS[g, :len(exec_tau)] @ c_)
                     sc.append(float(s_[min(g, 15)]))
-                qref = bridge(np.mean(qs, axis=0), d.qpos[:6], d.qvel[:6])
+                if ref_tail is None:
+                    anchor = (d.qpos[:6].copy(), d.qvel[:6].copy(), np.zeros(6))
+                else:
+                    anchor = (ref_tail[-1],
+                              (ref_tail[-1] - ref_tail[-2]) / CTRL_DT,
+                              (ref_tail[-1] - 2 * ref_tail[-2] + ref_tail[-3]) / CTRL_DT**2)
+                qref = bridge(np.mean(qs, axis=0), anchor)
                 suc_cmd = np.full(16, np.mean(sc) > 0.5, dtype=bool)
             else:
-                qref = bridge(DENSE @ ctrl, d.qpos[:6], d.qvel[:6])
+                if ref_tail is None:
+                    anchor = (d.qpos[:6].copy(), d.qvel[:6].copy(), np.zeros(6))
+                else:
+                    anchor = (ref_tail[-1],
+                              (ref_tail[-1] - ref_tail[-2]) / CTRL_DT,
+                              (ref_tail[-1] - 2 * ref_tail[-2] + ref_tail[-3]) / CTRL_DT**2)
+                qref = bridge(DENSE @ ctrl, anchor)
+            ref_tail = qref[-3:].copy()
             qdref, tau_ff, kp, kd = demo["_gains_and_ff"](m, d, qref)
             sched = dict(qref=qref, qdref=qdref, tau_ff=tau_ff, kp=kp, kd=kd)
             prev = (j405, j435, q_now, qd_now)
