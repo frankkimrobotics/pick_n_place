@@ -550,7 +550,10 @@ class PickEnv:
             # GENTLE-LANDING grade: full credit at rest, fades with impact speed
             gentle = torch.exp(-(spd ** 2) / (2 * 0.04 ** 2))
             # CONTACT-RELEASE grade: released while pressed to the surface
-            contact_rel = torch.exp(-(self.release_h ** 2) / (2 * 0.008 ** 2))
+            # sigma wide enough that a few-cm drop still gets gradient toward
+            # contact release (0.008 was a reward cliff: e^-19 at 5 cm ->
+            # never-release trap); the strict placed gate stays at 1 cm
+            contact_rel = torch.exp(-(self.release_h ** 2) / (2 * 0.025 ** 2))
             # TILT-DISCIPLINE grade: fades past ~15 deg peak tilt
             tilt_g = torch.exp(-((self.max_tilt - 0.26).clamp(min=0) ** 2)
                                / (2 * 0.17 ** 2))
