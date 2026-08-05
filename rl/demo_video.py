@@ -63,7 +63,9 @@ def main():
                 results[i] = bool(info["placed"][i])
         if done_seen.all():
             break
-    print("[demo] episode results (seal+lift):",
+    crit = ("seal+lift 2cm" if a.mode == "attach"
+            else "placed at target + released + at rest")
+    print(f"[demo] episode results ({crit}):",
           ["OK" if r else "fail" for r in results])
 
     # replay through renderer
