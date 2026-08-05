@@ -422,7 +422,8 @@ class PickEnv:
             over_bin = (torch.abs(op[:, 0] - self.bin_pos[0]) < BIN_HALF) & \
                        (torch.abs(op[:, 1] - self.bin_pos[1]) < BIN_HALF)
         if self.mode == "pnp":
-            bad_drop = (released | broke) & ~over_bin      # any off-target release
+            # penalize only AERIAL drops; gentle set-downs are graded below
+            bad_drop = (released | broke) & (lift_h > 0.02)
         else:
             bad_drop = (released | broke) & (lift_h > 0.02) & ~over_bin
         C["drop"] = W["drop"] * bad_drop.float()
@@ -445,18 +446,28 @@ class PickEnv:
             placed = self.sealed & (lift_h > 0.02)      # success = seal + lift
             timeout = self.t_step >= EP_LEN_ATTACH
         elif self.mode == "pnp":
-            # success = PLACED: was sealed, now released, object ON the
-            # target (<= PLACE_TOL), set down, at rest
-            placed = self.ever_sealed & ~self.sealed & over_bin & \
-                (lift_h < 0.01) & \
+            # GRADED placement: any gentle set-down (release at <1 cm lift,
+            # object slow) ENDS the episode with reward 20*exp(-d^2/2s^2),
+            # s = 5 cm -- smooth gradient toward the target from anywhere.
+            # 'placed' (the success METRIC) still requires d <= PLACE_TOL.
+            setdown = self.ever_sealed & ~self.sealed & (lift_h < 0.01) & \
                 (torch.norm(self.qvel[:, self.vadr_obj:self.vadr_obj + 3],
-                            dim=-1) < 0.05)
+                            dim=-1) < 0.08) & (released | (self.t_step > 1))
+            d_tgt = torch.norm(op[:, :2] - self.place_target, dim=-1)
+            placed = setdown & (d_tgt < PLACE_TOL)
+            self._graded = setdown.float() * torch.exp(-(d_tgt ** 2) / (2 * 0.05 ** 2))
             timeout = self.t_step >= EP_LEN_PNP
         else:
             timeout = self.t_step >= EP_LEN
-        C["place"] = W["place"] * placed.float()
+        if self.mode == "pnp":
+            C["place"] = W["place"] * getattr(self, "_graded",
+                                              placed.float())
+            done_setdown = self._graded > 0
+        else:
+            C["place"] = W["place"] * placed.float()
+            done_setdown = placed
         C["off_table"] = W["off_table"] * off.float()
-        done = placed | off | timeout
+        done = done_setdown | placed | off | timeout
         comp = torch.stack([C[k] for k in self.RKEYS], dim=-1)
         self.ep_comp += comp
         r = comp.sum(-1)
