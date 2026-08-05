@@ -98,16 +98,15 @@ def _worker_render(job):
         ren.update_scene(d, camera=cam, scene_option=_W["vopt"])
         dep = ren.render()
         ren.disable_depth_rendering()
-        rgbd = np.concatenate([rgb.astype(np.float32) / 255.0,
-                               np.clip(dep, 0, 2.0)[..., None] / 2.0], -1)
-        out.append(rgbd.transpose(2, 0, 1))              # (4, H, W)
+        d8 = (np.clip(dep, 0, 2.0) * 127.5).astype(np.uint8)[..., None]
+        out.append(np.concatenate([rgb, d8], -1).transpose(2, 0, 1))  # (4,H,W) u8
     return out
 
 
 class RenderFarm:
     """Multiprocess CPU renderer; main process owns the DR RNG and ships
     explicit per-world params with each request (workers are stateless)."""
-    def __init__(self, xml, nworld, seed=0, workers=32):
+    def __init__(self, xml, nworld, seed=0, workers=56):
         import multiprocessing as mp
         self.rng = np.random.default_rng(seed)
         m0 = mujoco.MjModel.from_xml_path(xml)
@@ -194,26 +193,23 @@ def main():
         obs = env.observe()
         # track per-world mocap for the render (pedestal)
         while collected < a.steps_per_iter:
-            ims1, ims2 = [], []
             mocap = None
             if env.mocap_pos is not None:
                 mocap = env.mocap_pos.cpu().numpy()
             qp = env.qpos.cpu().numpy()
-            for i in range(a.nworld):
-                r1, r2 = farm.render(i, qp[i], mocap[i] if mocap is not None else None)
-                ims1.append(r1)
-                ims2.append(r2)
-            im1 = torch.tensor(np.stack(ims1), device=dev)
-            im2 = torch.tensor(np.stack(ims2), device=dev)
+            ims1, ims2 = farm.render_batch(qp, mocap)
+            u1, u2 = np.stack(ims1), np.stack(ims2)
             prop, goal = proprio_goal()
             with torch.no_grad():
                 t_act = torch.tanh(teacher.pi(obs))
             if beta_teacher >= 1.0:
                 act = t_act
             else:
+                im1 = torch.tensor(u1, device=dev).float() / 255.0
+                im2 = torch.tensor(u2, device=dev).float() / 255.0
                 act = student_act(im1, im2, prop, goal)
-            D_im1.append((im1.cpu().numpy() * 255).astype(np.uint8))
-            D_im2.append((im2.cpu().numpy() * 255).astype(np.uint8))
+            D_im1.append(u1)
+            D_im2.append(u2)
             D_prop.append(prop.cpu().numpy())
             D_goal.append(goal.cpu().numpy())
             D_act.append(t_act.cpu().numpy())
@@ -261,12 +257,9 @@ def main():
         while done_ct < 64:
             mocap = env.mocap_pos.cpu().numpy() if env.mocap_pos is not None else None
             qp = env.qpos.cpu().numpy()
-            ims1 = []; ims2 = []
-            for i in range(a.nworld):
-                r1, r2 = farm.render(i, qp[i], mocap[i] if mocap is not None else None)
-                ims1.append(r1); ims2.append(r2)
-            im1 = torch.tensor(np.stack(ims1), device=dev)
-            im2 = torch.tensor(np.stack(ims2), device=dev)
+            ims1, ims2 = farm.render_batch(qp, mocap)
+            im1 = torch.tensor(np.stack(ims1), device=dev).float() / 255.0
+            im2 = torch.tensor(np.stack(ims2), device=dev).float() / 255.0
             prop, goal = proprio_goal()
             act = student_act(im1, im2, prop, goal)
             obs, r, done, info = env.step(act)
