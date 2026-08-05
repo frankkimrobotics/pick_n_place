@@ -60,9 +60,13 @@ def main():
     if a.init:
         ck = torch.load(a.init, map_location=dev, weights_only=False)
         try:
-            ac.pi.load_state_dict({k[4:]: v for k, v in ck["actor"].items()
-                                   if k.startswith("net.")}, strict=False)
-            print("[ppo] warm-started pi (partial)", flush=True)
+            if "ac" in ck:                      # PPO-format checkpoint
+                ac.load_state_dict(ck["ac"])
+                print("[ppo] warm-started full AC (ppo ckpt)", flush=True)
+            elif "actor" in ck:                 # SAC-format: pi only
+                ac.pi.load_state_dict({k[4:]: v for k, v in ck["actor"].items()
+                                       if k.startswith("net.")}, strict=False)
+                print("[ppo] warm-started pi (sac ckpt, partial)", flush=True)
         except Exception as e:
             print("[ppo] warm-start skipped:", e, flush=True)
     opt = torch.optim.Adam(ac.parameters(), lr=a.lr)
