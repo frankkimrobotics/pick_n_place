@@ -112,6 +112,21 @@ class PickEnv:
             self.mjm, dik, "tcp",
             [0.38, 0.0, float(half_extents[2]) + CUP_R + 0.05],
             demo["R_DOWN"], self.q_home)
+        # HOVER GRID: pre-solved IK across the whole table so resets (and
+        # therefore training picks) cover the full workspace, not one spot
+        grid = []
+        z_h = float(half_extents[2]) + CUP_R + 0.05
+        q_seed = self.q_hover
+        for gx in np.linspace(TABLE_X[0] + 0.03, TABLE_X[1] - 0.03, 9):
+            for gy in np.linspace(TABLE_Y[0] + 0.03, TABLE_Y[1] - 0.03, 7):
+                q_g, e_g = demo["ik"](self.mjm, dik, "tcp",
+                                      [float(gx), float(gy), z_h],
+                                      demo["R_DOWN"], q_seed)
+                if e_g < 0.005:
+                    grid.append(q_g)
+                    q_seed = q_g
+        self.hover_grid = np.stack(grid)
+        print(f"[env] hover grid: {len(grid)} reachable cells", flush=True)
         mjd.qpos[:6] = self.q_home
         mujoco.mj_forward(self.mjm, mjd)
         # PD gains (fixed diagonal; simpler than per-tick gain scheduling)
@@ -218,8 +233,9 @@ class PickEnv:
             # use a canonical pre-solved hover configuration for the object at
             # scene center and correct the object to sit UNDER the cup instead:
             # sample cup-relative offsets and put the object there.
+            cells = self.rng.integers(0, len(self.hover_grid), size=idx.numel())
             self.qpos[idx, :6] = torch.tensor(
-                self.q_hover + self.rng.normal(0, 0.015, size=(idx.numel(), 6)),
+                self.hover_grid[cells] + self.rng.normal(0, 0.015, size=(idx.numel(), 6)),
                 device=self.device, dtype=torch.float32)
             mjw.forward(self.m, self.d)
             tcp, _ = self._tcp()
@@ -361,7 +377,7 @@ class PickEnv:
         r, done, info = self.reward(want, first_latch, released, broke,
                                     tcp_before, obj_before, a)
         obs = self.observe()
-        if done.any():
+        if done.any() and getattr(self, "auto_reset", True):
             self.reset(done)
         return obs, r, done, info
 
