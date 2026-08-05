@@ -62,7 +62,8 @@ def main():
             if not done_seen[i]:
                 traj[i].append((env.qpos[i].detach().cpu().numpy().copy(),
                                 bool(env.sealed[i]),
-                                env.place_target[i].detach().cpu().numpy().copy()))
+                                env.place_target[i].detach().cpu().numpy().copy(),
+                                float(env.target_h[i])))
         with torch.no_grad():
             mu = actor(obs)[0] if a.algo == "ppo" else actor(obs)[0]
             act = torch.tanh(mu)                     # deterministic policy
@@ -97,7 +98,7 @@ def main():
     vw = cv2.VideoWriter(os.path.join(a.out, "_raw.mp4"),
                          cv2.VideoWriter_fourcc(*"mp4v"), 10, (864, 300))
     for i in range(N):
-        for qpos, sealed, tgt in traj[i]:
+        for qpos, sealed, tgt, th in traj[i]:
             d.qpos[:len(qpos)] = qpos
             if a.mode == "pnp":
                 d.mocap_pos[0] = [tgt[0], tgt[1], 0.002]
