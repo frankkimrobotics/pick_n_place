@@ -28,19 +28,29 @@ def main():
     ap.add_argument("--out", default=os.path.expanduser("~/pnp_rl/attach_demo"))
     ap.add_argument("--scene", default=os.path.join(HERE, "scenes", "box_med.xml"))
     ap.add_argument("--mode", default="attach", choices=["attach", "pnp"])
+    ap.add_argument("--algo", default="sac", choices=["sac", "ppo"])
     ap.add_argument("--horizon", type=int, default=45)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     wp.init()
     from env_warp import PickEnv
     from sac import Actor
+    from ppo import AC
 
     N = a.episodes
     env = PickEnv(nworld=N, mode=a.mode, xml=a.scene)
-    actor = Actor().to(env.device)
     ck = torch.load(a.actor, map_location=env.device, weights_only=False)
-    actor.load_state_dict(ck["actor"])
-    actor.eval()
+    if a.algo == "ppo":
+        net = AC().to(env.device)
+        net.load_state_dict(ck["ac"])
+        net.eval()
+        class _A:
+            def __call__(self, o): return net.pi(o), None
+        actor = _A()
+    else:
+        actor = Actor().to(env.device)
+        actor.load_state_dict(ck["actor"])
+        actor.eval()
     print(f"[demo] actor from step {ck.get('step')}")
 
     traj = [[] for _ in range(N)]      # per-world (qpos, sealed)
@@ -54,7 +64,7 @@ def main():
                                 bool(env.sealed[i]),
                                 env.place_target[i].detach().cpu().numpy().copy()))
         with torch.no_grad():
-            mu, _ = actor(obs)
+            mu = actor(obs)[0] if a.algo == "ppo" else actor(obs)[0]
             act = torch.tanh(mu)                     # deterministic policy
         obs, r, done, info = env.step(act)
         for i in range(N):
