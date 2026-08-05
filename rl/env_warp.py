@@ -43,6 +43,7 @@ SEAL_DIST = 0.012          # cup tip to object-top center (m)
 SEAL_TILT = 25.0           # deg
 SEAL_VEL = 0.08            # m/s relative speed gate (low-energy latch)
 F_MAX = 20.0               # N suction holding limit
+TAU_CUP = 0.4              # N*m peel-torque limit (~F_MAX x cup radius)
 BIN_XY = np.array([0.10, 0.40])
 BIN_HALF = 0.145
 TABLE_X = (0.24, 0.52)
@@ -155,6 +156,7 @@ class PickEnv:
         self.xmat_site = wp.to_torch(self.d.site_xmat)  # (N, nsite, 3, 3)
         self.site_xpos = wp.to_torch(self.d.site_xpos)
         self.xfrc = wp.to_torch(self.d.xfrc_applied)    # (N, nbody, 6)
+        self.xquat = wp.to_torch(self.d.xquat)          # (N, nbody, 4) wxyz
         self.bid_ped = name2id(M, mujoco.mjtObj.mjOBJ_BODY, "pedestal")
         self.mocap_ped = int(M.body_mocapid[self.bid_ped]) if self.bid_ped >= 0 else -1
         self.mocap_pos = wp.to_torch(self.d.mocap_pos) if self.mocap_ped >= 0 else None
@@ -176,6 +178,8 @@ class PickEnv:
         self.ep_comp = torch.zeros(N, len(self.RKEYS), device=device)
         self.max_lift = torch.zeros(N, device=device)
         self.target_h = torch.zeros(N, device=device)   # place surface height
+        self.max_tilt = torch.zeros(N, device=device)    # rad, while sealed
+        self.release_h = torch.zeros(N, device=device)   # rest_h at release
         self.bin_pos = torch.tensor([*BIN_XY, 0.0], device=device, dtype=torch.float32)
         self.place_target = self.bin_pos[:2].expand(N, 2).clone()
         self.reset(torch.ones(N, dtype=torch.bool, device=device))
@@ -222,6 +226,8 @@ class PickEnv:
         self.ever_sealed[idx] = False
         self.ep_comp[idx] = 0.0
         self.max_lift[idx] = 0.0
+        self.max_tilt[idx] = 0.0
+        self.release_h[idx] = 0.0
         if self.dr:
             n_ = idx.numel()
             self.gain_scale[idx] = torch.tensor(
@@ -335,6 +341,16 @@ class PickEnv:
             self.ever_sealed[idx] = True
         return gate
 
+    def _obj_zaxis(self):
+        q = self.xquat[:, self.bid_obj]                  # wxyz
+        w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        return torch.stack([2 * (x * z + w * y),
+                            2 * (y * z - w * x),
+                            1 - 2 * (x * x + y * y)], -1)
+
+    K_ROT = 4.0               # N*m/rad righting stiffness
+    C_ROT = 0.05              # N*m*s/rad
+
     def _apply_suction_force(self):
         """Called each physics substep: spring-damper pulling the object's
         latch anchor to its latched pose in the (moving) tcp frame."""
@@ -351,8 +367,19 @@ class PickEnv:
         F = F * scale
         m = self.sealed.float()[:, None]
         self.xfrc[:, self.bid_obj, :3] = F * m
-        self.xfrc[:, self.bid_obj, 3:] = 0.0
-        sat = self.sealed & (Fmag.squeeze(-1) * scale.squeeze(-1) >= F_MAX - 1e-4)
+        # rotational spring: right the object's z-axis toward the CUP axis,
+        # capped at the peel-torque limit (single-cup wrench limit)
+        objz = self._obj_zaxis()
+        cupz = -R[:, :, 2]                       # cup presses along -z
+        err = torch.cross(objz, cupz, dim=-1)
+        w_obj = self.qvel[:, self.vadr_obj + 3:self.vadr_obj + 6]
+        T = self.K_ROT * err - self.C_ROT * w_obj
+        Tmag = torch.norm(T, dim=-1, keepdim=True)
+        tscale = (TAU_CUP / Tmag.clamp(min=1e-6)).clamp(max=1.0)
+        self.xfrc[:, self.bid_obj, 3:] = T * tscale * m
+        sat_t = self.sealed & (Tmag.squeeze(-1) * tscale.squeeze(-1) >= TAU_CUP - 1e-5)
+        sat = self.sealed & ((Fmag.squeeze(-1) * scale.squeeze(-1) >= F_MAX - 1e-4)
+                             | sat_t)
         self.sat_count = torch.where(sat, self.sat_count + 1,
                                      torch.zeros_like(self.sat_count))
 
@@ -420,7 +447,8 @@ class PickEnv:
             (op[:, :2] - self.place_target),              # to-target xy
             self.target_h[:, None],                        # place surface z
             (op[:, 2] - float(self.half[2]) - self.target_h)[:, None],
-        ], dim=-1) + (torch.randn(self.nworld, 36, device=self.device) * 0.005
+            self._obj_zaxis()[:, 2:3],                     # uprightness
+        ], dim=-1) + (torch.randn(self.nworld, 37, device=self.device) * 0.005
                       if self.dr else 0.0)
 
     # ---------------- reward ----------------
@@ -467,6 +495,12 @@ class PickEnv:
             over_bin = (torch.abs(op[:, 0] - self.bin_pos[0]) < BIN_HALF) & \
                        (torch.abs(op[:, 1] - self.bin_pos[1]) < BIN_HALF)
         rest_h = op[:, 2] - float(self.half[2]) - self.target_h
+        tilt = torch.arccos(self._obj_zaxis()[:, 2].clamp(-1, 1))
+        self.max_tilt = torch.where(self.sealed,
+                                    torch.maximum(self.max_tilt, tilt),
+                                    self.max_tilt)
+        self.release_h = torch.where(released, rest_h.clamp(min=0),
+                                     self.release_h)
         if self.mode == "pnp":
             # penalize only AERIAL drops (relative to the TARGET surface)
             bad_drop = (released | broke) & (rest_h > 0.02)
@@ -503,6 +537,11 @@ class PickEnv:
                 (released | (self.t_step > 1))
             # GENTLE-LANDING grade: full credit at rest, fades with impact speed
             gentle = torch.exp(-(spd ** 2) / (2 * 0.04 ** 2))
+            # CONTACT-RELEASE grade: released while pressed to the surface
+            contact_rel = torch.exp(-(self.release_h ** 2) / (2 * 0.008 ** 2))
+            # TILT-DISCIPLINE grade: fades past ~15 deg peak tilt
+            tilt_g = torch.exp(-((self.max_tilt - 0.26).clamp(min=0) ** 2)
+                               / (2 * 0.17 ** 2))
             d_tgt = torch.norm(op[:, :2] - self.place_target, dim=-1)
             if self.lift_req > 0:
                 lift_ok = self.max_lift >= self.lift_req
@@ -513,8 +552,10 @@ class PickEnv:
             else:
                 lift_ok = torch.ones_like(setdown)
                 lift_fac = torch.ones_like(self.max_lift)
-            placed = setdown & (d_tgt < PLACE_TOL) & lift_ok
+            placed = setdown & (d_tgt < PLACE_TOL) & lift_ok & \
+                (self.release_h < 0.010) & (self.max_tilt < 0.44)  # 1cm, 25deg
             self._graded = setdown.float() * lift_fac * gentle * \
+                contact_rel * tilt_g * \
                 torch.exp(-(d_tgt ** 2) / (2 * 0.05 ** 2))
             if self.speed_bonus > 0:
                 self._graded = self._graded * (
@@ -538,7 +579,14 @@ class PickEnv:
         info = dict(placed=placed, sealed=self.sealed.clone(),
                     ever_sealed=self.ever_sealed.clone(), off=off,
                     timeout=timeout, ep_comp=self.ep_comp.clone(),
-                    ep_len=self.t_step.clone())
+                    ep_len=self.t_step.clone(),
+                    max_lift=self.max_lift.clone(),
+                    final_d=torch.norm(op[:, :2] - self.place_target, dim=-1),
+                    final_spd=torch.norm(
+                        self.qvel[:, self.vadr_obj:self.vadr_obj + 3], dim=-1),
+                    target_h=self.target_h.clone(),
+                    max_tilt=self.max_tilt.clone(),
+                    release_h=self.release_h.clone())
         return r, done, info
 
 
