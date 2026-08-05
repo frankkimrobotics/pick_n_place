@@ -50,6 +50,8 @@ TABLE_Y = (-0.16, 0.16)
 DQ_MAX = np.radians(2.0)   # per-decision joint delta clamp
 EP_LEN = 150
 EP_LEN_ATTACH = 40
+EP_LEN_PNP = 100
+PLACE_TOL = 0.035
 
 W = dict(approach=1.0, align=0.3, press=0.5, seal=5.0, lift=2.0,
          transport=1.5, place=10.0, drop=-2.0, chatter=-0.05,
@@ -145,6 +147,7 @@ class PickEnv:
                       "time", "table_slam", "off_table"]
         self.ep_comp = torch.zeros(N, len(self.RKEYS), device=device)
         self.bin_pos = torch.tensor([*BIN_XY, 0.0], device=device, dtype=torch.float32)
+        self.place_target = self.bin_pos[:2].expand(N, 2).clone()
         self.reset(torch.ones(N, dtype=torch.bool, device=device))
 
     # ---------------- helpers ----------------
@@ -189,7 +192,7 @@ class PickEnv:
         self.ever_sealed[idx] = False
         self.ep_comp[idx] = 0.0
         self.q_target[idx] = self.qpos[idx, :6]
-        if self.mode == "attach":
+        if self.mode in ("attach", "pnp"):
             # place the ARM near the grasp: per-world CPU IK is too slow, so
             # use a canonical pre-solved hover configuration for the object at
             # scene center and correct the object to sit UNDER the cup instead:
@@ -210,12 +213,26 @@ class PickEnv:
                                       - float(self.half[2]) - CUP_R).clamp(
                 min=float(self.half[2]) + 0.001)
             self.q_target[idx] = self.qpos[idx, :6]
+        if self.mode == "pnp":
+            # random set-down target, guaranteed >= 8 cm from the object
+            for _try in range(1):
+                tgt = torch.tensor(self.rng.uniform(
+                    [TABLE_X[0] + 0.04, TABLE_Y[0] + 0.04],
+                    [TABLE_X[1] - 0.04, TABLE_Y[1] - 0.04], size=(idx.numel(), 2)),
+                    device=self.device, dtype=torch.float32)
+            qa = self.jadr_obj
+            near = torch.norm(tgt - self.qpos[idx, qa:qa + 2], dim=-1) < 0.08
+            tgt[near] = torch.where(
+                tgt[near] > 0.0, tgt[near] - 0.12, tgt[near] + 0.12).clamp(
+                torch.tensor([TABLE_X[0] + 0.04, TABLE_Y[0] + 0.04], device=self.device),
+                torch.tensor([TABLE_X[1] - 0.04, TABLE_Y[1] - 0.04], device=self.device))
+            self.place_target[idx] = tgt
         mjw.forward(self.m, self.d)
         tcp, _ = self._tcp()
         self.phi_approach[idx] = -torch.norm(
             tcp[idx] - self._grasp_point()[idx], dim=-1)
         self.phi_transport[idx] = -torch.norm(
-            self._obj_pos()[idx, :2] - self.bin_pos[:2], dim=-1)
+            self._obj_pos()[idx, :2] - self.place_target[idx], dim=-1)
         self.phi_lift[idx] = 0.0
 
     # ---------------- suction ----------------
@@ -326,7 +343,7 @@ class PickEnv:
             torch.tensor(self.half, device=self.device, dtype=torch.float32).expand(self.nworld, 3),
             self.sealed.float()[:, None],
             (op[:, 2] - self.half[2])[:, None],          # lift height
-            (op[:, :2] - self.bin_pos[:2]),               # to-bin xy
+            (op[:, :2] - self.place_target),              # to-target xy
         ], dim=-1)
 
     # ---------------- reward ----------------
@@ -359,13 +376,16 @@ class PickEnv:
         C["lift"] = W["lift"] * self.sealed.float() * (phi_l - self.phi_lift)
         self.phi_lift = torch.where(self.sealed, phi_l, self.phi_lift)
         # 6 transport while sealed and lifted
-        phi_t = -torch.norm(op[:, :2] - self.bin_pos[:2], dim=-1)
+        phi_t = -torch.norm(op[:, :2] - self.place_target, dim=-1)
         carrying = self.sealed & (lift_h > 0.05)
         C["transport"] = W["transport"] * carrying.float() * (phi_t - self.phi_transport)
         self.phi_transport = phi_t
         # 7 drop penalty: released or broke while far from bin and airborne
-        over_bin = (torch.abs(op[:, 0] - self.bin_pos[0]) < BIN_HALF) & \
-                   (torch.abs(op[:, 1] - self.bin_pos[1]) < BIN_HALF)
+        if self.mode == "pnp":
+            over_bin = torch.norm(op[:, :2] - self.place_target, dim=-1) < PLACE_TOL
+        else:
+            over_bin = (torch.abs(op[:, 0] - self.bin_pos[0]) < BIN_HALF) & \
+                       (torch.abs(op[:, 1] - self.bin_pos[1]) < BIN_HALF)
         bad_drop = (released | broke) & (lift_h > 0.02) & ~over_bin
         C["drop"] = W["drop"] * bad_drop.float()
         # 8 suction chatter: commanding far from the object
@@ -383,7 +403,7 @@ class PickEnv:
         off = (op[:, 0] < TABLE_X[0] - 0.08) | (op[:, 0] > TABLE_X[1] + 0.08) | \
               (op[:, 1] < TABLE_Y[0] - 0.10) | (op[:, 1] > TABLE_Y[1] + 0.10)
         off = off & ~over_bin
-        if self.mode == "attach":
+        if self.mode in ("attach", "pnp"):
             placed = self.sealed & (lift_h > 0.02)      # success = seal + lift
             timeout = self.t_step >= EP_LEN_ATTACH
         else:
