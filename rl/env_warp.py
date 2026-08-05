@@ -44,6 +44,7 @@ SEAL_TILT = 25.0           # deg
 SEAL_VEL = 0.08            # m/s relative speed gate (low-energy latch)
 F_MAX = 20.0               # N suction holding limit
 TAU_CUP = 0.4              # N*m peel-torque limit (~F_MAX x cup radius)
+PEEL_COS = 0.878           # cos(~28.6 deg): tilt beyond this = cup peeling
 BIN_XY = np.array([0.10, 0.40])
 BIN_HALF = 0.145
 TABLE_X = (0.24, 0.52)
@@ -348,6 +349,14 @@ class PickEnv:
                             2 * (y * z - w * x),
                             1 - 2 * (x * x + y * y)], -1)
 
+    def _obj_w_world(self):
+        """Free-joint angular velocity (qvel) is BODY-frame; rotate to world."""
+        w_b = self.qvel[:, self.vadr_obj + 3:self.vadr_obj + 6]
+        q = self.xquat[:, self.bid_obj]
+        qw, qv = q[:, :1], q[:, 1:]
+        t = 2 * torch.cross(qv, w_b, dim=-1)
+        return w_b + qw * t + torch.cross(qv, t, dim=-1)
+
     K_ROT = 4.0               # N*m/rad righting stiffness
     C_ROT = 0.05              # N*m*s/rad
 
@@ -372,12 +381,15 @@ class PickEnv:
         objz = self._obj_zaxis()
         cupz = -R[:, :, 2]                       # cup presses along -z
         err = torch.cross(objz, cupz, dim=-1)
-        w_obj = self.qvel[:, self.vadr_obj + 3:self.vadr_obj + 6]
+        w_obj = self._obj_w_world()
         T = self.K_ROT * err - self.C_ROT * w_obj
         Tmag = torch.norm(T, dim=-1, keepdim=True)
         tscale = (TAU_CUP / Tmag.clamp(min=1e-6)).clamp(max=1.0)
         self.xfrc[:, self.bid_obj, 3:] = T * tscale * m
-        sat_t = self.sealed & (Tmag.squeeze(-1) * tscale.squeeze(-1) >= TAU_CUP - 1e-5)
+        # peel = object actually hanging far off the cup axis (the capped
+        # righting spring can no longer recover it), NOT mere cap saturation
+        cosang = (objz * cupz).sum(-1)
+        sat_t = self.sealed & (cosang < PEEL_COS)
         sat = self.sealed & ((Fmag.squeeze(-1) * scale.squeeze(-1) >= F_MAX - 1e-4)
                              | sat_t)
         self.sat_count = torch.where(sat, self.sat_count + 1,
