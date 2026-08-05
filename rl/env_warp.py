@@ -78,7 +78,8 @@ def build_scene_xml(half_extents, kind, out_xml, seed=0):
 class PickEnv:
     def __init__(self, nworld=1024, device="cuda:0", seed=0,
                  xml=None, half_extents=(0.025, 0.025, 0.02), kind="box",
-                 mode="full", dr=False, target_max=0.30):
+                 mode="full", dr=False, target_max=0.30,
+                 lift_req=0.0, speed_bonus=0.0):
         """mode='attach': staged sub-task -- episodes START with the cup
         hovering 2-4 cm above the (jittered) grasp point; success = seal +
         hold + 2 cm lift within a 40-step episode. mode='full': whole task."""
@@ -87,6 +88,8 @@ class PickEnv:
         self.mode = mode
         self.dr = dr
         self.target_max = target_max
+        self.lift_req = lift_req          # required MAX lift for pnp success
+        self.speed_bonus = speed_bonus    # terminal bonus * (1 - t/EP_LEN)
         self.rng = np.random.default_rng(seed)
         if xml is None:
             xml = os.path.join(HERE, "_scene_rl.xml")
@@ -168,6 +171,7 @@ class PickEnv:
                       "transport", "place", "drop", "chatter", "act",
                       "time", "table_slam", "off_table"]
         self.ep_comp = torch.zeros(N, len(self.RKEYS), device=device)
+        self.max_lift = torch.zeros(N, device=device)
         self.bin_pos = torch.tensor([*BIN_XY, 0.0], device=device, dtype=torch.float32)
         self.place_target = self.bin_pos[:2].expand(N, 2).clone()
         self.reset(torch.ones(N, dtype=torch.bool, device=device))
@@ -213,6 +217,7 @@ class PickEnv:
         self.sealed[idx] = False
         self.ever_sealed[idx] = False
         self.ep_comp[idx] = 0.0
+        self.max_lift[idx] = 0.0
         if self.dr:
             n_ = idx.numel()
             self.gain_scale[idx] = torch.tensor(
@@ -406,7 +411,8 @@ class PickEnv:
         tcp, R = self._tcp()
         op = self._obj_pos()
         gp = self._grasp_point()
-        lift_h = (op[:, 2] - float(self.half[2])).clamp(0, 0.10)
+        lift_h = (op[:, 2] - float(self.half[2])).clamp(
+            0, max(self.lift_req, 0.10) + 0.05)
 
         # 1 approach (potential delta, pre-seal only)
         phi_a = -torch.norm(tcp - gp, dim=-1)
@@ -423,7 +429,9 @@ class PickEnv:
         # 4 seal event (one-time)
         C["seal"] = W["seal"] * latched_now.float()
         # 5 lift while sealed (potential on capped height)
-        phi_l = lift_h / 0.10
+        lift_cap = max(self.lift_req, 0.10)
+        self.max_lift = torch.maximum(self.max_lift, lift_h)
+        phi_l = lift_h.clamp(0, lift_cap) / lift_cap
         C["lift"] = W["lift"] * self.sealed.float() * (phi_l - self.phi_lift)
         self.phi_lift = torch.where(self.sealed, phi_l, self.phi_lift)
         # 6 transport while sealed and lifted
@@ -470,8 +478,15 @@ class PickEnv:
                 (torch.norm(self.qvel[:, self.vadr_obj:self.vadr_obj + 3],
                             dim=-1) < 0.08) & (released | (self.t_step > 1))
             d_tgt = torch.norm(op[:, :2] - self.place_target, dim=-1)
-            placed = setdown & (d_tgt < PLACE_TOL)
-            self._graded = setdown.float() * torch.exp(-(d_tgt ** 2) / (2 * 0.05 ** 2))
+            lift_ok = (self.max_lift >= self.lift_req) if self.lift_req > 0 \
+                else torch.ones_like(setdown)
+            placed = setdown & (d_tgt < PLACE_TOL) & lift_ok
+            self._graded = setdown.float() * lift_ok.float() * \
+                torch.exp(-(d_tgt ** 2) / (2 * 0.05 ** 2))
+            if self.speed_bonus > 0:
+                self._graded = self._graded * (
+                    1.0 + self.speed_bonus *
+                    (1.0 - self.t_step.float() / EP_LEN_PNP))
             timeout = self.t_step >= EP_LEN_PNP
         else:
             timeout = self.t_step >= EP_LEN
