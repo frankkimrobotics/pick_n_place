@@ -54,7 +54,7 @@ EP_LEN_PNP = 100
 PLACE_TOL = 0.035
 
 W = dict(approach=1.0, align=0.3, press=0.5, seal=5.0, lift=2.0,
-         transport=1.5, place=10.0, drop=-2.0, chatter=-0.05,
+         transport=6.0, place=20.0, drop=-0.5, chatter=-0.05,
          act=-0.01, time=-0.005, table_slam=-0.5, off_table=-2.0)
 
 
@@ -78,7 +78,7 @@ def build_scene_xml(half_extents, kind, out_xml, seed=0):
 class PickEnv:
     def __init__(self, nworld=1024, device="cuda:0", seed=0,
                  xml=None, half_extents=(0.025, 0.025, 0.02), kind="box",
-                 mode="full", dr=False):
+                 mode="full", dr=False, target_max=0.30):
         """mode='attach': staged sub-task -- episodes START with the cup
         hovering 2-4 cm above the (jittered) grasp point; success = seal +
         hold + 2 cm lift within a 40-step episode. mode='full': whole task."""
@@ -86,6 +86,7 @@ class PickEnv:
         self.device = device
         self.mode = mode
         self.dr = dr
+        self.target_max = target_max
         self.rng = np.random.default_rng(seed)
         if xml is None:
             xml = os.path.join(HERE, "_scene_rl.xml")
@@ -235,11 +236,18 @@ class PickEnv:
             self.q_target[idx] = self.qpos[idx, :6]
         if self.mode == "pnp":
             # random set-down target, guaranteed >= 8 cm from the object
-            for _try in range(1):
-                tgt = torch.tensor(self.rng.uniform(
-                    [TABLE_X[0] + 0.04, TABLE_Y[0] + 0.04],
-                    [TABLE_X[1] - 0.04, TABLE_Y[1] - 0.04], size=(idx.numel(), 2)),
-                    device=self.device, dtype=torch.float32)
+            # curriculum: target at distance U[0.05, target_max] from object
+            qa0 = self.jadr_obj
+            objxy = self.qpos[idx, qa0:qa0 + 2]
+            ang = torch.tensor(self.rng.uniform(0, 2 * np.pi, size=idx.numel()),
+                               device=self.device, dtype=torch.float32)
+            rad = torch.tensor(self.rng.uniform(0.05, self.target_max,
+                                                size=idx.numel()),
+                               device=self.device, dtype=torch.float32)
+            tgt = objxy + torch.stack([rad * torch.cos(ang),
+                                       rad * torch.sin(ang)], -1)
+            tgt[:, 0] = tgt[:, 0].clamp(TABLE_X[0] + 0.04, TABLE_X[1] - 0.04)
+            tgt[:, 1] = tgt[:, 1].clamp(TABLE_Y[0] + 0.04, TABLE_Y[1] - 0.04)
             qa = self.jadr_obj
             near = torch.norm(tgt - self.qpos[idx, qa:qa + 2], dim=-1) < 0.08
             tgt[near] = torch.where(
@@ -262,7 +270,7 @@ class PickEnv:
     # no jolt, no unbreakable carry -- the RL-hardened suction model).
     K_SUCTION = 1500.0        # N/m  (~1.3 mm sag under a 2 N payload)
     C_SUCTION = 30.0          # N s/m
-    BREAK_STEPS = 10          # substeps of saturation before break
+    BREAK_STEPS = 20          # substeps of saturation before break
 
     def _try_latch(self, want):
         tcp, R = self._tcp()
