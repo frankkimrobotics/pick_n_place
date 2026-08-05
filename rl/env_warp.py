@@ -308,7 +308,9 @@ class PickEnv:
         tcp_before, _ = self._tcp()
         obj_before = self._obj_pos().clone()
 
+        first_possible = ~self.ever_sealed.clone()
         latched_now = self._try_latch(want)
+        first_latch = latched_now & first_possible
         released = self.sealed & ~want
         if released.any():
             idx = torch.nonzero(released).squeeze(-1)
@@ -324,7 +326,7 @@ class PickEnv:
         self._last_tcp = self._tcp()[0].clone()
         self.t_step += 1
 
-        r, done, info = self.reward(want, latched_now, released, broke,
+        r, done, info = self.reward(want, first_latch, released, broke,
                                     tcp_before, obj_before, a)
         obs = self.observe()
         if done.any():
@@ -386,7 +388,10 @@ class PickEnv:
         else:
             over_bin = (torch.abs(op[:, 0] - self.bin_pos[0]) < BIN_HALF) & \
                        (torch.abs(op[:, 1] - self.bin_pos[1]) < BIN_HALF)
-        bad_drop = (released | broke) & (lift_h > 0.02) & ~over_bin
+        if self.mode == "pnp":
+            bad_drop = (released | broke) & ~over_bin      # any off-target release
+        else:
+            bad_drop = (released | broke) & (lift_h > 0.02) & ~over_bin
         C["drop"] = W["drop"] * bad_drop.float()
         # 8 suction chatter: commanding far from the object
         C["chatter"] = W["chatter"] * (want & ~self.sealed &
