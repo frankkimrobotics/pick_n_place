@@ -27,6 +27,8 @@ def main():
     ap.add_argument("--episodes", type=int, default=6)
     ap.add_argument("--out", default=os.path.expanduser("~/pnp_rl/attach_demo"))
     ap.add_argument("--scene", default=os.path.join(HERE, "scenes", "box_med.xml"))
+    ap.add_argument("--mode", default="attach", choices=["attach", "pnp"])
+    ap.add_argument("--horizon", type=int, default=45)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     wp.init()
@@ -34,7 +36,7 @@ def main():
     from sac import Actor
 
     N = a.episodes
-    env = PickEnv(nworld=N, mode="attach", xml=a.scene)
+    env = PickEnv(nworld=N, mode=a.mode, xml=a.scene)
     actor = Actor().to(env.device)
     ck = torch.load(a.actor, map_location=env.device, weights_only=False)
     actor.load_state_dict(ck["actor"])
@@ -45,11 +47,12 @@ def main():
     obs = env.observe()
     done_seen = torch.zeros(N, dtype=torch.bool, device=env.device)
     results = [None] * N
-    for t in range(45):
+    for t in range(a.horizon):
         for i in range(N):
             if not done_seen[i]:
                 traj[i].append((env.qpos[i].detach().cpu().numpy().copy(),
-                                bool(env.sealed[i])))
+                                bool(env.sealed[i]),
+                                env.place_target[i].detach().cpu().numpy().copy()))
         with torch.no_grad():
             mu, _ = actor(obs)
             act = torch.tanh(mu)                     # deterministic policy
@@ -74,7 +77,7 @@ def main():
     vw = cv2.VideoWriter(os.path.join(a.out, "_raw.mp4"),
                          cv2.VideoWriter_fourcc(*"mp4v"), 10, (864, 300))
     for i in range(N):
-        for qpos, sealed in traj[i]:
+        for qpos, sealed, tgt in traj[i]:
             d.qpos[:] = qpos
             mujoco.mj_forward(m, d)
             frames = []
@@ -84,7 +87,9 @@ def main():
             row = np.hstack([cv2.resize(f, (432, 240)) for f in frames])
             canvas = np.zeros((300, 864, 3), np.uint8)
             canvas[60:] = row
-            label = f"attach episode {i+1}/{N}  ({'SUCCESS' if results[i] else 'fail'})"
+            label = (f"{a.mode} episode {i+1}/{N}  "
+                     f"({'SUCCESS' if results[i] else 'fail'})"
+                     + (f"  target=({tgt[0]:.2f},{tgt[1]:.2f})" if a.mode == "pnp" else ""))
             cv2.putText(canvas, label, (10, 38), cv2.FONT_HERSHEY_SIMPLEX,
                         0.8, (255, 255, 255), 2, cv2.LINE_AA)
             if sealed:
