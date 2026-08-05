@@ -404,7 +404,7 @@ class PickEnv:
         self.phi_lift = torch.where(self.sealed, phi_l, self.phi_lift)
         # 6 transport while sealed and lifted
         phi_t = -torch.norm(op[:, :2] - self.place_target, dim=-1)
-        carrying = self.sealed & (lift_h > 0.05)
+        carrying = self.sealed & (lift_h > 0.015)   # low-carry counts
         C["transport"] = W["transport"] * carrying.float() * (phi_t - self.phi_transport)
         self.phi_transport = phi_t
         # 7 drop penalty: released or broke while far from bin and airborne
@@ -433,9 +433,17 @@ class PickEnv:
         off = (op[:, 0] < TABLE_X[0] - 0.08) | (op[:, 0] > TABLE_X[1] + 0.08) | \
               (op[:, 1] < TABLE_Y[0] - 0.10) | (op[:, 1] > TABLE_Y[1] + 0.10)
         off = off & ~over_bin
-        if self.mode in ("attach", "pnp"):
+        if self.mode == "attach":
             placed = self.sealed & (lift_h > 0.02)      # success = seal + lift
             timeout = self.t_step >= EP_LEN_ATTACH
+        elif self.mode == "pnp":
+            # success = PLACED: was sealed, now released, object ON the
+            # target (<= PLACE_TOL), set down, at rest
+            placed = self.ever_sealed & ~self.sealed & over_bin & \
+                (lift_h < 0.01) & \
+                (torch.norm(self.qvel[:, self.vadr_obj:self.vadr_obj + 3],
+                            dim=-1) < 0.05)
+            timeout = self.t_step >= EP_LEN_PNP
         else:
             timeout = self.t_step >= EP_LEN
         C["place"] = W["place"] * placed.float()
