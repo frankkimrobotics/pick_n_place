@@ -23,7 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import warp as wp                                          # noqa: E402
 
-OBS_DIM = 34
+OBS_DIM = 36
 ACT_DIM = 7
 LOG_EVERY = 200
 

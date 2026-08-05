@@ -155,6 +155,9 @@ class PickEnv:
         self.xmat_site = wp.to_torch(self.d.site_xmat)  # (N, nsite, 3, 3)
         self.site_xpos = wp.to_torch(self.d.site_xpos)
         self.xfrc = wp.to_torch(self.d.xfrc_applied)    # (N, nbody, 6)
+        self.bid_ped = name2id(M, mujoco.mjtObj.mjOBJ_BODY, "pedestal")
+        self.mocap_ped = int(M.body_mocapid[self.bid_ped]) if self.bid_ped >= 0 else -1
+        self.mocap_pos = wp.to_torch(self.d.mocap_pos) if self.mocap_ped >= 0 else None
         # episode state (torch, device)
         N = nworld
         self.t_step = torch.zeros(N, dtype=torch.long, device=device)
@@ -172,6 +175,7 @@ class PickEnv:
                       "time", "table_slam", "off_table"]
         self.ep_comp = torch.zeros(N, len(self.RKEYS), device=device)
         self.max_lift = torch.zeros(N, device=device)
+        self.target_h = torch.zeros(N, device=device)   # place surface height
         self.bin_pos = torch.tensor([*BIN_XY, 0.0], device=device, dtype=torch.float32)
         self.place_target = self.bin_pos[:2].expand(N, 2).clone()
         self.reset(torch.ones(N, dtype=torch.bool, device=device))
@@ -276,6 +280,21 @@ class PickEnv:
                 torch.tensor([TABLE_X[0] + 0.04, TABLE_Y[0] + 0.04], device=self.device),
                 torch.tensor([TABLE_X[1] - 0.04, TABLE_Y[1] - 0.04], device=self.device))
             self.place_target[idx] = tgt
+            if self.mocap_ped >= 0:
+                n2 = idx.numel()
+                elevated = torch.tensor(self.rng.random(n2) < 0.6,
+                                        device=self.device)
+                hh = torch.tensor(self.rng.uniform(0.04, 0.12, size=n2),
+                                  device=self.device, dtype=torch.float32)
+                hh = torch.where(elevated, hh, torch.zeros_like(hh))
+                self.target_h[idx] = hh
+                self.mocap_pos[idx, self.mocap_ped, 0] = tgt[:, 0]
+                self.mocap_pos[idx, self.mocap_ped, 1] = tgt[:, 1]
+                self.mocap_pos[idx, self.mocap_ped, 2] = torch.where(
+                    elevated, hh - 0.06,
+                    torch.full_like(hh, -0.5))    # park under world if table
+            else:
+                self.target_h[idx] = 0.0
         mjw.forward(self.m, self.d)
         tcp, _ = self._tcp()
         self.phi_approach[idx] = -torch.norm(
@@ -399,7 +418,9 @@ class PickEnv:
             self.sealed.float()[:, None],
             (op[:, 2] - self.half[2])[:, None],          # lift height
             (op[:, :2] - self.place_target),              # to-target xy
-        ], dim=-1) + (torch.randn(self.nworld, 34, device=self.device) * 0.005
+            self.target_h[:, None],                        # place surface z
+            (op[:, 2] - float(self.half[2]) - self.target_h)[:, None],
+        ], dim=-1) + (torch.randn(self.nworld, 36, device=self.device) * 0.005
                       if self.dr else 0.0)
 
     # ---------------- reward ----------------
@@ -445,9 +466,10 @@ class PickEnv:
         else:
             over_bin = (torch.abs(op[:, 0] - self.bin_pos[0]) < BIN_HALF) & \
                        (torch.abs(op[:, 1] - self.bin_pos[1]) < BIN_HALF)
+        rest_h = op[:, 2] - float(self.half[2]) - self.target_h
         if self.mode == "pnp":
-            # penalize only AERIAL drops; gentle set-downs are graded below
-            bad_drop = (released | broke) & (lift_h > 0.02)
+            # penalize only AERIAL drops (relative to the TARGET surface)
+            bad_drop = (released | broke) & (rest_h > 0.02)
         else:
             bad_drop = (released | broke) & (lift_h > 0.02) & ~over_bin
         C["drop"] = W["drop"] * bad_drop.float()
@@ -474,9 +496,13 @@ class PickEnv:
             # object slow) ENDS the episode with reward 20*exp(-d^2/2s^2),
             # s = 5 cm -- smooth gradient toward the target from anywhere.
             # 'placed' (the success METRIC) still requires d <= PLACE_TOL.
-            setdown = self.ever_sealed & ~self.sealed & (lift_h < 0.01) & \
-                (torch.norm(self.qvel[:, self.vadr_obj:self.vadr_obj + 3],
-                            dim=-1) < 0.08) & (released | (self.t_step > 1))
+            spd = torch.norm(self.qvel[:, self.vadr_obj:self.vadr_obj + 3],
+                             dim=-1)
+            setdown = self.ever_sealed & ~self.sealed & \
+                (rest_h.abs() < 0.012) & (spd < 0.08) & \
+                (released | (self.t_step > 1))
+            # GENTLE-LANDING grade: full credit at rest, fades with impact speed
+            gentle = torch.exp(-(spd ** 2) / (2 * 0.04 ** 2))
             d_tgt = torch.norm(op[:, :2] - self.place_target, dim=-1)
             if self.lift_req > 0:
                 lift_ok = self.max_lift >= self.lift_req
@@ -488,7 +514,7 @@ class PickEnv:
                 lift_ok = torch.ones_like(setdown)
                 lift_fac = torch.ones_like(self.max_lift)
             placed = setdown & (d_tgt < PLACE_TOL) & lift_ok
-            self._graded = setdown.float() * lift_fac * \
+            self._graded = setdown.float() * lift_fac * gentle * \
                 torch.exp(-(d_tgt ** 2) / (2 * 0.05 ** 2))
             if self.speed_bonus > 0:
                 self._graded = self._graded * (
