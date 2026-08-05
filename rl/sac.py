@@ -108,7 +108,8 @@ def main():
     ap.add_argument("--warmup", type=int, default=20_000)
     ap.add_argument("--out", default=os.path.expanduser("~/pnp_rl/run1"))
     ap.add_argument("--scene", default=os.path.join(HERE, "scenes", "box_med.xml"))
-    ap.add_argument("--mode", default="full", choices=["full", "attach"])
+    ap.add_argument("--mode", default="full", choices=["full", "attach", "pnp"])
+    ap.add_argument("--init", default=None, help="warm-start ckpt (actor[+critics])")
     ap.add_argument("--device", default="cuda:0")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -130,6 +131,13 @@ def main():
     opt_a = torch.optim.Adam(actor.parameters(), lr=a.lr)
     opt_q = torch.optim.Adam(list(q1.parameters()) + list(q2.parameters()), lr=a.lr)
     opt_al = torch.optim.Adam([log_alpha], lr=a.lr)
+    if a.init:
+        ck = torch.load(a.init, map_location=dev, weights_only=False)
+        actor.load_state_dict(ck["actor"])
+        if "q1" in ck:
+            q1.load_state_dict(ck["q1"]); q2.load_state_dict(ck["q2"])
+            q1t.load_state_dict(ck["q1"]); q2t.load_state_dict(ck["q2"])
+        print(f"[sac] warm-started from {a.init}", flush=True)
     buf = Replay(2_000_000, dev)
     log = open(os.path.join(a.out, "log.jsonl"), "a")
     json.dump(vars(a), open(os.path.join(a.out, "args.json"), "w"), indent=1)
