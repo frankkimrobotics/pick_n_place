@@ -63,8 +63,16 @@ def main():
         ck = torch.load(a.init, map_location=dev, weights_only=False)
         try:
             if "ac" in ck:                      # PPO-format checkpoint
-                ac.load_state_dict(ck["ac"])
-                print("[ppo] warm-started full AC (ppo ckpt)", flush=True)
+                sd = ck["ac"]
+                own = ac.state_dict()
+                for k in list(sd.keys()):           # obs-dim growth: zero-pad
+                    if k in own and own[k].shape != sd[k].shape:
+                        pad = torch.zeros_like(own[k])
+                        sl = tuple(slice(0, s) for s in sd[k].shape)
+                        pad[sl] = sd[k]
+                        sd[k] = pad
+                ac.load_state_dict(sd)
+                print("[ppo] warm-started full AC (ppo ckpt, padded)", flush=True)
             elif "actor" in ck:                 # SAC-format: pi only
                 ac.pi.load_state_dict({k[4:]: v for k, v in ck["actor"].items()
                                        if k.startswith("net.")}, strict=False)
