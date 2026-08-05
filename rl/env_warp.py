@@ -381,11 +381,18 @@ class PickEnv:
         objz = self._obj_zaxis()
         cupz = -R[:, :, 2]                       # cup presses along -z
         err = torch.cross(objz, cupz, dim=-1)
-        w_obj = self._obj_w_world()
-        T = self.K_ROT * err - self.C_ROT * w_obj
-        Tmag = torch.norm(T, dim=-1, keepdim=True)
+        # spring capped at the cup's holding limit; damping is applied as
+        # direct exponential decay of the object's angular velocity below
+        # (torque-based damping is either starved by the cap -- undamped
+        # 70deg ringing -- or explicit-unstable for the box's tiny inertia)
+        Ts = self.K_ROT * err
+        Tmag = torch.norm(Ts, dim=-1, keepdim=True)
         tscale = (TAU_CUP / Tmag.clamp(min=1e-6)).clamp(max=1.0)
-        self.xfrc[:, self.bid_obj, 3:] = T * tscale * m
+        self.xfrc[:, self.bid_obj, 3:] = Ts * tscale * m
+        va = self.vadr_obj
+        self.qvel[:, va + 3:va + 6] = torch.where(
+            self.sealed[:, None], self.qvel[:, va + 3:va + 6] * 0.82,
+            self.qvel[:, va + 3:va + 6])
         # peel = object actually hanging far off the cup axis (the capped
         # righting spring can no longer recover it), NOT mere cap saturation
         cosang = (objz * cupz).sum(-1)
@@ -508,10 +515,17 @@ class PickEnv:
                        (torch.abs(op[:, 1] - self.bin_pos[1]) < BIN_HALF)
         rest_h = op[:, 2] - float(self.half[2]) - self.target_h
         tilt = torch.arccos(self._obj_zaxis()[:, 2].clamp(-1, 1))
-        self.max_tilt = torch.where(self.sealed,
+        # track tilt only while the CUP alone supports the object (clear of
+        # table and target surface) -- press/set-down contact transients pin
+        # the object and spike tilt in ways the policy cannot control
+        lift_h_now = op[:, 2] - float(self.half[2])
+        airborne = self.sealed & (lift_h_now > 0.012) & (rest_h > 0.012)
+        self.max_tilt = torch.where(airborne,
                                     torch.maximum(self.max_tilt, tilt),
                                     self.max_tilt)
-        self.release_h = torch.where(released, rest_h.clamp(min=0),
+        # record height at release AND at seal break (else break-at-height
+        # would score full contact-release credit)
+        self.release_h = torch.where(released | broke, rest_h.clamp(min=0),
                                      self.release_h)
         if self.mode == "pnp":
             # penalize only AERIAL drops (relative to the TARGET surface)
@@ -549,14 +563,15 @@ class PickEnv:
                 (released | (self.t_step > 1))
             # GENTLE-LANDING grade: full credit at rest, fades with impact speed
             gentle = torch.exp(-(spd ** 2) / (2 * 0.04 ** 2))
-            # CONTACT-RELEASE grade: released while pressed to the surface
-            # sigma wide enough that a few-cm drop still gets gradient toward
-            # contact release (0.008 was a reward cliff: e^-19 at 5 cm ->
-            # never-release trap); the strict placed gate stays at 1 cm
-            contact_rel = torch.exp(-(self.release_h ** 2) / (2 * 0.025 ** 2))
-            # TILT-DISCIPLINE grade: fades past ~15 deg peak tilt
-            tilt_g = torch.exp(-((self.max_tilt - 0.26).clamp(min=0) ** 2)
-                               / (2 * 0.17 ** 2))
+            # CONTACT-RELEASE grade, Laplace kernel: the warm-start policy
+            # releases from ~25 cm, and any Gaussian tight enough to mean
+            # "contact" is a reward cliff from there (e^-50).  exp(-h/8cm)
+            # keeps a monotone gradient over the whole range: 25 cm -> 0.04,
+            # 5 cm -> 0.54, 0 -> 1.  The strict placed gate stays at 1 cm.
+            contact_rel = torch.exp(-self.release_h / 0.08)
+            # TILT-DISCIPLINE grade, Laplace: warm start carries at ~80 deg
+            # peak tilt (never penalized before); a Gaussian is e^-24 there
+            tilt_g = torch.exp(-(self.max_tilt - 0.26).clamp(min=0) / 0.35)
             d_tgt = torch.norm(op[:, :2] - self.place_target, dim=-1)
             if self.lift_req > 0:
                 lift_ok = self.max_lift >= self.lift_req
@@ -569,9 +584,12 @@ class PickEnv:
                 lift_fac = torch.ones_like(self.max_lift)
             placed = setdown & (d_tgt < PLACE_TOL) & lift_ok & \
                 (self.release_h < 0.010) & (self.max_tilt < 0.44)  # 1cm, 25deg
+            dist_g = torch.exp(-(d_tgt ** 2) / (2 * 0.05 ** 2))
+            # cube root: three multiplicative near-zero grades starve PPO of
+            # any terminal signal (product ~2e-4 from the warm start); the
+            # geometric mean keeps every factor mandatory at a usable scale
             self._graded = setdown.float() * lift_fac * gentle * \
-                contact_rel * tilt_g * \
-                torch.exp(-(d_tgt ** 2) / (2 * 0.05 ** 2))
+                (contact_rel * tilt_g * dist_g).clamp(min=0) ** (1.0 / 3.0)
             if self.speed_bonus > 0:
                 self._graded = self._graded * (
                     1.0 + self.speed_bonus *
