@@ -53,7 +53,7 @@ EP_LEN_ATTACH = 40
 EP_LEN_PNP = 100
 PLACE_TOL = 0.035
 
-W = dict(approach=1.0, align=0.3, press=0.5, seal=5.0, lift=2.0,
+W = dict(approach=1.0, align=0.3, press=0.5, seal=5.0, lift=4.0,
          transport=6.0, place=20.0, drop=-0.5, chatter=-0.05,
          act=-0.01, time=-0.005, table_slam=-0.5, off_table=-2.0)
 
@@ -478,10 +478,17 @@ class PickEnv:
                 (torch.norm(self.qvel[:, self.vadr_obj:self.vadr_obj + 3],
                             dim=-1) < 0.08) & (released | (self.t_step > 1))
             d_tgt = torch.norm(op[:, :2] - self.place_target, dim=-1)
-            lift_ok = (self.max_lift >= self.lift_req) if self.lift_req > 0 \
-                else torch.ones_like(setdown)
+            if self.lift_req > 0:
+                lift_ok = self.max_lift >= self.lift_req
+                # GRADED lift factor (quadratic ramp): every cm of carry
+                # height raises the set-down payout; all-or-nothing gating
+                # re-created the never-release trap (run 6a)
+                lift_fac = (self.max_lift / self.lift_req).clamp(0, 1) ** 2
+            else:
+                lift_ok = torch.ones_like(setdown)
+                lift_fac = torch.ones_like(self.max_lift)
             placed = setdown & (d_tgt < PLACE_TOL) & lift_ok
-            self._graded = setdown.float() * lift_ok.float() * \
+            self._graded = setdown.float() * lift_fac * \
                 torch.exp(-(d_tgt ** 2) / (2 * 0.05 ** 2))
             if self.speed_bonus > 0:
                 self._graded = self._graded * (
