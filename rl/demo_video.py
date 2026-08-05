@@ -68,7 +68,15 @@ def main():
 
     # replay through renderer
     import cv2
-    m = mujoco.MjModel.from_xml_path(a.scene)
+    # inject a visible place-target marker (mocap disc) into the render model
+    xml_txt = open(a.scene).read()
+    marker = ('<body name="place_marker" mocap="true" pos="0 0 -1">'
+              '<geom type="cylinder" size="0.035 0.0015" rgba="0.1 0.9 0.2 0.6" '
+              'contype="0" conaffinity="0"/></body>')
+    xml_txt = xml_txt.replace("</worldbody>", marker + "</worldbody>", 1)
+    mpath = os.path.join(os.path.dirname(a.scene), "_render_marked.xml")
+    open(mpath, "w").write(xml_txt)
+    m = mujoco.MjModel.from_xml_path(mpath)
     d = mujoco.MjData(m)
     ren = mujoco.Renderer(m, height=240, width=424)
     vopt = mujoco.MjvOption()
@@ -78,7 +86,9 @@ def main():
                          cv2.VideoWriter_fourcc(*"mp4v"), 10, (864, 300))
     for i in range(N):
         for qpos, sealed, tgt in traj[i]:
-            d.qpos[:] = qpos
+            d.qpos[:len(qpos)] = qpos
+            if a.mode == "pnp":
+                d.mocap_pos[0] = [tgt[0], tgt[1], 0.002]
             mujoco.mj_forward(m, d)
             frames = []
             for cam in ("wrist_d405", "fixed_d435"):

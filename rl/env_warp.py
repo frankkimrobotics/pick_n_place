@@ -78,13 +78,14 @@ def build_scene_xml(half_extents, kind, out_xml, seed=0):
 class PickEnv:
     def __init__(self, nworld=1024, device="cuda:0", seed=0,
                  xml=None, half_extents=(0.025, 0.025, 0.02), kind="box",
-                 mode="full"):
+                 mode="full", dr=False):
         """mode='attach': staged sub-task -- episodes START with the cup
         hovering 2-4 cm above the (jittered) grasp point; success = seal +
         hold + 2 cm lift within a 40-step episode. mode='full': whole task."""
         self.nworld = nworld
         self.device = device
         self.mode = mode
+        self.dr = dr
         self.rng = np.random.default_rng(seed)
         if xml is None:
             xml = os.path.join(HERE, "_scene_rl.xml")
@@ -118,6 +119,11 @@ class PickEnv:
         self.kd = torch.tensor([40, 60, 40, 12, 4, 2], device=device,
                                dtype=torch.float32)
         self.tau_max = 100.0
+        self.gain_scale = torch.ones(nworld, 1, device=device)
+        self.seal_dist_w = torch.full((nworld,), SEAL_DIST, device=device)
+        self.seal_vel_w = torch.full((nworld,), SEAL_VEL, device=device)
+        self.delay_mask = torch.zeros(nworld, dtype=torch.bool, device=device)
+        self.prev_action = torch.zeros(nworld, 7, device=device)
         # batched warp model/data
         self.m = mjw.put_model(self.mjm)
         self.d = mjw.put_data(self.mjm, mjd, nworld=nworld)
@@ -191,6 +197,20 @@ class PickEnv:
         self.sealed[idx] = False
         self.ever_sealed[idx] = False
         self.ep_comp[idx] = 0.0
+        if self.dr:
+            n_ = idx.numel()
+            self.gain_scale[idx] = torch.tensor(
+                self.rng.uniform(0.8, 1.2, size=(n_, 1)), device=self.device,
+                dtype=torch.float32)
+            self.seal_dist_w[idx] = SEAL_DIST * torch.tensor(
+                self.rng.uniform(0.8, 1.2, size=n_), device=self.device,
+                dtype=torch.float32)
+            self.seal_vel_w[idx] = SEAL_VEL * torch.tensor(
+                self.rng.uniform(0.8, 1.2, size=n_), device=self.device,
+                dtype=torch.float32)
+            self.delay_mask[idx] = torch.tensor(
+                self.rng.random(n_) < 0.5, device=self.device)
+            self.prev_action[idx] = 0.0
         self.q_target[idx] = self.qpos[idx, :6]
         if self.mode in ("attach", "pnp"):
             # place the ARM near the grasp: per-world CPU IK is too slow, so
@@ -254,8 +274,8 @@ class PickEnv:
         tv = (tcp - self._last_tcp) * CTRL_HZ if hasattr(self, "_last_tcp") \
             else torch.zeros_like(tcp)
         rel_speed = torch.norm(tv - ov, dim=-1)
-        gate = want & ~self.sealed & (dist < SEAL_DIST) & pressing & tilt_ok \
-            & (rel_speed < SEAL_VEL)
+        gate = want & ~self.sealed & (dist < self.seal_dist_w) & pressing \
+            & tilt_ok & (rel_speed < self.seal_vel_w)
         if gate.any():
             idx = torch.nonzero(gate).squeeze(-1)
             # anchor: object top point in tcp frame at latch
@@ -303,6 +323,10 @@ class PickEnv:
     def step(self, action):
         """action (N,7) in [-1,1]. Returns obs, reward, done, info."""
         a = action.clamp(-1, 1)
+        if self.dr:                     # 1-step action latency on half the worlds
+            eff = torch.where(self.delay_mask[:, None], self.prev_action, a)
+            self.prev_action = a.clone()
+            a = eff
         self.q_target = self.q_target + a[:, :6] * DQ_MAX
         want = a[:, 6] > 0
         tcp_before, _ = self._tcp()
@@ -317,8 +341,8 @@ class PickEnv:
             self.sealed[idx] = False
             self.xfrc[idx, self.bid_obj] = 0.0
         for _ in range(self.substeps):
-            tau = (self.kp * (self.q_target - self.qpos[:, :6])
-                   - self.kd * self.qvel[:, :6]).clamp(-self.tau_max, self.tau_max)
+            tau = (self.gain_scale * (self.kp * (self.q_target - self.qpos[:, :6])
+                   - self.kd * self.qvel[:, :6])).clamp(-self.tau_max, self.tau_max)
             self.ctrl[:, :6] = tau
             self._apply_suction_force()
             mjw.step(self.m, self.d)
@@ -346,7 +370,8 @@ class PickEnv:
             self.sealed.float()[:, None],
             (op[:, 2] - self.half[2])[:, None],          # lift height
             (op[:, :2] - self.place_target),              # to-target xy
-        ], dim=-1)
+        ], dim=-1) + (torch.randn(self.nworld, 34, device=self.device) * 0.005
+                      if self.dr else 0.0)
 
     # ---------------- reward ----------------
     def reward(self, want, latched_now, released, broke, tcp_before, obj_before, a):

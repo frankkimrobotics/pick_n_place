@@ -110,6 +110,7 @@ def main():
     ap.add_argument("--scene", default=os.path.join(HERE, "scenes", "box_med.xml"))
     ap.add_argument("--mode", default="full", choices=["full", "attach", "pnp"])
     ap.add_argument("--init", default=None, help="warm-start ckpt (actor[+critics])")
+    ap.add_argument("--dr", action="store_true")
     ap.add_argument("--device", default="cuda:0")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -118,7 +119,7 @@ def main():
 
     wp.init()
     from env_warp import PickEnv
-    env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode)
+    env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode, dr=a.dr)
     print(f"[sac] env up: {a.nworld} worlds", flush=True)
 
     actor = Actor().to(dev)
