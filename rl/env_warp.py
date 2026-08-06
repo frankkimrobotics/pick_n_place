@@ -586,8 +586,9 @@ class PickEnv:
         C["approach"] = W["approach"] * torch.where(self.sealed, torch.zeros_like(phi_a),
                                                     phi_a - self.phi_approach)
         self.phi_approach = phi_a
-        # 2 alignment near contact (within 3 cm, pre-seal)
-        near = (~self.sealed) & (torch.norm(tcp - gp, dim=-1) < 0.03)
+        # 2 alignment near contact (within 3 cm, pre-FIRST-seal only:
+        # ~sealed allowed delaying the latch to farm align+press ~+4/ep)
+        near = (~self.ever_sealed) & (torch.norm(tcp - gp, dim=-1) < 0.03)
         align = (-R[:, 2, 2]).clamp(0, 1)               # 1 = cup facing down
         C["align"] = W["align"] * near.float() * align / CTRL_HZ
         # 3 press quality while commanding suction near the object
