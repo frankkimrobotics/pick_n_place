@@ -57,7 +57,8 @@ PLACE_TOL = 0.035
 
 W = dict(approach=1.0, align=0.3, press=0.5, seal=5.0, lift=4.0,
          transport=6.0, place=20.0, drop=-0.5, chatter=-0.05,
-         act=-0.01, time=-0.005, table_slam=-0.5, off_table=-2.0)
+         act=-0.01, time=-0.005, table_slam=-0.5, off_table=-2.0,
+         descend=4.0, tilt_pen=-0.05)
 
 
 def build_scene_xml(half_extents, kind, out_xml, seed=0):
@@ -173,9 +174,11 @@ class PickEnv:
         self.phi_approach = torch.zeros(N, device=device)
         self.phi_transport = torch.zeros(N, device=device)
         self.phi_lift = torch.zeros(N, device=device)
+        self.phi_desc = torch.zeros(N, device=device)
         self.RKEYS = ["approach", "align", "press", "seal", "lift",
                       "transport", "place", "drop", "chatter", "act",
-                      "time", "table_slam", "off_table"]
+                      "time", "table_slam", "off_table", "descend",
+                      "tilt_pen"]
         self.ep_comp = torch.zeros(N, len(self.RKEYS), device=device)
         self.max_lift = torch.zeros(N, device=device)
         self.target_h = torch.zeros(N, device=device)   # place surface height
@@ -309,6 +312,11 @@ class PickEnv:
         self.phi_transport[idx] = -torch.norm(
             self._obj_pos()[idx, :2] - self.place_target[idx], dim=-1)
         self.phi_lift[idx] = 0.0
+        op_i = self._obj_pos()[idx]
+        rh_i = (op_i[:, 2] - float(self.half[2]) - self.target_h[idx])
+        d_i = torch.norm(op_i[:, :2] - self.place_target[idx], dim=-1)
+        self.phi_desc[idx] = -rh_i.clamp(min=0.0, max=0.40) * \
+            torch.exp(-(d_i ** 2) / (2 * 0.07 ** 2))
 
     # ---------------- suction ----------------
     # Suction = per-world compliant spring-damper (xfrc_applied) with a
@@ -527,6 +535,18 @@ class PickEnv:
         # would score full contact-release credit)
         self.release_h = torch.where(released | broke, rest_h.clamp(min=0),
                                      self.release_h)
+        # 6b DENSE descend-to-surface: potential -rest_h weighted by a
+        # smooth over-target gate -- the xy transport shaping never pulls
+        # the object DOWN, so contact-release had no per-step gradient
+        d_now = torch.norm(op[:, :2] - self.place_target, dim=-1)
+        phi_d = -rest_h.clamp(min=0.0, max=0.40) * \
+            torch.exp(-(d_now ** 2) / (2 * 0.07 ** 2))
+        C["descend"] = W["descend"] * self.sealed.float() * \
+            (phi_d - self.phi_desc)
+        self.phi_desc = torch.where(self.sealed, phi_d, self.phi_desc)
+        # 6c DENSE tilt discipline while the cup alone carries the object
+        C["tilt_pen"] = W["tilt_pen"] * airborne.float() * \
+            (tilt - 0.35).clamp(min=0)
         if self.mode == "pnp":
             # penalize only AERIAL drops (relative to the TARGET surface)
             bad_drop = (released | broke) & (rest_h > 0.02)
