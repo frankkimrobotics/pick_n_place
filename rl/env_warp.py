@@ -82,7 +82,8 @@ class PickEnv:
     def __init__(self, nworld=1024, device="cuda:0", seed=0,
                  xml=None, half_extents=(0.025, 0.025, 0.02), kind="box",
                  mode="full", dr=False, target_max=0.30,
-                 lift_req=0.0, speed_bonus=0.0, release_mask=False):
+                 lift_req=0.0, speed_bonus=0.0, release_mask=False,
+                 mask_h=0.05):
         """mode='attach': staged sub-task -- episodes START with the cup
         hovering 2-4 cm above the (jittered) grasp point; success = seal +
         hold + 2 cm lift within a 40-step episode. mode='full': whole task."""
@@ -93,7 +94,8 @@ class PickEnv:
         self.target_max = target_max
         self.lift_req = lift_req          # required MAX lift for pnp success
         self.speed_bonus = speed_bonus    # terminal bonus * (1 - t/EP_LEN)
-        self.release_mask = release_mask  # hold seal if release cmd >5cm up
+        self.release_mask = release_mask  # hold seal if release cmd high
+        self.mask_h = mask_h              # anneal 0.05 -> 0.015
         self.rng = np.random.default_rng(seed)
         if xml is None:
             xml = os.path.join(HERE, "_scene_rl.xml")
@@ -507,7 +509,7 @@ class PickEnv:
             # the policy learns to TIME release, not lean on the mask.
             op_z = self.qpos[:, self.jadr_obj + 2]
             rest_now = op_z - float(self.half[2]) - self.target_h
-            self._masked_rel = self.sealed & ~want & (rest_now > 0.05)
+            self._masked_rel = self.sealed & ~want & (rest_now > self.mask_h)
             want = want | self._masked_rel
         else:
             self._masked_rel = torch.zeros_like(self.sealed)
