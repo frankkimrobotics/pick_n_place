@@ -58,7 +58,7 @@ PLACE_TOL = 0.035
 W = dict(approach=1.0, align=0.3, press=0.5, seal=5.0, lift=4.0,
          transport=6.0, place=20.0, drop=-0.5, chatter=-0.05,
          act=-0.01, time=-0.005, table_slam=-0.5, off_table=-2.0,
-         descend=4.0, tilt_pen=-0.05)
+         descend=4.0, tilt_pen=-0.05, rel_mask=-0.08)
 
 
 def build_scene_xml(half_extents, kind, out_xml, seed=0):
@@ -82,7 +82,7 @@ class PickEnv:
     def __init__(self, nworld=1024, device="cuda:0", seed=0,
                  xml=None, half_extents=(0.025, 0.025, 0.02), kind="box",
                  mode="full", dr=False, target_max=0.30,
-                 lift_req=0.0, speed_bonus=0.0):
+                 lift_req=0.0, speed_bonus=0.0, release_mask=False):
         """mode='attach': staged sub-task -- episodes START with the cup
         hovering 2-4 cm above the (jittered) grasp point; success = seal +
         hold + 2 cm lift within a 40-step episode. mode='full': whole task."""
@@ -93,6 +93,7 @@ class PickEnv:
         self.target_max = target_max
         self.lift_req = lift_req          # required MAX lift for pnp success
         self.speed_bonus = speed_bonus    # terminal bonus * (1 - t/EP_LEN)
+        self.release_mask = release_mask  # hold seal if release cmd >5cm up
         self.rng = np.random.default_rng(seed)
         if xml is None:
             xml = os.path.join(HERE, "_scene_rl.xml")
@@ -193,7 +194,7 @@ class PickEnv:
         self.RKEYS = ["approach", "align", "press", "seal", "lift",
                       "transport", "place", "drop", "chatter", "act",
                       "time", "table_slam", "off_table", "descend",
-                      "tilt_pen"]
+                      "tilt_pen", "rel_mask"]
         self.ep_comp = torch.zeros(N, len(self.RKEYS), device=device)
         self.max_lift = torch.zeros(N, device=device)
         self.target_h = torch.zeros(N, device=device)   # place surface height
@@ -371,10 +372,9 @@ class PickEnv:
         tcp, _ = self._tcp()
         if self.mode == "place":
             # phi_lift consistent with the seeded carry (no free first-step
-            # lift payout)
+            # lift payout); phi tracks MAX lift
             lift_cap = max(self.lift_req, 0.10)
-            lh = (self._obj_pos()[idx, 2] - float(self.half[2]))
-            self.phi_lift[idx] = lh.clamp(0, lift_cap) / lift_cap
+            self.phi_lift[idx] = self.max_lift[idx].clamp(0, lift_cap) / lift_cap
         self.phi_approach[idx] = -torch.norm(
             tcp[idx] - self._grasp_point()[idx], dim=-1)
         self.phi_transport[idx] = -torch.norm(
@@ -500,6 +500,17 @@ class PickEnv:
             a = eff
         self.q_target = self.q_target + a[:, :6] * DQ_MAX
         want = a[:, 6] > 0
+        if self.release_mask:
+            # training aid: the cup does not let go >5 cm above the
+            # target surface -- deletes the drop-from-height optimum.
+            # Commanding a masked release is penalized (rel_mask) so
+            # the policy learns to TIME release, not lean on the mask.
+            op_z = self.qpos[:, self.jadr_obj + 2]
+            rest_now = op_z - float(self.half[2]) - self.target_h
+            self._masked_rel = self.sealed & ~want & (rest_now > 0.05)
+            want = want | self._masked_rel
+        else:
+            self._masked_rel = torch.zeros_like(self.sealed)
         tcp_before, _ = self._tcp()
         obj_before = self._obj_pos().clone()
 
@@ -573,10 +584,13 @@ class PickEnv:
         C["press"] = W["press"] * press.float() / CTRL_HZ
         # 4 seal event (one-time)
         C["seal"] = W["seal"] * latched_now.float()
-        # 5 lift while sealed (potential on capped height)
+        # 5 lift while sealed -- potential on MAX height reached (monotone):
+        # a current-height potential paid -4 for sealed descent while
+        # RELEASED descent froze the potential and was free, systematically
+        # bribing the policy to drop instead of lower-and-place
         lift_cap = max(self.lift_req, 0.10)
         self.max_lift = torch.maximum(self.max_lift, lift_h)
-        phi_l = lift_h.clamp(0, lift_cap) / lift_cap
+        phi_l = self.max_lift.clamp(0, lift_cap) / lift_cap
         C["lift"] = W["lift"] * self.sealed.float() * (phi_l - self.phi_lift)
         self.phi_lift = torch.where(self.sealed, phi_l, self.phi_lift)
         # 6 transport while sealed and lifted
@@ -625,6 +639,7 @@ class PickEnv:
         # 8 suction chatter: commanding far from the object
         C["chatter"] = W["chatter"] * (want & ~self.sealed &
                                        (torch.norm(tcp - gp, dim=-1) > 0.03)).float()
+        C["rel_mask"] = W["rel_mask"] * self._masked_rel.float()
         # 9 action penalty
         C["act"] = W["act"] * a[:, :6].pow(2).sum(-1)
         # 10 table slam: cup below table plane proxy
