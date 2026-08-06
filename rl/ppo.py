@@ -48,6 +48,7 @@ def main():
     ap.add_argument("--init", default=None)
     ap.add_argument("--release_mask", action="store_true")
     ap.add_argument("--mask_h", type=float, default=0.05)
+    ap.add_argument("--tilt_pen", type=float, default=None)
     ap.add_argument("--target_max", type=float, default=0.30)
     ap.add_argument("--lift_req", type=float, default=0.0)
     ap.add_argument("--speed_bonus", type=float, default=0.0)
@@ -59,7 +60,7 @@ def main():
     torch.manual_seed(0)
     wp.init()
     from env_warp import PickEnv
-    env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode, dr=a.dr, target_max=a.target_max, lift_req=a.lift_req, speed_bonus=a.speed_bonus, release_mask=a.release_mask, mask_h=a.mask_h)
+    env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode, dr=a.dr, target_max=a.target_max, lift_req=a.lift_req, speed_bonus=a.speed_bonus, release_mask=a.release_mask, mask_h=a.mask_h, tilt_pen_w=a.tilt_pen)
     ac = AC().to(dev)
     if a.init:
         ck = torch.load(a.init, map_location=dev, weights_only=False)

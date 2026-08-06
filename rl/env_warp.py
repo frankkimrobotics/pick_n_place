@@ -83,7 +83,7 @@ class PickEnv:
                  xml=None, half_extents=(0.025, 0.025, 0.02), kind="box",
                  mode="full", dr=False, target_max=0.30,
                  lift_req=0.0, speed_bonus=0.0, release_mask=False,
-                 mask_h=0.05):
+                 mask_h=0.05, tilt_pen_w=None):
         """mode='attach': staged sub-task -- episodes START with the cup
         hovering 2-4 cm above the (jittered) grasp point; success = seal +
         hold + 2 cm lift within a 40-step episode. mode='full': whole task."""
@@ -96,6 +96,7 @@ class PickEnv:
         self.speed_bonus = speed_bonus    # terminal bonus * (1 - t/EP_LEN)
         self.release_mask = release_mask  # hold seal if release cmd high
         self.mask_h = mask_h              # anneal 0.05 -> 0.015
+        self.tilt_pen_w = W["tilt_pen"] if tilt_pen_w is None else tilt_pen_w
         self.rng = np.random.default_rng(seed)
         if xml is None:
             xml = os.path.join(HERE, "_scene_rl.xml")
@@ -638,7 +639,7 @@ class PickEnv:
             (phi_d - self.phi_desc)
         self.phi_desc = torch.where(self.sealed, phi_d, self.phi_desc)
         # 6c DENSE tilt discipline while the cup alone carries the object
-        C["tilt_pen"] = W["tilt_pen"] * airborne.float() * \
+        C["tilt_pen"] = self.tilt_pen_w * airborne.float() * \
             (tilt - 0.30).clamp(min=0)
         if self.mode in ("pnp", "place", "carry"):
             # penalize only AERIAL drops (relative to the TARGET surface)
