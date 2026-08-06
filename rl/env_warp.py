@@ -58,7 +58,7 @@ PLACE_TOL = 0.035
 W = dict(approach=1.0, align=0.3, press=0.5, seal=5.0, lift=4.0,
          transport=6.0, place=20.0, drop=-0.5, chatter=-0.05,
          act=-0.01, time=-0.005, table_slam=-0.5, off_table=-2.0,
-         descend=4.0, tilt_pen=-0.05, rel_mask=-0.08)
+         descend=4.0, tilt_pen=-0.4, rel_mask=-0.08)
 
 
 def build_scene_xml(half_extents, kind, out_xml, seed=0):
@@ -631,7 +631,7 @@ class PickEnv:
         self.phi_desc = torch.where(self.sealed, phi_d, self.phi_desc)
         # 6c DENSE tilt discipline while the cup alone carries the object
         C["tilt_pen"] = W["tilt_pen"] * airborne.float() * \
-            (tilt - 0.35).clamp(min=0)
+            (tilt - 0.30).clamp(min=0)
         if self.mode in ("pnp", "place"):
             # penalize only AERIAL drops (relative to the TARGET surface)
             bad_drop = (released | broke) & (rest_h > 0.02)
