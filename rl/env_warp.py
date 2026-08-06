@@ -133,6 +133,21 @@ class PickEnv:
                     q_seed = q_g
         self.hover_grid = np.stack(grid)
         print(f"[env] hover grid: {len(grid)} reachable cells", flush=True)
+        # CARRY GRID: same lattice at carry height (for place-curriculum
+        # resets that start sealed mid-carry above the target)
+        cgrid = []
+        z_c = 0.30 + 2 * float(half_extents[2]) + CUP_R + 0.004
+        q_seed = self.q_hover
+        for gx in np.linspace(TABLE_X[0] + 0.03, TABLE_X[1] - 0.03, 9):
+            for gy in np.linspace(TABLE_Y[0] + 0.03, TABLE_Y[1] - 0.03, 7):
+                q_g, e_g = demo["ik"](self.mjm, dik, "tcp",
+                                      [float(gx), float(gy), z_c],
+                                      demo["R_DOWN"], q_seed)
+                if e_g < 0.005:
+                    cgrid.append(q_g)
+                    q_seed = q_g
+        self.carry_grid = np.stack(cgrid) if cgrid else self.hover_grid
+        print(f"[env] carry grid: {len(cgrid)} reachable cells", flush=True)
         mjd.qpos[:6] = self.q_home
         mujoco.mj_forward(self.mjm, mjd)
         # PD gains (fixed diagonal; simpler than per-tick gain scheduling)
@@ -305,13 +320,67 @@ class PickEnv:
                     torch.full_like(hh, -0.5))    # park under world if table
             else:
                 self.target_h[idx] = 0.0
+        if self.mode == "place":
+            # PLACE CURRICULUM: start SEALED mid-carry above the target so
+            # every step of experience is descend -> contact -> release
+            # (the attach-mode trick applied to the end of the task)
+            n2 = idx.numel()
+            cells = self.rng.integers(0, len(self.carry_grid), size=n2)
+            self.qpos[idx, :6] = torch.tensor(
+                self.carry_grid[cells] + self.rng.normal(0, 0.02, size=(n2, 6)),
+                device=self.device, dtype=torch.float32)
+            self.qvel[idx, :6] = 0.0
+            mjw.forward(self.m, self.d)
+            tcp, R = self._tcp()
+            qa = self.jadr_obj
+            self.qpos[idx, qa] = tcp[idx, 0]
+            self.qpos[idx, qa + 1] = tcp[idx, 1]
+            self.qpos[idx, qa + 2] = tcp[idx, 2] - 0.004 - float(self.half[2])
+            self.qpos[idx, qa + 3] = 1.0
+            self.qpos[idx, qa + 4:qa + 7] = 0.0
+            self.qvel[idx, self.vadr_obj:self.vadr_obj + 6] = 0.0
+            mjw.forward(self.m, self.d)
+            op = self._obj_pos()
+            self.anchor[idx] = torch.einsum(
+                "nij,nj->ni", R[idx].transpose(1, 2), op[idx] - tcp[idx])
+            self.sealed[idx] = True
+            self.ever_sealed[idx] = True
+            self.sat_count[idx] = 0
+            self.max_lift[idx] = self.lift_req + 0.02   # already carried
+            tgt = op[idx, :2] + torch.tensor(
+                self.rng.uniform(-0.06, 0.06, size=(n2, 2)),
+                device=self.device, dtype=torch.float32)
+            tgt[:, 0] = tgt[:, 0].clamp(TABLE_X[0] + 0.04, TABLE_X[1] - 0.04)
+            tgt[:, 1] = tgt[:, 1].clamp(TABLE_Y[0] + 0.04, TABLE_Y[1] - 0.04)
+            self.place_target[idx] = tgt
+            if self.mocap_ped >= 0:
+                elevated = torch.tensor(self.rng.random(n2) < 0.6,
+                                        device=self.device)
+                hh = torch.tensor(self.rng.uniform(0.04, 0.12, size=n2),
+                                  device=self.device, dtype=torch.float32)
+                hh = torch.where(elevated, hh, torch.zeros_like(hh))
+                self.target_h[idx] = hh
+                self.mocap_pos[idx, self.mocap_ped, 0] = tgt[:, 0]
+                self.mocap_pos[idx, self.mocap_ped, 1] = tgt[:, 1]
+                self.mocap_pos[idx, self.mocap_ped, 2] = torch.where(
+                    elevated, hh - 0.06, torch.full_like(hh, -0.5))
+            else:
+                self.target_h[idx] = 0.0
+            self.q_target[idx] = self.qpos[idx, :6]
         mjw.forward(self.m, self.d)
         tcp, _ = self._tcp()
+        if self.mode == "place":
+            # phi_lift consistent with the seeded carry (no free first-step
+            # lift payout)
+            lift_cap = max(self.lift_req, 0.10)
+            lh = (self._obj_pos()[idx, 2] - float(self.half[2]))
+            self.phi_lift[idx] = lh.clamp(0, lift_cap) / lift_cap
         self.phi_approach[idx] = -torch.norm(
             tcp[idx] - self._grasp_point()[idx], dim=-1)
         self.phi_transport[idx] = -torch.norm(
             self._obj_pos()[idx, :2] - self.place_target[idx], dim=-1)
-        self.phi_lift[idx] = 0.0
+        if self.mode != "place":
+            self.phi_lift[idx] = 0.0
         op_i = self._obj_pos()[idx]
         rh_i = (op_i[:, 2] - float(self.half[2]) - self.target_h[idx])
         d_i = torch.norm(op_i[:, :2] - self.place_target[idx], dim=-1)
@@ -516,7 +585,7 @@ class PickEnv:
         C["transport"] = W["transport"] * carrying.float() * (phi_t - self.phi_transport)
         self.phi_transport = phi_t
         # 7 drop penalty: released or broke while far from bin and airborne
-        if self.mode == "pnp":
+        if self.mode in ("pnp", "place"):
             over_bin = torch.norm(op[:, :2] - self.place_target, dim=-1) < PLACE_TOL
         else:
             over_bin = (torch.abs(op[:, 0] - self.bin_pos[0]) < BIN_HALF) & \
@@ -547,7 +616,7 @@ class PickEnv:
         # 6c DENSE tilt discipline while the cup alone carries the object
         C["tilt_pen"] = W["tilt_pen"] * airborne.float() * \
             (tilt - 0.35).clamp(min=0)
-        if self.mode == "pnp":
+        if self.mode in ("pnp", "place"):
             # penalize only AERIAL drops (relative to the TARGET surface)
             bad_drop = (released | broke) & (rest_h > 0.02)
         else:
@@ -571,7 +640,7 @@ class PickEnv:
         if self.mode == "attach":
             placed = self.sealed & (lift_h > 0.02)      # success = seal + lift
             timeout = self.t_step >= EP_LEN_ATTACH
-        elif self.mode == "pnp":
+        elif self.mode in ("pnp", "place"):
             # GRADED placement: any gentle set-down (release at <1 cm lift,
             # object slow) ENDS the episode with reward 20*exp(-d^2/2s^2),
             # s = 5 cm -- smooth gradient toward the target from anywhere.
@@ -617,7 +686,7 @@ class PickEnv:
             timeout = self.t_step >= EP_LEN_PNP
         else:
             timeout = self.t_step >= EP_LEN
-        if self.mode == "pnp":
+        if self.mode in ("pnp", "place"):
             C["place"] = W["place"] * getattr(self, "_graded",
                                               placed.float())
             done_setdown = self._graded > 0
