@@ -323,14 +323,17 @@ class PickEnv:
                     torch.full_like(hh, -0.5))    # park under world if table
             else:
                 self.target_h[idx] = 0.0
-        if self.mode == "place":
-            # PLACE CURRICULUM: start SEALED mid-carry above the target so
-            # every step of experience is descend -> contact -> release
-            # (the attach-mode trick applied to the end of the task)
+        if self.mode in ("place", "carry"):
+            # PLACE: start SEALED mid-carry above the target (descend ->
+            # contact -> release). CARRY: start SEALED at table level at a
+            # random pick cell with a FAR target -- trains the whole
+            # post-seal span (lift -> transport -> descend -> release),
+            # the rung place-mode training catastrophically forgot.
             n2 = idx.numel()
-            cells = self.rng.integers(0, len(self.carry_grid), size=n2)
+            grid = self.carry_grid if self.mode == "place" else self.hover_grid
+            cells = self.rng.integers(0, len(grid), size=n2)
             self.qpos[idx, :6] = torch.tensor(
-                self.carry_grid[cells] + self.rng.normal(0, 0.02, size=(n2, 6)),
+                grid[cells] + self.rng.normal(0, 0.02, size=(n2, 6)),
                 device=self.device, dtype=torch.float32)
             self.qvel[idx, :6] = 0.0
             mjw.forward(self.m, self.d)
@@ -349,10 +352,16 @@ class PickEnv:
             self.sealed[idx] = True
             self.ever_sealed[idx] = True
             self.sat_count[idx] = 0
-            self.max_lift[idx] = self.lift_req + 0.02   # already carried
+            if self.mode == "place":
+                self.max_lift[idx] = self.lift_req + 0.02   # already carried
+                t_off = self.rng.uniform(-0.06, 0.06, size=(n2, 2))
+            else:                       # carry: must LIFT itself; far target
+                self.max_lift[idx] = 0.0
+                ang = self.rng.uniform(0, 2 * np.pi, size=n2)
+                rad = self.rng.uniform(0.08, self.target_max, size=n2)
+                t_off = np.stack([rad * np.cos(ang), rad * np.sin(ang)], -1)
             tgt = op[idx, :2] + torch.tensor(
-                self.rng.uniform(-0.06, 0.06, size=(n2, 2)),
-                device=self.device, dtype=torch.float32)
+                t_off, device=self.device, dtype=torch.float32)
             tgt[:, 0] = tgt[:, 0].clamp(TABLE_X[0] + 0.04, TABLE_X[1] - 0.04)
             tgt[:, 1] = tgt[:, 1].clamp(TABLE_Y[0] + 0.04, TABLE_Y[1] - 0.04)
             self.place_target[idx] = tgt
@@ -372,16 +381,15 @@ class PickEnv:
             self.q_target[idx] = self.qpos[idx, :6]
         mjw.forward(self.m, self.d)
         tcp, _ = self._tcp()
-        if self.mode == "place":
-            # phi_lift consistent with the seeded carry (no free first-step
-            # lift payout); phi tracks MAX lift
+        if self.mode in ("place", "carry"):
+            # phi_lift consistent with the seeded max_lift (no free payout)
             lift_cap = max(self.lift_req, 0.10)
             self.phi_lift[idx] = self.max_lift[idx].clamp(0, lift_cap) / lift_cap
         self.phi_approach[idx] = -torch.norm(
             tcp[idx] - self._grasp_point()[idx], dim=-1)
         self.phi_transport[idx] = -torch.norm(
             self._obj_pos()[idx, :2] - self.place_target[idx], dim=-1)
-        if self.mode != "place":
+        if self.mode not in ("place", "carry"):
             self.phi_lift[idx] = 0.0
         op_i = self._obj_pos()[idx]
         rh_i = (op_i[:, 2] - float(self.half[2]) - self.target_h[idx])
@@ -601,7 +609,7 @@ class PickEnv:
         C["transport"] = W["transport"] * carrying.float() * (phi_t - self.phi_transport)
         self.phi_transport = phi_t
         # 7 drop penalty: released or broke while far from bin and airborne
-        if self.mode in ("pnp", "place"):
+        if self.mode in ("pnp", "place", "carry"):
             over_bin = torch.norm(op[:, :2] - self.place_target, dim=-1) < PLACE_TOL
         else:
             over_bin = (torch.abs(op[:, 0] - self.bin_pos[0]) < BIN_HALF) & \
@@ -632,7 +640,7 @@ class PickEnv:
         # 6c DENSE tilt discipline while the cup alone carries the object
         C["tilt_pen"] = W["tilt_pen"] * airborne.float() * \
             (tilt - 0.30).clamp(min=0)
-        if self.mode in ("pnp", "place"):
+        if self.mode in ("pnp", "place", "carry"):
             # penalize only AERIAL drops (relative to the TARGET surface)
             bad_drop = (released | broke) & (rest_h > 0.02)
         else:
@@ -657,7 +665,7 @@ class PickEnv:
         if self.mode == "attach":
             placed = self.sealed & (lift_h > 0.02)      # success = seal + lift
             timeout = self.t_step >= EP_LEN_ATTACH
-        elif self.mode in ("pnp", "place"):
+        elif self.mode in ("pnp", "place", "carry"):
             # GRADED placement: any gentle set-down (release at <1 cm lift,
             # object slow) ENDS the episode with reward 20*exp(-d^2/2s^2),
             # s = 5 cm -- smooth gradient toward the target from anywhere.
@@ -703,7 +711,7 @@ class PickEnv:
             timeout = self.t_step >= EP_LEN_PNP
         else:
             timeout = self.t_step >= EP_LEN
-        if self.mode in ("pnp", "place"):
+        if self.mode in ("pnp", "place", "carry"):
             C["place"] = W["place"] * getattr(self, "_graded",
                                               placed.float())
             done_setdown = self._graded > 0

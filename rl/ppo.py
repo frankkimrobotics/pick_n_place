@@ -43,7 +43,7 @@ def main():
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--ent", type=float, default=0.003)
     ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--mode", default="pnp", choices=["full", "attach", "pnp", "place"])
+    ap.add_argument("--mode", default="pnp", choices=["full", "attach", "pnp", "place", "carry"])
     ap.add_argument("--dr", action="store_true")
     ap.add_argument("--init", default=None)
     ap.add_argument("--release_mask", action="store_true")
