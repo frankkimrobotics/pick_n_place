@@ -27,7 +27,7 @@ def main():
     ap.add_argument("--episodes", type=int, default=6)
     ap.add_argument("--out", default=os.path.expanduser("~/pnp_rl/attach_demo"))
     ap.add_argument("--scene", default=os.path.join(HERE, "scenes", "box_med.xml"))
-    ap.add_argument("--mode", default="attach", choices=["attach", "pnp"])
+    ap.add_argument("--mode", default="attach", choices=["attach", "pnp", "place", "carry"])
     ap.add_argument("--algo", default="sac", choices=["sac", "ppo"])
     ap.add_argument("--horizon", type=int, default=45)
     a = ap.parse_args()
@@ -38,7 +38,7 @@ def main():
     from ppo import AC
 
     N = a.episodes
-    env = PickEnv(nworld=N, mode=a.mode, xml=a.scene)
+    env = PickEnv(nworld=N, mode=a.mode, xml=a.scene, lift_req=0.35)
     ck = torch.load(a.actor, map_location=env.device, weights_only=False)
     if a.algo == "ppo":
         net = AC().to(env.device)

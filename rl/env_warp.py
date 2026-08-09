@@ -58,7 +58,8 @@ PLACE_TOL = 0.035
 W = dict(approach=1.0, align=0.3, press=0.5, seal=5.0, lift=4.0,
          transport=6.0, place=20.0, drop=-0.5, chatter=-0.05,
          act=-0.01, time=-0.005, table_slam=-0.5, off_table=-2.0,
-         descend=4.0, tilt_pen=-0.4, rel_mask=-0.08)
+         descend=4.0, tilt_pen=-0.4, rel_mask=-0.08,
+         place_align=-0.6, rel_far=-1.0)
 
 
 def build_scene_xml(half_extents, kind, out_xml, seed=0):
@@ -197,11 +198,13 @@ class PickEnv:
         self.RKEYS = ["approach", "align", "press", "seal", "lift",
                       "transport", "place", "drop", "chatter", "act",
                       "time", "table_slam", "off_table", "descend",
-                      "tilt_pen", "rel_mask"]
+                      "tilt_pen", "rel_mask", "place_align", "rel_far"]
         self.ep_comp = torch.zeros(N, len(self.RKEYS), device=device)
         self.max_lift = torch.zeros(N, device=device)
         self.wmode = torch.zeros(N, dtype=torch.long, device=device)
         self.mask_worlds = torch.zeros(N, dtype=torch.bool, device=device)
+        self.rel_count = torch.zeros(N, dtype=torch.long, device=device)
+        self.release_cup_tilt = torch.zeros(N, device=device)
         self.target_h = torch.zeros(N, device=device)   # place surface height
         self.max_tilt = torch.zeros(N, device=device)    # rad, while sealed
         self.release_h = torch.zeros(N, device=device)   # rest_h at release
@@ -253,6 +256,8 @@ class PickEnv:
         self.max_lift[idx] = 0.0
         self.max_tilt[idx] = 0.0
         self.release_h[idx] = 0.0
+        self.rel_count[idx] = 0
+        self.release_cup_tilt[idx] = 0.0
         if self.dr:
             n_ = idx.numel()
             self.gain_scale[idx] = torch.tensor(
@@ -513,6 +518,13 @@ class PickEnv:
             a = eff
         self.q_target = self.q_target + a[:, :6] * DQ_MAX
         want = a[:, 6] > 0
+        # suction hysteresis: a latched cup releases only after REL_N
+        # consecutive off-commands -- action flicker was causing transient
+        # seals and lost grips mid-pick
+        hold = self.sealed & ~want
+        self.rel_count = torch.where(
+            hold, self.rel_count + 1, torch.zeros_like(self.rel_count))
+        want = want | (hold & (self.rel_count < 3))
         if self.release_mask:
             # training aid: the cup does not let go >5 cm above the
             # target surface -- deletes the drop-from-height optimum.
@@ -632,6 +644,17 @@ class PickEnv:
         # would score full contact-release credit)
         self.release_h = torch.where(released | broke, rest_h.clamp(min=0),
                                      self.release_h)
+        cup_tilt = torch.arccos((-R[:, 2, 2]).clamp(-1, 1))
+        self.release_cup_tilt = torch.where(released | broke, cup_tilt,
+                                            self.release_cup_tilt)
+        d_tgt_now = torch.norm(op[:, :2] - self.place_target, dim=-1)
+        # losing the grip far from the target was FREE -> latch-lose-retry
+        C["rel_far"] = W["rel_far"] * ((released | broke) &
+                                       (d_tgt_now > 2 * PLACE_TOL)).float()
+        # cup verticality while placing (sealed, over target, low)
+        placing = self.sealed & (d_tgt_now < 0.07) & (rest_h < 0.12)
+        C["place_align"] = W["place_align"] * placing.float() * \
+            (cup_tilt - 0.10).clamp(min=0)
         # 6b DENSE descend-to-surface: potential -rest_h weighted by a
         # smooth over-target gate -- the xy transport shaping never pulls
         # the object DOWN, so contact-release had no per-step gradient
@@ -701,13 +724,16 @@ class PickEnv:
                 lift_ok = torch.ones_like(setdown)
                 lift_fac = torch.ones_like(self.max_lift)
             placed = setdown & (d_tgt < PLACE_TOL) & lift_ok & \
-                (self.release_h < 0.010) & (self.max_tilt < 0.44)  # 1cm, 25deg
+                (self.release_h < 0.010) & (self.max_tilt < 0.44) & \
+                (self.release_cup_tilt < 0.17)   # 1cm, 25deg, cup 10deg
             dist_g = torch.exp(-(d_tgt ** 2) / (2 * 0.05 ** 2))
+            vert_g = torch.exp(-(self.release_cup_tilt - 0.10).clamp(min=0)
+                               / 0.30)
             # cube root: three multiplicative near-zero grades starve PPO of
             # any terminal signal (product ~2e-4 from the warm start); the
             # geometric mean keeps every factor mandatory at a usable scale
             self._graded = setdown.float() * lift_fac * gentle * \
-                (contact_rel * tilt_g * dist_g).clamp(min=0) ** (1.0 / 3.0)
+                (contact_rel * tilt_g * dist_g * vert_g).clamp(min=0) ** 0.25
             if self.speed_bonus > 0:
                 self._graded = self._graded * (
                     1.0 + self.speed_bonus *
