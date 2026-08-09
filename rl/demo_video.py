@@ -42,7 +42,15 @@ def main():
     ck = torch.load(a.actor, map_location=env.device, weights_only=False)
     if a.algo == "ppo":
         net = AC().to(env.device)
-        net.load_state_dict(ck["ac"])
+        sd = ck["ac"]
+        own = net.state_dict()
+        for k in list(sd.keys()):                      # obs-dim growth: zero-pad
+            if k in own and own[k].shape != sd[k].shape:
+                pad = torch.zeros_like(own[k])
+                sl = tuple(slice(0, s) for s in sd[k].shape)
+                pad[sl] = sd[k]
+                sd[k] = pad
+        net.load_state_dict(sd)
         net.eval()
         class _A:
             def __call__(self, o): return net.pi(o), None

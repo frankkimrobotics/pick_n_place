@@ -45,6 +45,7 @@ SEAL_VEL = 0.08            # m/s relative speed gate (low-energy latch)
 F_MAX = 20.0               # N suction holding limit
 TAU_CUP = 0.4              # N*m peel-torque limit (~F_MAX x cup radius)
 PEEL_COS = 0.878           # cos(~28.6 deg): tilt beyond this = cup peeling
+TAU_TORSION = 0.15         # N*m torsional (yaw) friction limit ~ mu*F_MAX*r_cup
 BIN_XY = np.array([0.10, 0.40])
 BIN_HALF = 0.145
 TABLE_X = (0.24, 0.52)
@@ -190,6 +191,7 @@ class PickEnv:
         self.q_target = torch.zeros(N, 6, device=device)
         self.prev_obj_vel = torch.zeros(N, 3, device=device)
         self.anchor = torch.zeros(N, 3, device=device)
+        self.anchor_R = torch.eye(3, device=device).expand(N, 3, 3).clone()
         self.sat_count = torch.zeros(N, dtype=torch.long, device=device)
         self.phi_approach = torch.zeros(N, device=device)
         self.phi_transport = torch.zeros(N, device=device)
@@ -356,6 +358,8 @@ class PickEnv:
             op = self._obj_pos()
             self.anchor[grp] = torch.einsum(
                 "nij,nj->ni", R[grp].transpose(1, 2), op[grp] - tcp[grp])
+            self.anchor_R[grp] = torch.einsum(
+                "nij,njk->nik", R[grp].transpose(1, 2), self._obj_R()[grp])
             self.sealed[grp] = True
             self.ever_sealed[grp] = True
             self.sat_count[grp] = 0
@@ -432,10 +436,24 @@ class PickEnv:
             op = self._obj_pos()[idx]
             self.anchor[idx] = torch.einsum(
                 "nij,nj->ni", R[idx].transpose(1, 2), op - tcp[idx])
+            self.anchor_R[idx] = torch.einsum(
+                "nij,njk->nik", R[idx].transpose(1, 2), self._obj_R()[idx])
             self.sat_count[idx] = 0
             self.sealed[idx] = True
             self.ever_sealed[idx] = True
         return gate
+
+    def _obj_R(self):
+        """Object body rotation matrix from xquat (wxyz)."""
+        q = self.xquat[:, self.bid_obj]
+        w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        return torch.stack([
+            torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z),
+                         2 * (x * z + w * y)], -1),
+            torch.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z),
+                         2 * (y * z - w * x)], -1),
+            torch.stack([2 * (x * z - w * y), 2 * (y * z + w * x),
+                         1 - 2 * (x * x + y * y)], -1)], -2)
 
     def _obj_zaxis(self):
         q = self.xquat[:, self.bid_obj]                  # wxyz
@@ -452,7 +470,7 @@ class PickEnv:
         t = 2 * torch.cross(qv, w_b, dim=-1)
         return w_b + qw * t + torch.cross(qv, t, dim=-1)
 
-    K_ROT = 4.0               # N*m/rad righting stiffness
+    K_ROT = 20.0              # N*m/rad orientation stiffness (cap still TAU_CUP)
     C_ROT = 0.05              # N*m*s/rad
 
     def _apply_suction_force(self):
@@ -471,22 +489,37 @@ class PickEnv:
         F = F * scale
         m = self.sealed.float()[:, None]
         self.xfrc[:, self.bid_obj, :3] = F * m
-        # rotational spring: right the object's z-axis toward the CUP axis,
-        # capped at the peel-torque limit (single-cup wrench limit)
+        # rotational spring on the FULL latched orientation.  The old
+        # cross(objz, cupz) torque is perpendicular to the cup axis by
+        # construction -> ZERO yaw authority, so a sealed object could spin
+        # freely about the cup.  A real cup resists that through contact
+        # friction; hold the whole relative orientation instead.
         objz = self._obj_zaxis()
         cupz = -R[:, :, 2]                       # cup presses along -z
-        err = torch.cross(objz, cupz, dim=-1)
+        R_tgt = torch.einsum("nij,njk->nik", R, self.anchor_R)
+        E = torch.einsum("nij,nkj->nik", R_tgt, self._obj_R())
+        err = 0.5 * torch.stack([E[:, 2, 1] - E[:, 1, 2],
+                                 E[:, 0, 2] - E[:, 2, 0],
+                                 E[:, 1, 0] - E[:, 0, 1]], -1)
         # spring capped at the cup's holding limit; damping is applied as
         # direct exponential decay of the object's angular velocity below
         # (torque-based damping is either starved by the cap -- undamped
         # 70deg ringing -- or explicit-unstable for the box's tiny inertia)
-        Ts = self.K_ROT * err
-        Tmag = torch.norm(Ts, dim=-1, keepdim=True)
-        tscale = (TAU_CUP / Tmag.clamp(min=1e-6)).clamp(max=1.0)
-        self.xfrc[:, self.bid_obj, 3:] = Ts * tscale * m
+        # split the budget: PEEL (tilt, perpendicular to the cup axis) and
+        # TORSION (yaw, about it) are different physical limits, so capping
+        # one combined vector let a large yaw error starve tilt correction
+        n_ax = cupz / cupz.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        e_par = (err * n_ax).sum(-1, keepdim=True) * n_ax       # yaw
+        e_perp = err - e_par                                    # tilt
+        def _cap(v, lim):
+            mag = torch.norm(v, dim=-1, keepdim=True)
+            return v * (lim / mag.clamp(min=1e-6)).clamp(max=1.0)
+        Ts = _cap(self.K_ROT * e_perp, TAU_CUP) + \
+            _cap(self.K_ROT * e_par, TAU_TORSION)
+        self.xfrc[:, self.bid_obj, 3:] = Ts * m
         va = self.vadr_obj
         self.qvel[:, va + 3:va + 6] = torch.where(
-            self.sealed[:, None], self.qvel[:, va + 3:va + 6] * 0.82,
+            self.sealed[:, None], self.qvel[:, va + 3:va + 6] * 0.55,
             self.qvel[:, va + 3:va + 6])
         # peel = object actually hanging far off the cup axis (the capped
         # righting spring can no longer recover it), NOT mere cap saturation
