@@ -43,10 +43,12 @@ def main():
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--ent", type=float, default=0.003)
     ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--mode", default="pnp", choices=["full", "attach", "pnp", "place"])
+    ap.add_argument("--mode", default="pnp", choices=["full", "attach", "pnp", "place", "carry", "mix"])
     ap.add_argument("--dr", action="store_true")
     ap.add_argument("--init", default=None)
     ap.add_argument("--release_mask", action="store_true")
+    ap.add_argument("--mask_h", type=float, default=0.05)
+    ap.add_argument("--tilt_pen", type=float, default=None)
     ap.add_argument("--target_max", type=float, default=0.30)
     ap.add_argument("--lift_req", type=float, default=0.0)
     ap.add_argument("--speed_bonus", type=float, default=0.0)
@@ -58,7 +60,7 @@ def main():
     torch.manual_seed(0)
     wp.init()
     from env_warp import PickEnv
-    env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode, dr=a.dr, target_max=a.target_max, lift_req=a.lift_req, speed_bonus=a.speed_bonus, release_mask=a.release_mask)
+    env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode, dr=a.dr, target_max=a.target_max, lift_req=a.lift_req, speed_bonus=a.speed_bonus, release_mask=a.release_mask, mask_h=a.mask_h, tilt_pen_w=a.tilt_pen)
     ac = AC().to(dev)
     if a.init:
         ck = torch.load(a.init, map_location=dev, weights_only=False)
@@ -115,6 +117,9 @@ def main():
                     ep["ret"] += float(info["ep_comp"][di].sum(-1).sum())
                     ep["len"] += float(info["ep_len"][di].float().sum())
                     ep["placed"] += int(info["placed"][di].sum())
+                    pm = info["wmode"][di] == 0
+                    ep["n_p"] = ep.get("n_p", 0) + int(pm.sum())
+                    ep["placed_p"] = ep.get("placed_p", 0) + int(info["placed"][di][pm].sum())
                     ep["sealed"] += int(info["ever_sealed"][di].sum())
                     ep["comp"] += info["ep_comp"][di].sum(0).cpu().numpy()
             val_b[T] = ac.v(obs).squeeze(-1)
@@ -160,11 +165,12 @@ def main():
                        alpha=0.0, entropy=el / nb, q_mean=float(val_b.mean()),
                        ep_ret=ep["ret"] / n_ep, ep_len=ep["len"] / n_ep,
                        success=ep["placed"] / n_ep, seal_rate=ep["sealed"] / n_ep,
+                       succ_pnp=ep.get("placed_p", 0) / max(1, ep.get("n_p", 0)),
                        sps=step / (time.time() - t0),
                        comp={k: ep["comp"][i] / n_ep
                              for i, k in enumerate(env.RKEYS)})
             log.write(json.dumps(rec) + "\n"); log.flush()
-            print(f"[ppo] {step:>10,} | succ {rec['success']:.2%} "
+            print(f"[ppo] {step:>10,} | succ {rec['success']:.2%} pnp {rec['succ_pnp']:.2%} "
                   f"seal {rec['seal_rate']:.2%} ret {rec['ep_ret']:.2f} "
                   f"sps {rec['sps']:,.0f}", flush=True)
             ep = dict(n=0, ret=0.0, len=0.0, placed=0, sealed=0,

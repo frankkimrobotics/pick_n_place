@@ -23,7 +23,7 @@ import os
 import sys
 import time
 
-os.environ.setdefault("MUJOCO_GL", "osmesa")
+os.environ.setdefault("MUJOCO_GL", "egl")     # GPU render; osmesa = 180x slower
 
 import mujoco
 import numpy as np
@@ -103,6 +103,62 @@ def _worker_render(job):
     return out
 
 
+class EglFarm:
+    """In-process GPU renderer (EGL). One model/renderer; per-world visual DR
+    params are applied to the shared model right before that world's render.
+    ~630 render-units/s vs ~3.5 single-proc osmesa -- no worker pool needed."""
+    def __init__(self, xml, nworld, seed=0):
+        self.rng = np.random.default_rng(seed)
+        self.m = mujoco.MjModel.from_xml_path(xml)
+        self.d = mujoco.MjData(self.m)
+        self.ren = mujoco.Renderer(self.m, height=IMG, width=IMG)
+        self.vopt = mujoco.MjvOption()
+        self.vopt.flags[mujoco.mjtVisFlag.mjVIS_RANGEFINDER] = 0
+        self.vopt.sitegroup[:] = 0
+        self.gid = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_GEOM, "object0")
+        self.cid = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_CAMERA,
+                                     "fixed_d435")
+        self._cam0 = self.m.cam_pos[self.cid].copy()
+        self.params = [None] * nworld
+        for i in range(nworld):
+            self.randomize(i)
+
+    def randomize(self, i):
+        self.params[i] = dict(
+            rgba=self.rng.uniform(0.15, 0.95, 3),
+            light=np.array([self.rng.uniform(-0.6, 1.1),
+                            self.rng.uniform(-0.8, 1.0),
+                            self.rng.uniform(0.9, 1.7)]),
+            cam=self._cam0 + self.rng.normal(0, 0.01, 3))
+
+    def render_batch(self, qp, mocap):
+        m, d, ren = self.m, self.d, self.ren
+        o1, o2 = [], []
+        for i in range(len(qp)):
+            p = self.params[i]
+            m.geom_rgba[self.gid, :3] = p["rgba"]
+            if m.nlight > 0:
+                m.light_pos[0] = p["light"]
+            m.cam_pos[self.cid] = p["cam"]
+            d.qpos[:len(qp[i])] = qp[i]
+            if mocap is not None and m.nmocap > 0:
+                d.mocap_pos[:] = mocap[i]
+            mujoco.mj_forward(m, d)
+            out = []
+            for cam in ("wrist_d405", "fixed_d435"):
+                ren.update_scene(d, camera=cam, scene_option=self.vopt)
+                rgb = ren.render()
+                ren.enable_depth_rendering()
+                ren.update_scene(d, camera=cam, scene_option=self.vopt)
+                dep = ren.render()
+                ren.disable_depth_rendering()
+                d8 = (np.clip(dep, 0, 2.0) * 127.5).astype(np.uint8)[..., None]
+                out.append(np.concatenate([rgb, d8], -1).transpose(2, 0, 1))
+            o1.append(out[0])
+            o2.append(out[1])
+        return o1, o2
+
+
 class RenderFarm:
     """Multiprocess CPU renderer; main process owns the DR RNG and ships
     explicit per-world params with each request (workers are stateless)."""
@@ -169,7 +225,13 @@ def main():
     teacher.eval()
     student = Student().to(dev)
     opt = torch.optim.Adam(student.parameters(), lr=a.lr)
-    farm = RenderFarm(a.scene, a.nworld)
+    try:                                    # GPU render if EGL is available
+        farm = EglFarm(a.scene, a.nworld)
+        print("[dagger] renderer: EGL (GPU)", flush=True)
+    except Exception as e:
+        print("[dagger] EGL unavailable (%s) -> CPU pool" % str(e)[:60], flush=True)
+        os.environ["MUJOCO_GL"] = "osmesa"
+        farm = RenderFarm(a.scene, a.nworld)
     log = open(os.path.join(a.out, "log.jsonl"), "a")
 
     # dataset buffers (grow across iters -- DAgger aggregation)

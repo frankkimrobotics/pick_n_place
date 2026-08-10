@@ -45,6 +45,7 @@ SEAL_VEL = 0.08            # m/s relative speed gate (low-energy latch)
 F_MAX = 20.0               # N suction holding limit
 TAU_CUP = 0.4              # N*m peel-torque limit (~F_MAX x cup radius)
 PEEL_COS = 0.878           # cos(~28.6 deg): tilt beyond this = cup peeling
+TAU_TORSION = 0.15         # N*m torsional (yaw) friction limit ~ mu*F_MAX*r_cup
 BIN_XY = np.array([0.10, 0.40])
 BIN_HALF = 0.145
 TABLE_X = (0.24, 0.52)
@@ -58,7 +59,8 @@ PLACE_TOL = 0.035
 W = dict(approach=1.0, align=0.3, press=0.5, seal=5.0, lift=4.0,
          transport=6.0, place=20.0, drop=-0.5, chatter=-0.05,
          act=-0.01, time=-0.005, table_slam=-0.5, off_table=-2.0,
-         descend=4.0, tilt_pen=-0.05, rel_mask=-0.08)
+         descend=4.0, tilt_pen=-0.4, rel_mask=-0.08,
+         place_align=-0.6, rel_far=-1.0)
 
 
 def build_scene_xml(half_extents, kind, out_xml, seed=0):
@@ -82,7 +84,8 @@ class PickEnv:
     def __init__(self, nworld=1024, device="cuda:0", seed=0,
                  xml=None, half_extents=(0.025, 0.025, 0.02), kind="box",
                  mode="full", dr=False, target_max=0.30,
-                 lift_req=0.0, speed_bonus=0.0, release_mask=False):
+                 lift_req=0.0, speed_bonus=0.0, release_mask=False,
+                 mask_h=0.05, tilt_pen_w=None):
         """mode='attach': staged sub-task -- episodes START with the cup
         hovering 2-4 cm above the (jittered) grasp point; success = seal +
         hold + 2 cm lift within a 40-step episode. mode='full': whole task."""
@@ -93,7 +96,9 @@ class PickEnv:
         self.target_max = target_max
         self.lift_req = lift_req          # required MAX lift for pnp success
         self.speed_bonus = speed_bonus    # terminal bonus * (1 - t/EP_LEN)
-        self.release_mask = release_mask  # hold seal if release cmd >5cm up
+        self.release_mask = release_mask  # hold seal if release cmd high
+        self.mask_h = mask_h              # anneal 0.05 -> 0.015
+        self.tilt_pen_w = W["tilt_pen"] if tilt_pen_w is None else tilt_pen_w
         self.rng = np.random.default_rng(seed)
         if xml is None:
             xml = os.path.join(HERE, "_scene_rl.xml")
@@ -186,6 +191,7 @@ class PickEnv:
         self.q_target = torch.zeros(N, 6, device=device)
         self.prev_obj_vel = torch.zeros(N, 3, device=device)
         self.anchor = torch.zeros(N, 3, device=device)
+        self.anchor_R = torch.eye(3, device=device).expand(N, 3, 3).clone()
         self.sat_count = torch.zeros(N, dtype=torch.long, device=device)
         self.phi_approach = torch.zeros(N, device=device)
         self.phi_transport = torch.zeros(N, device=device)
@@ -194,9 +200,13 @@ class PickEnv:
         self.RKEYS = ["approach", "align", "press", "seal", "lift",
                       "transport", "place", "drop", "chatter", "act",
                       "time", "table_slam", "off_table", "descend",
-                      "tilt_pen", "rel_mask"]
+                      "tilt_pen", "rel_mask", "place_align", "rel_far"]
         self.ep_comp = torch.zeros(N, len(self.RKEYS), device=device)
         self.max_lift = torch.zeros(N, device=device)
+        self.wmode = torch.zeros(N, dtype=torch.long, device=device)
+        self.mask_worlds = torch.zeros(N, dtype=torch.bool, device=device)
+        self.rel_count = torch.zeros(N, dtype=torch.long, device=device)
+        self.release_cup_tilt = torch.zeros(N, device=device)
         self.target_h = torch.zeros(N, device=device)   # place surface height
         self.max_tilt = torch.zeros(N, device=device)    # rad, while sealed
         self.release_h = torch.zeros(N, device=device)   # rest_h at release
@@ -248,6 +258,8 @@ class PickEnv:
         self.max_lift[idx] = 0.0
         self.max_tilt[idx] = 0.0
         self.release_h[idx] = 0.0
+        self.rel_count[idx] = 0
+        self.release_cup_tilt[idx] = 0.0
         if self.dr:
             n_ = idx.numel()
             self.gain_scale[idx] = torch.tensor(
@@ -263,129 +275,139 @@ class PickEnv:
                 self.rng.random(n_) < 0.5, device=self.device)
             self.prev_action[idx] = 0.0
         self.q_target[idx] = self.qpos[idx, :6]
-        if self.mode in ("attach", "pnp"):
-            # place the ARM near the grasp: per-world CPU IK is too slow, so
-            # use a canonical pre-solved hover configuration for the object at
-            # scene center and correct the object to sit UNDER the cup instead:
-            # sample cup-relative offsets and put the object there.
-            cells = self.rng.integers(0, len(self.hover_grid), size=idx.numel())
-            self.qpos[idx, :6] = torch.tensor(
-                self.hover_grid[cells] + self.rng.normal(0, 0.015, size=(idx.numel(), 6)),
+        # --- per-world curriculum mode ---------------------------------
+        # 0 = pnp (unsealed hover start, must pick), 1 = carry (sealed at
+        # table level, far target), 2 = place (sealed mid-carry, near
+        # target).  "mix" trains all three simultaneously in one network --
+        # sequential stages kept catastrophically forgetting earlier skills.
+        if self.mode == "mix":
+            draws = self.rng.random(n)
+            wm = np.where(draws < 0.4, 0, np.where(draws < 0.7, 1, 2))
+            self.wmode[idx] = torch.tensor(wm, device=self.device)
+        elif self.mode == "carry":
+            self.wmode[idx] = 1
+        elif self.mode == "place":
+            self.wmode[idx] = 2
+        else:
+            self.wmode[idx] = 0
+        wm_i = self.wmode[idx]
+        i_pnp = idx[wm_i == 0]
+        i_carry = idx[wm_i == 1]
+        i_place = idx[wm_i == 2]
+        # release mask: skill-forcer for sealed-start worlds only; pnp
+        # worlds keep free release (mask blocks discovery there)
+        self.mask_worlds[idx] = bool(self.release_mask) & (wm_i > 0)
+
+        i_hover = idx if self.mode == "attach" else i_pnp
+        if i_hover.numel():
+            cells = self.rng.integers(0, len(self.hover_grid), size=i_hover.numel())
+            self.qpos[i_hover, :6] = torch.tensor(
+                self.hover_grid[cells] + self.rng.normal(0, 0.015, size=(i_hover.numel(), 6)),
                 device=self.device, dtype=torch.float32)
             mjw.forward(self.m, self.d)
             tcp, _ = self._tcp()
             off = torch.tensor(self.rng.uniform(
-                [-0.015, -0.015], [0.015, 0.015], size=(idx.numel(), 2)),
+                [-0.015, -0.015], [0.015, 0.015], size=(i_hover.numel(), 2)),
                 device=self.device, dtype=torch.float32)
-            hover = torch.tensor(self.rng.uniform(0.02, 0.04, size=idx.numel()),
+            hover = torch.tensor(self.rng.uniform(0.02, 0.04, size=i_hover.numel()),
                                  device=self.device, dtype=torch.float32)
             qa = self.jadr_obj
-            self.qpos[idx, qa:qa + 2] = tcp[idx, :2] + off
-            self.qpos[idx, qa + 2] = (tcp[idx, 2] - hover
-                                      - float(self.half[2]) - CUP_R).clamp(
+            self.qpos[i_hover, qa:qa + 2] = tcp[i_hover, :2] + off
+            self.qpos[i_hover, qa + 2] = (tcp[i_hover, 2] - hover
+                                          - float(self.half[2]) - CUP_R).clamp(
                 min=float(self.half[2]) + 0.001)
-            self.q_target[idx] = self.qpos[idx, :6]
-        if self.mode == "pnp":
-            # random set-down target, guaranteed >= 8 cm from the object
-            # curriculum: target at distance U[0.05, target_max] from object
+            self.q_target[i_hover] = self.qpos[i_hover, :6]
+        if i_pnp.numel() and self.mode != "attach":
+            n2 = i_pnp.numel()
             qa0 = self.jadr_obj
-            objxy = self.qpos[idx, qa0:qa0 + 2]
-            ang = torch.tensor(self.rng.uniform(0, 2 * np.pi, size=idx.numel()),
+            objxy = self.qpos[i_pnp, qa0:qa0 + 2]
+            ang = torch.tensor(self.rng.uniform(0, 2 * np.pi, size=n2),
                                device=self.device, dtype=torch.float32)
-            rad = torch.tensor(self.rng.uniform(0.05, self.target_max,
-                                                size=idx.numel()),
+            rad = torch.tensor(self.rng.uniform(0.05, self.target_max, size=n2),
                                device=self.device, dtype=torch.float32)
             tgt = objxy + torch.stack([rad * torch.cos(ang),
                                        rad * torch.sin(ang)], -1)
             tgt[:, 0] = tgt[:, 0].clamp(TABLE_X[0] + 0.04, TABLE_X[1] - 0.04)
             tgt[:, 1] = tgt[:, 1].clamp(TABLE_Y[0] + 0.04, TABLE_Y[1] - 0.04)
-            qa = self.jadr_obj
-            near = torch.norm(tgt - self.qpos[idx, qa:qa + 2], dim=-1) < 0.08
+            near = torch.norm(tgt - self.qpos[i_pnp, qa0:qa0 + 2], dim=-1) < 0.08
             tgt[near] = torch.where(
                 tgt[near] > 0.0, tgt[near] - 0.12, tgt[near] + 0.12).clamp(
                 torch.tensor([TABLE_X[0] + 0.04, TABLE_Y[0] + 0.04], device=self.device),
                 torch.tensor([TABLE_X[1] - 0.04, TABLE_Y[1] - 0.04], device=self.device))
-            self.place_target[idx] = tgt
-            if self.mocap_ped >= 0:
-                n2 = idx.numel()
-                elevated = torch.tensor(self.rng.random(n2) < 0.6,
-                                        device=self.device)
-                hh = torch.tensor(self.rng.uniform(0.04, 0.12, size=n2),
-                                  device=self.device, dtype=torch.float32)
-                hh = torch.where(elevated, hh, torch.zeros_like(hh))
-                self.target_h[idx] = hh
-                self.mocap_pos[idx, self.mocap_ped, 0] = tgt[:, 0]
-                self.mocap_pos[idx, self.mocap_ped, 1] = tgt[:, 1]
-                self.mocap_pos[idx, self.mocap_ped, 2] = torch.where(
-                    elevated, hh - 0.06,
-                    torch.full_like(hh, -0.5))    # park under world if table
-            else:
-                self.target_h[idx] = 0.0
-        if self.mode == "place":
-            # PLACE CURRICULUM: start SEALED mid-carry above the target so
-            # every step of experience is descend -> contact -> release
-            # (the attach-mode trick applied to the end of the task)
-            n2 = idx.numel()
-            cells = self.rng.integers(0, len(self.carry_grid), size=n2)
-            self.qpos[idx, :6] = torch.tensor(
-                self.carry_grid[cells] + self.rng.normal(0, 0.02, size=(n2, 6)),
+            self._assign_target(i_pnp, tgt)
+        for grp, grid, seeded in ((i_carry, self.hover_grid, False),
+                                  (i_place, self.carry_grid, True)):
+            if grp.numel() == 0 or self.mode in ("attach", "full"):
+                continue
+            n2 = grp.numel()
+            cells = self.rng.integers(0, len(grid), size=n2)
+            self.qpos[grp, :6] = torch.tensor(
+                grid[cells] + self.rng.normal(0, 0.02, size=(n2, 6)),
                 device=self.device, dtype=torch.float32)
-            self.qvel[idx, :6] = 0.0
+            self.qvel[grp, :6] = 0.0
             mjw.forward(self.m, self.d)
             tcp, R = self._tcp()
             qa = self.jadr_obj
-            self.qpos[idx, qa] = tcp[idx, 0]
-            self.qpos[idx, qa + 1] = tcp[idx, 1]
-            self.qpos[idx, qa + 2] = tcp[idx, 2] - 0.004 - float(self.half[2])
-            self.qpos[idx, qa + 3] = 1.0
-            self.qpos[idx, qa + 4:qa + 7] = 0.0
-            self.qvel[idx, self.vadr_obj:self.vadr_obj + 6] = 0.0
+            self.qpos[grp, qa] = tcp[grp, 0]
+            self.qpos[grp, qa + 1] = tcp[grp, 1]
+            self.qpos[grp, qa + 2] = tcp[grp, 2] - 0.004 - float(self.half[2])
+            self.qpos[grp, qa + 3] = 1.0
+            self.qpos[grp, qa + 4:qa + 7] = 0.0
+            self.qvel[grp, self.vadr_obj:self.vadr_obj + 6] = 0.0
             mjw.forward(self.m, self.d)
             op = self._obj_pos()
-            self.anchor[idx] = torch.einsum(
-                "nij,nj->ni", R[idx].transpose(1, 2), op[idx] - tcp[idx])
-            self.sealed[idx] = True
-            self.ever_sealed[idx] = True
-            self.sat_count[idx] = 0
-            self.max_lift[idx] = self.lift_req + 0.02   # already carried
-            tgt = op[idx, :2] + torch.tensor(
-                self.rng.uniform(-0.06, 0.06, size=(n2, 2)),
-                device=self.device, dtype=torch.float32)
+            self.anchor[grp] = torch.einsum(
+                "nij,nj->ni", R[grp].transpose(1, 2), op[grp] - tcp[grp])
+            self.anchor_R[grp] = torch.einsum(
+                "nij,njk->nik", R[grp].transpose(1, 2), self._obj_R()[grp])
+            self.sealed[grp] = True
+            self.ever_sealed[grp] = True
+            self.sat_count[grp] = 0
+            if seeded:
+                self.max_lift[grp] = self.lift_req + 0.02
+                t_off = self.rng.uniform(-0.06, 0.06, size=(n2, 2))
+            else:
+                self.max_lift[grp] = 0.0
+                ang = self.rng.uniform(0, 2 * np.pi, size=n2)
+                rad = self.rng.uniform(0.08, self.target_max, size=n2)
+                t_off = np.stack([rad * np.cos(ang), rad * np.sin(ang)], -1)
+            tgt = op[grp, :2] + torch.tensor(
+                t_off, device=self.device, dtype=torch.float32)
             tgt[:, 0] = tgt[:, 0].clamp(TABLE_X[0] + 0.04, TABLE_X[1] - 0.04)
             tgt[:, 1] = tgt[:, 1].clamp(TABLE_Y[0] + 0.04, TABLE_Y[1] - 0.04)
-            self.place_target[idx] = tgt
-            if self.mocap_ped >= 0:
-                elevated = torch.tensor(self.rng.random(n2) < 0.6,
-                                        device=self.device)
-                hh = torch.tensor(self.rng.uniform(0.04, 0.12, size=n2),
-                                  device=self.device, dtype=torch.float32)
-                hh = torch.where(elevated, hh, torch.zeros_like(hh))
-                self.target_h[idx] = hh
-                self.mocap_pos[idx, self.mocap_ped, 0] = tgt[:, 0]
-                self.mocap_pos[idx, self.mocap_ped, 1] = tgt[:, 1]
-                self.mocap_pos[idx, self.mocap_ped, 2] = torch.where(
-                    elevated, hh - 0.06, torch.full_like(hh, -0.5))
-            else:
-                self.target_h[idx] = 0.0
-            self.q_target[idx] = self.qpos[idx, :6]
+            self._assign_target(grp, tgt)
+            self.q_target[grp] = self.qpos[grp, :6]
         mjw.forward(self.m, self.d)
         tcp, _ = self._tcp()
-        if self.mode == "place":
-            # phi_lift consistent with the seeded carry (no free first-step
-            # lift payout); phi tracks MAX lift
-            lift_cap = max(self.lift_req, 0.10)
-            self.phi_lift[idx] = self.max_lift[idx].clamp(0, lift_cap) / lift_cap
+        lift_cap = max(self.lift_req, 0.10)
+        self.phi_lift[idx] = self.max_lift[idx].clamp(0, lift_cap) / lift_cap
         self.phi_approach[idx] = -torch.norm(
             tcp[idx] - self._grasp_point()[idx], dim=-1)
         self.phi_transport[idx] = -torch.norm(
             self._obj_pos()[idx, :2] - self.place_target[idx], dim=-1)
-        if self.mode != "place":
-            self.phi_lift[idx] = 0.0
         op_i = self._obj_pos()[idx]
         rh_i = (op_i[:, 2] - float(self.half[2]) - self.target_h[idx])
         d_i = torch.norm(op_i[:, :2] - self.place_target[idx], dim=-1)
         self.phi_desc[idx] = -rh_i.clamp(min=0.0, max=0.40) * \
             torch.exp(-(d_i ** 2) / (2 * 0.07 ** 2))
+
+    def _assign_target(self, grp, tgt):
+        """Set xy target + sampled surface height (pedestal) for grp."""
+        self.place_target[grp] = tgt
+        n2 = grp.numel()
+        if self.mocap_ped >= 0:
+            elevated = torch.tensor(self.rng.random(n2) < 0.6,
+                                    device=self.device)
+            hh = torch.tensor(self.rng.uniform(0.04, 0.12, size=n2),
+                              device=self.device, dtype=torch.float32)
+            hh = torch.where(elevated, hh, torch.zeros_like(hh))
+            self.target_h[grp] = hh
+            self.mocap_pos[grp, self.mocap_ped, 0] = tgt[:, 0]
+            self.mocap_pos[grp, self.mocap_ped, 1] = tgt[:, 1]
+            self.mocap_pos[grp, self.mocap_ped, 2] = torch.where(
+                elevated, hh - 0.06, torch.full_like(hh, -0.5))
+        else:
+            self.target_h[grp] = 0.0
 
     # ---------------- suction ----------------
     # Suction = per-world compliant spring-damper (xfrc_applied) with a
@@ -414,10 +436,24 @@ class PickEnv:
             op = self._obj_pos()[idx]
             self.anchor[idx] = torch.einsum(
                 "nij,nj->ni", R[idx].transpose(1, 2), op - tcp[idx])
+            self.anchor_R[idx] = torch.einsum(
+                "nij,njk->nik", R[idx].transpose(1, 2), self._obj_R()[idx])
             self.sat_count[idx] = 0
             self.sealed[idx] = True
             self.ever_sealed[idx] = True
         return gate
+
+    def _obj_R(self):
+        """Object body rotation matrix from xquat (wxyz)."""
+        q = self.xquat[:, self.bid_obj]
+        w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        return torch.stack([
+            torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z),
+                         2 * (x * z + w * y)], -1),
+            torch.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z),
+                         2 * (y * z - w * x)], -1),
+            torch.stack([2 * (x * z - w * y), 2 * (y * z + w * x),
+                         1 - 2 * (x * x + y * y)], -1)], -2)
 
     def _obj_zaxis(self):
         q = self.xquat[:, self.bid_obj]                  # wxyz
@@ -434,7 +470,7 @@ class PickEnv:
         t = 2 * torch.cross(qv, w_b, dim=-1)
         return w_b + qw * t + torch.cross(qv, t, dim=-1)
 
-    K_ROT = 4.0               # N*m/rad righting stiffness
+    K_ROT = 20.0              # N*m/rad orientation stiffness (cap still TAU_CUP)
     C_ROT = 0.05              # N*m*s/rad
 
     def _apply_suction_force(self):
@@ -453,22 +489,37 @@ class PickEnv:
         F = F * scale
         m = self.sealed.float()[:, None]
         self.xfrc[:, self.bid_obj, :3] = F * m
-        # rotational spring: right the object's z-axis toward the CUP axis,
-        # capped at the peel-torque limit (single-cup wrench limit)
+        # rotational spring on the FULL latched orientation.  The old
+        # cross(objz, cupz) torque is perpendicular to the cup axis by
+        # construction -> ZERO yaw authority, so a sealed object could spin
+        # freely about the cup.  A real cup resists that through contact
+        # friction; hold the whole relative orientation instead.
         objz = self._obj_zaxis()
         cupz = -R[:, :, 2]                       # cup presses along -z
-        err = torch.cross(objz, cupz, dim=-1)
+        R_tgt = torch.einsum("nij,njk->nik", R, self.anchor_R)
+        E = torch.einsum("nij,nkj->nik", R_tgt, self._obj_R())
+        err = 0.5 * torch.stack([E[:, 2, 1] - E[:, 1, 2],
+                                 E[:, 0, 2] - E[:, 2, 0],
+                                 E[:, 1, 0] - E[:, 0, 1]], -1)
         # spring capped at the cup's holding limit; damping is applied as
         # direct exponential decay of the object's angular velocity below
         # (torque-based damping is either starved by the cap -- undamped
         # 70deg ringing -- or explicit-unstable for the box's tiny inertia)
-        Ts = self.K_ROT * err
-        Tmag = torch.norm(Ts, dim=-1, keepdim=True)
-        tscale = (TAU_CUP / Tmag.clamp(min=1e-6)).clamp(max=1.0)
-        self.xfrc[:, self.bid_obj, 3:] = Ts * tscale * m
+        # split the budget: PEEL (tilt, perpendicular to the cup axis) and
+        # TORSION (yaw, about it) are different physical limits, so capping
+        # one combined vector let a large yaw error starve tilt correction
+        n_ax = cupz / cupz.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        e_par = (err * n_ax).sum(-1, keepdim=True) * n_ax       # yaw
+        e_perp = err - e_par                                    # tilt
+        def _cap(v, lim):
+            mag = torch.norm(v, dim=-1, keepdim=True)
+            return v * (lim / mag.clamp(min=1e-6)).clamp(max=1.0)
+        Ts = _cap(self.K_ROT * e_perp, TAU_CUP) + \
+            _cap(self.K_ROT * e_par, TAU_TORSION)
+        self.xfrc[:, self.bid_obj, 3:] = Ts * m
         va = self.vadr_obj
         self.qvel[:, va + 3:va + 6] = torch.where(
-            self.sealed[:, None], self.qvel[:, va + 3:va + 6] * 0.82,
+            self.sealed[:, None], self.qvel[:, va + 3:va + 6] * 0.55,
             self.qvel[:, va + 3:va + 6])
         # peel = object actually hanging far off the cup axis (the capped
         # righting spring can no longer recover it), NOT mere cap saturation
@@ -500,6 +551,13 @@ class PickEnv:
             a = eff
         self.q_target = self.q_target + a[:, :6] * DQ_MAX
         want = a[:, 6] > 0
+        # suction hysteresis: a latched cup releases only after REL_N
+        # consecutive off-commands -- action flicker was causing transient
+        # seals and lost grips mid-pick
+        hold = self.sealed & ~want
+        self.rel_count = torch.where(
+            hold, self.rel_count + 1, torch.zeros_like(self.rel_count))
+        want = want | (hold & (self.rel_count < 3))
         if self.release_mask:
             # training aid: the cup does not let go >5 cm above the
             # target surface -- deletes the drop-from-height optimum.
@@ -507,7 +565,7 @@ class PickEnv:
             # the policy learns to TIME release, not lean on the mask.
             op_z = self.qpos[:, self.jadr_obj + 2]
             rest_now = op_z - float(self.half[2]) - self.target_h
-            self._masked_rel = self.sealed & ~want & (rest_now > 0.05)
+            self._masked_rel = self.sealed & ~want & (rest_now > self.mask_h) & self.mask_worlds
             want = want | self._masked_rel
         else:
             self._masked_rel = torch.zeros_like(self.sealed)
@@ -575,8 +633,9 @@ class PickEnv:
         C["approach"] = W["approach"] * torch.where(self.sealed, torch.zeros_like(phi_a),
                                                     phi_a - self.phi_approach)
         self.phi_approach = phi_a
-        # 2 alignment near contact (within 3 cm, pre-seal)
-        near = (~self.sealed) & (torch.norm(tcp - gp, dim=-1) < 0.03)
+        # 2 alignment near contact (within 3 cm, pre-FIRST-seal only:
+        # ~sealed allowed delaying the latch to farm align+press ~+4/ep)
+        near = (~self.ever_sealed) & (torch.norm(tcp - gp, dim=-1) < 0.03)
         align = (-R[:, 2, 2]).clamp(0, 1)               # 1 = cup facing down
         C["align"] = W["align"] * near.float() * align / CTRL_HZ
         # 3 press quality while commanding suction near the object
@@ -599,7 +658,7 @@ class PickEnv:
         C["transport"] = W["transport"] * carrying.float() * (phi_t - self.phi_transport)
         self.phi_transport = phi_t
         # 7 drop penalty: released or broke while far from bin and airborne
-        if self.mode in ("pnp", "place"):
+        if self.mode in ("pnp", "place", "carry", "mix"):
             over_bin = torch.norm(op[:, :2] - self.place_target, dim=-1) < PLACE_TOL
         else:
             over_bin = (torch.abs(op[:, 0] - self.bin_pos[0]) < BIN_HALF) & \
@@ -618,6 +677,17 @@ class PickEnv:
         # would score full contact-release credit)
         self.release_h = torch.where(released | broke, rest_h.clamp(min=0),
                                      self.release_h)
+        cup_tilt = torch.arccos((-R[:, 2, 2]).clamp(-1, 1))
+        self.release_cup_tilt = torch.where(released | broke, cup_tilt,
+                                            self.release_cup_tilt)
+        d_tgt_now = torch.norm(op[:, :2] - self.place_target, dim=-1)
+        # losing the grip far from the target was FREE -> latch-lose-retry
+        C["rel_far"] = W["rel_far"] * ((released | broke) &
+                                       (d_tgt_now > 2 * PLACE_TOL)).float()
+        # cup verticality while placing (sealed, over target, low)
+        placing = self.sealed & (d_tgt_now < 0.07) & (rest_h < 0.12)
+        C["place_align"] = W["place_align"] * placing.float() * \
+            (cup_tilt - 0.10).clamp(min=0)
         # 6b DENSE descend-to-surface: potential -rest_h weighted by a
         # smooth over-target gate -- the xy transport shaping never pulls
         # the object DOWN, so contact-release had no per-step gradient
@@ -628,9 +698,9 @@ class PickEnv:
             (phi_d - self.phi_desc)
         self.phi_desc = torch.where(self.sealed, phi_d, self.phi_desc)
         # 6c DENSE tilt discipline while the cup alone carries the object
-        C["tilt_pen"] = W["tilt_pen"] * airborne.float() * \
-            (tilt - 0.35).clamp(min=0)
-        if self.mode in ("pnp", "place"):
+        C["tilt_pen"] = self.tilt_pen_w * airborne.float() * \
+            (tilt - 0.30).clamp(min=0)
+        if self.mode in ("pnp", "place", "carry", "mix"):
             # penalize only AERIAL drops (relative to the TARGET surface)
             bad_drop = (released | broke) & (rest_h > 0.02)
         else:
@@ -655,7 +725,7 @@ class PickEnv:
         if self.mode == "attach":
             placed = self.sealed & (lift_h > 0.02)      # success = seal + lift
             timeout = self.t_step >= EP_LEN_ATTACH
-        elif self.mode in ("pnp", "place"):
+        elif self.mode in ("pnp", "place", "carry", "mix"):
             # GRADED placement: any gentle set-down (release at <1 cm lift,
             # object slow) ENDS the episode with reward 20*exp(-d^2/2s^2),
             # s = 5 cm -- smooth gradient toward the target from anywhere.
@@ -687,13 +757,16 @@ class PickEnv:
                 lift_ok = torch.ones_like(setdown)
                 lift_fac = torch.ones_like(self.max_lift)
             placed = setdown & (d_tgt < PLACE_TOL) & lift_ok & \
-                (self.release_h < 0.010) & (self.max_tilt < 0.44)  # 1cm, 25deg
+                (self.release_h < 0.010) & (self.max_tilt < 0.44) & \
+                (self.release_cup_tilt < 0.17)   # 1cm, 25deg, cup 10deg
             dist_g = torch.exp(-(d_tgt ** 2) / (2 * 0.05 ** 2))
+            vert_g = torch.exp(-(self.release_cup_tilt - 0.10).clamp(min=0)
+                               / 0.30)
             # cube root: three multiplicative near-zero grades starve PPO of
             # any terminal signal (product ~2e-4 from the warm start); the
             # geometric mean keeps every factor mandatory at a usable scale
             self._graded = setdown.float() * lift_fac * gentle * \
-                (contact_rel * tilt_g * dist_g).clamp(min=0) ** (1.0 / 3.0)
+                (contact_rel * tilt_g * dist_g * vert_g).clamp(min=0) ** 0.25
             if self.speed_bonus > 0:
                 self._graded = self._graded * (
                     1.0 + self.speed_bonus *
@@ -701,7 +774,7 @@ class PickEnv:
             timeout = self.t_step >= EP_LEN_PNP
         else:
             timeout = self.t_step >= EP_LEN
-        if self.mode in ("pnp", "place"):
+        if self.mode in ("pnp", "place", "carry", "mix"):
             C["place"] = W["place"] * getattr(self, "_graded",
                                               placed.float())
             done_setdown = self._graded > 0
@@ -723,7 +796,8 @@ class PickEnv:
                         self.qvel[:, self.vadr_obj:self.vadr_obj + 3], dim=-1),
                     target_h=self.target_h.clone(),
                     max_tilt=self.max_tilt.clone(),
-                    release_h=self.release_h.clone())
+                    release_h=self.release_h.clone(),
+                    wmode=self.wmode.clone())
         return r, done, info
 
 
