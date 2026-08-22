@@ -6,3 +6,10 @@ __pycache__/
 *.pyo
 # backups
 *.bak_*
+
+# large model artifacts (regenerable; exceed GitHub limits)
+*.engine
+*.onnx
+*_traced.pt
+pnp_export/
+pnp_runs_studio/
