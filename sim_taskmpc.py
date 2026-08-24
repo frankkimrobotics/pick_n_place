@@ -50,14 +50,22 @@ class TaskQP:
     posture regularization (pulls toward HOME = cup-vertical; uses the
     3-DOF redundancy without costing tracking; mu swept 2026-08-24:
     tilt p50 64->15 deg at identical final error) + wall constraint."""
-    def __init__(self, lam=1e-3, mu=2e-3):
+    def __init__(self, lam=1e-3, mu=0.0):
         self.lam = lam
         self.mu = mu
 
-    def solve(self, J, dx, x_tcp, q_now=None):
+    W_ROT = 1.20          # orientation-task weight (rad task vs m task)
+
+    def solve(self, J, dx, x_tcp, q_now=None, Jr=None, dw=None):
         n = 6
-        P = J.T @ J + (self.lam + self.mu) * np.eye(n)
-        q = -J.T @ dx
+        if Jr is not None:
+            # 6-row task: position + cup-axis alignment to surface normal
+            Jt = np.vstack([J, self.W_ROT * Jr])
+            xt = np.concatenate([dx, self.W_ROT * dw])
+        else:
+            Jt, xt = J, dx
+        P = Jt.T @ Jt + (self.lam + self.mu) * np.eye(n)
+        q = -Jt.T @ xt
         if q_now is not None and self.mu > 0:
             q = q - self.mu * (HOME - q_now)
         # box on dq + wall: e_x . (x + J dq) >= WALL_X + 0.05
@@ -86,11 +94,15 @@ def main():
     sid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "tcp")
     bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "object0")
     jadr = m.jnt_qposadr[m.body_jntadr[bid]]
-    half_z = float(m.geom_size[mujoco.mj_name2id(
-        m, mujoco.mjtObj.mjOBJ_GEOM, "object0"), 2])
+    ogid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "g_object0")
+    assert ogid >= 0, "object geom not found"
+    half_z = float(m.geom_size[ogid, 2])
     d.qpos[:6] = HOME
     d.qpos[jadr:jadr + 3] = [0.36, 0.05, half_z + 0.001]
     d.qpos[jadr + 3:jadr + 7] = [1, 0, 0, 0]
+    ped_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "pedestal")
+    if ped_bid >= 0 and m.body_mocapid[ped_bid] >= 0:
+        d.mocap_pos[m.body_mocapid[ped_bid]] = [0.0, 0.9, -0.5]   # park away
     mujoco.mj_forward(m, d)
     cup_gids = [g for g in range(m.ngeom)
                 if "cup" in (mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, g) or "")]
@@ -176,8 +188,17 @@ def main():
                 err = np.zeros(3)                     # deadband: don't chase noise
             dx = np.clip(0.6 * err, -0.03, 0.03)      # sub-unity task gain
             Jp = np.zeros((3, m.nv))
-            mujoco.mj_jacSite(m, d, Jp, None, sid)
-            dq = qp.solve(Jp[:, :6], dx, x_tcp, d.qpos[:6])
+            Jr = np.zeros((3, m.nv))
+            mujoco.mj_jacSite(m, d, Jp, Jr, sid)
+            # cup-axis alignment: rotate tool z onto -z_world (vertical
+            # approach = aligned surface normal); yaw stays free (the
+            # cross-product error has no component about the aligned axis)
+            Rt = d.site_xmat[sid].reshape(3, 3)
+            cup_axis = Rt[:, 2]
+            e_rot = np.cross(cup_axis, np.array([0.0, 0.0, -1.0]))
+            dw = np.clip(3.0 * e_rot, -0.30, 0.30)
+            dq = qp.solve(Jp[:, :6], dx, x_tcp, d.qpos[:6],
+                          Jr[:, :6], dw)
         q_ref = q_ref + dq
         # --- inner 250 Hz LQR + drive emulation ---
         for ki in range(int(OUTER_DT / INNER_DT)):
@@ -199,6 +220,9 @@ def main():
         logs["err"].append(te)
         logs["contact"].append(cup_contact_force())
         logs.setdefault("tcpz", []).append(float(d.site_xpos[sid][2]))
+        Rt2 = d.site_xmat[sid].reshape(3, 3)
+        logs.setdefault("tilt", []).append(float(np.degrees(
+            np.arccos(np.clip(-Rt2[2, 2], -1, 1)))))
         logs["phase"].append(phase)
         if ko % 2 == 0:                    # 25 fps video
             ren.update_scene(d, camera="fixed_d435", scene_option=vopt)
@@ -240,7 +264,9 @@ def main():
     ax.set_title("task-space error (cm)", fontsize=10)
     ax.set_xlabel("t (s)")
     ax = axes[3, 1]
-    ax.plot(T, logs["contact"], color="#956CB4")
+    ax.plot(T, logs["tilt"], color="#EE854A", label="cup tilt (deg)")
+    ax.plot(T, logs["contact"], color="#956CB4", label="contact (N)")
+    ax.legend(fontsize=8)
     ax.axhline(1.0, color="gray", ls=":", lw=1)
     ax.set_title("cup-object contact force (N)", fontsize=10)
     ax.set_xlabel("t (s)")
@@ -262,6 +288,8 @@ def main():
     print(f"phases reached: {sorted(set(logs['phase']), key=logs['phase'].index)}")
     print(f"post-move recovery peak task error: {mx*100:.1f} cm")
     print(f"contact detected at t={contact_t}s" if contact_t else "NO CONTACT")
+    ti = np.array(logs["tilt"])
+    print(f"cup tilt: p50 {np.percentile(ti,50):.1f} deg  max {ti.max():.1f} deg")
     print(f"outputs -> {a.out}")
 
 
