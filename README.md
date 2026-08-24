@@ -217,3 +217,119 @@ released_above_rim · placed.
   large wrist swings make it worse (hence the J6 limit in calibration).
 - `outputs/` (debug images, calibration JSON, recordings) is **git-ignored**.
 ```
+
+---
+
+## Controllers & sim twin (2026-08)
+
+Three control stacks, all validated on the MuJoCo twin (`rl/scenes/*.xml`,
+same model the RL trains on) with an emulated drive layer that reproduces the
+real arm's velocity-mode servo behavior. Environment for all sim scripts:
+the `mjwarp` conda env (`$PY = ~/miniconda3/envs/mjwarp/bin/python`).
+
+| Script | What it runs |
+|---|---|
+| `sim_taskmpc.py` | closed-loop task-space MPC demo: 50 Hz QP (position + cup-vertical orientation task, wall constraint, joint limits) → 250 Hz LQR → drives; moving-object tracking, contact stop, renders mp4 + cmd-vs-actual plots |
+| `compare_controllers.py` | cuRobo-v2 vs task-MPC vs pseudo-inverse on a touch task; `--trials N` randomized scenes, RMSE/time/tilt metrics |
+| `pick_place_compare.py` | FULL pick-and-place in clutter (suction weld, carried-volume-aware placement, contact release); hybrid cuRobo = plan transits / servo contacts |
+| `rl/eval_bench.py` | RL-policy benchmark ladder (see `rl/README.md`) |
+
+```bash
+$PY sim_taskmpc.py --out ~/pnp_rl/taskmpc          # demo + video + plots
+$PY compare_controllers.py --trials 100 --workers 6
+$PY pick_place_compare.py --trials 30 --workers 6 --only taskmpc
+# cuRobo variants need the planner server (curobo2 env) on :9997:
+cd ../frankkimrobotics/ros2_mycobot/src/mycobot_description/curobo && \
+  ~/miniconda3/envs/curobo2/bin/python curobo_planner_server_v2.py
+```
+
+Headline results (30 randomized cluttered scenes each): task-MPC 100%
+(10.7 s, 0.5 cm), hybrid cuRobo 100% (19.6 s, 0.8 cm), pinv 20%.
+Key rules encoded in the harnesses: reference rate strictly below the layer
+beneath; anti-windup clamp to measured state; joint POSITION limits +
+nullspace limit-avoidance in the task layer; planners only for free-space
+transits (near-contact plan failures compound); seal welds at the CURRENT
+relative pose (latch-jolt).
+
+---
+
+## Real robot — complete start procedure
+
+Hardware chain: desktop ⇄ Raspberry Pi (`pi@10.0.0.27`, or Tailscale
+`100.124.53.41`; password `elephant`) ⇄ LinuxCNC + `robot_hal.py` ⇄ STM32
+drives. RoboFlow touchscreen login: Admin / `elephant`.
+
+### 1. Power & hardware start
+1. Flip the robot's main power switch.
+2. **Press the START button on the base** and wait for the servo *click*
+   (drive relay). Without it the STM32 never reports `svr_poweroned` and no
+   software can move the arm.
+3. The Pi boots with the stock RoboFlow stack auto-started — it must be
+   stopped before launching ours.
+
+### 2. Launch the control stack (on the Pi)
+```bash
+ssh pi@10.0.0.27                      # password: elephant
+# stop the stock stack + clear stale state (REQUIRED before every launch):
+pkill -9 -f RoboFlow; pkill -9 -f linuxcnc; pkill -9 milltask; pkill -9 rtapi_app
+rm -f /tmp/linuxcnc.lock
+cd ~/Desktop/mpc
+linuxcnc elerob.ini                   # GUI variant (robot monitor), or:
+linuxcnc elerob_headless.ini          # headless (linuxcncrsh on :5007)
+```
+`robot_hal.py` is auto-loaded by the HAL file and **self-initializes
+everything**: drive power-on → motor init (watch for "joint 1..6 init
+success") → servo enable → machine-on → command preload → "Waiting for
+commands". Ports: `:9998` command (`{"target_deg":[6 lcnc deg],
+"duration":s,"controller":"pid|mpc|pd_velff"}`), `:9999` 100 Hz state
+stream (joints + torque). Headless variant additionally needs homing:
+`set home -1` via linuxcncrsh `:5007`.
+
+robot_hal includes the **idle hold mode** (re-servos the last target at
+idle; without it the arm sags ~0.4°/s and the drives ferror-trip) and the
+**lag-aware LQR `mpc` controller** (sim-tuned, zero overshoot — see
+`../mycobot_mpc/README.md`).
+
+### 3. Verify before ANY motion (from the desktop)
+```bash
+# probe: 1 deg on J1, confirm the stream actually moves
+python3 - <<'PY'
+import socket, json, time
+q = json.loads(socket.create_connection(("10.0.0.27",9999),3).makefile().readline())["joints_deg"]
+t = list(q); t[0] += 1.0
+s = socket.create_connection(("10.0.0.27",9998),3)
+s.sendall((json.dumps({"target_deg":t,"duration":2.0,"controller":"pid"})+"\n").encode())
+time.sleep(3)
+q2 = json.loads(socket.create_connection(("10.0.0.27",9999),3).makefile().readline())["joints_deg"]
+print("moved:", round(q2[0]-q[0],2), "deg  ->", "OK" if abs(q2[0]-q[0])>0.4 else "NOT MOVING")
+PY
+```
+**Never send large motions to an unverified stack** — commands to frozen
+drives wind the PID integral into a violent-jump hazard.
+
+### 4. Run the hardware scripts (desktop)
+```bash
+# cuRobo planner (desktop GPU) — needed by real_touch:
+cd ../frankkimrobotics/.../curobo && ~/miniconda3/envs/curobo2/bin/python curobo_planner_server_v2.py &
+
+python3 real_touch.py                          # dry-run plan (touch demo)
+python3 real_touch.py --exec --obj X,Y,TOPZ    # execute (slow, logged, plotted)
+python3 real_ctrl_validate.py --exec           # pid-vs-mpc validation protocol
+PYTHONPATH=~/librealsense/build/release python3 policy/rs_shm_server.py &   # cameras
+~/miniconda3/envs/mjwarp/bin/python policy/real_student.py --exec --slow 3  # vision policy
+```
+
+### 5. Shutdown
+Send the arm home, then either Ctrl-C the interactive linuxcnc (robot_hal
+powers the drives off cleanly) or `pkill -f linuxcnc`, then switch off the
+base. **Do not leave the arm enabled and unattended raised**: the servo
+enable is known to drop spontaneously (suspected 48 V path, inspection
+pending) and the arm sags until the brakes catch.
+
+### Known hardware caveats (2026-08)
+* Servo-enable hold-time degrades across soft restarts; a full power cycle
+  resets it. Time-box sessions.
+* Fixed D435 mount was rebuilt — **re-run `calib_d435.py` before trusting
+  detections** (`d435_detect.py --board` self-check).
+* Drive velocity ceiling ≈ 36 °/s (STM32 firmware) — all controllers and
+  cuRobo joint-velocity limits must respect it.
