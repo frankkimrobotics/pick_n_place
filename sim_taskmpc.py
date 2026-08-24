@@ -40,7 +40,9 @@ TRACK_DT = 1.0 / 6.0        # 6 Hz object tracker
 K_LQR = np.array([53.4798, 4.7131])          # deployed gains (deg units)
 VEL_LIMIT = np.radians(40.0)
 KV_DRIVE = 40.0
-DQ_MAX = np.radians(1.2)    # per outer tick (60 deg/s task-layer ceiling)
+DQ_MAX = np.radians(0.7)    # per outer tick (35 deg/s -- UNDER the 40
+                            # deg/s inner/drive ceiling: the ref must
+                            # never outrun the arm or it rubber-bands)
 WALL_X = -0.30
 HOME = np.radians([0.0, -20.0, 80.0, 10.0, -90.0, 0.0])  # URDF-frame home
 
@@ -200,6 +202,9 @@ def main():
             dq = qp.solve(Jp[:, :6], dx, x_tcp, d.qpos[:6],
                           Jr[:, :6], dw)
         q_ref = q_ref + dq
+        # anti-windup: the reference may never stretch far from the arm
+        q_ref = np.clip(q_ref, d.qpos[:6] - np.radians(2.0),
+                        d.qpos[:6] + np.radians(2.0))
         # --- inner 250 Hz LQR + drive emulation ---
         for ki in range(int(OUTER_DT / INNER_DT)):
             e_deg = np.degrees(d.qpos[:6] - q_ref)
@@ -288,6 +293,10 @@ def main():
     print(f"phases reached: {sorted(set(logs['phase']), key=logs['phase'].index)}")
     print(f"post-move recovery peak task error: {mx*100:.1f} cm")
     print(f"contact detected at t={contact_t}s" if contact_t else "NO CONTACT")
+    zs = np.array(logs["tcpz"])
+    vz = np.diff(zs)
+    rev = int(np.sum(np.abs(np.diff(np.sign(vz[np.abs(vz) > 1e-4])) ) > 0))
+    print(f"z-direction reversals over run (springiness proxy): {rev}")
     ti = np.array(logs["tilt"])
     print(f"cup tilt: p50 {np.percentile(ti,50):.1f} deg  max {ti.max():.1f} deg")
     print(f"outputs -> {a.out}")
