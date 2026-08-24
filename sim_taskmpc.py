@@ -130,7 +130,11 @@ def main():
         # --- 6 Hz tracker with one-sample lag + noise ---
         if t - last_track >= TRACK_DT:
             if pend_track is not None:
-                tracked_obj = pend_track
+                # EMA filter: smooth tracker noise; jump-detect for real moves
+                if np.linalg.norm(pend_track - tracked_obj) > 0.02:
+                    tracked_obj = pend_track          # genuine displacement
+                else:
+                    tracked_obj = 0.7 * tracked_obj + 0.3 * pend_track
             pend_track = d.xpos[bid].copy() + np.random.normal(0, 0.002, 3)
             last_track = t
         # --- task goal per phase ---
@@ -161,7 +165,10 @@ def main():
             dq = np.clip(HOME - q_ref, -DQ_MAX, DQ_MAX)
         else:
             x_tcp = d.site_xpos[sid].copy()
-            dx = np.clip(x_goal - x_tcp, -0.03, 0.03)
+            err = x_goal - x_tcp
+            if np.linalg.norm(err) < 0.004 and phase != "descend":
+                err = np.zeros(3)                     # deadband: don't chase noise
+            dx = np.clip(0.6 * err, -0.03, 0.03)      # sub-unity task gain
             Jp = np.zeros((3, m.nv))
             mujoco.mj_jacSite(m, d, Jp, None, sid)
             dq = qp.solve(Jp[:, :6], dx, x_tcp)
@@ -241,6 +248,10 @@ def main():
         print(f"descend: min task err {np.array(logs['err'])[des].min()*100:.2f} cm, "
               f"max contact {np.array(logs['contact'])[des].max():.3f}, "
               f"tcp z min {min(z for z, p in zip([q for q in logs['tcpz']], ph) if p=='descend'):.4f}")
+    steady = [z for z, p, e in zip(logs["tcpz"], logs["phase"], logs["err"])
+              if p == "approach" and e < 0.01]
+    if len(steady) > 25:
+        print(f"steady-hover tcp-z jitter: {np.std(steady)*1000:.2f} mm std")
     mx = max(logs["err"][int(3.0/OUTER_DT):int(4.5/OUTER_DT)])
     print(f"phases reached: {sorted(set(logs['phase']), key=logs['phase'].index)}")
     print(f"post-move recovery peak task error: {mx*100:.1f} cm")
