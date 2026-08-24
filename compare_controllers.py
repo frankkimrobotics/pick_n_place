@@ -93,8 +93,18 @@ class Sim:
                 mujoco.mj_step(self.m, self.d)
 
 
-def run_case(ctrl, moving, T=12.0):
+def run_case(ctrl, moving, T=12.0, seed=0):
+    rng = np.random.default_rng(seed)
+    np.random.seed(seed)
     sim = Sim()
+    # per-trial scene randomization: object start + displacement vector
+    ox = rng.uniform(0.30, 0.44)
+    oy = rng.uniform(-0.10, 0.10)
+    sim.d.qpos[sim.jadr:sim.jadr + 2] = [ox, oy]
+    mujoco.mj_forward(sim.m, sim.d)
+    dxy = rng.uniform(-0.06, 0.06, 2)
+    if np.linalg.norm(dxy) < 0.03:
+        dxy = np.array([0.05, -0.03])
     d, m, sid = sim.d, sim.m, sim.sid
     q_ref = d.qpos[:6].copy()
     tracked = d.xpos[sim.bid].copy()
@@ -107,12 +117,15 @@ def run_case(ctrl, moving, T=12.0):
 
     def plan_to(x):
         t0 = time.perf_counter()
-        r = rpc({"type": "plan_pose", "start_q": [float(v) for v in d.qpos[:6]],
-                 "goal_pose": [float(v) for v in x] + DOWN, "max_attempts": 6})
-        wall = time.perf_counter() - t0
-        if not r.get("success"):
-            return None, wall
-        return np.array(r["trajectory"]), wall
+        for attempt in range(2):                  # retry: server can fail
+            r = rpc({"type": "plan_pose",         # transiently under load
+                     "start_q": [float(v) for v in d.qpos[:6]],
+                     "goal_pose": [float(v) for v in x] + DOWN,
+                     "max_attempts": 6})
+            if r.get("success"):
+                return np.array(r["trajectory"]), time.perf_counter() - t0
+            time.sleep(0.5)
+        return None, time.perf_counter() - t0
 
     if ctrl == "curobo":
         hover = tracked + np.array([0, 0, sim.half_z + 0.06])
@@ -123,8 +136,8 @@ def run_case(ctrl, moving, T=12.0):
     for ko in range(n):
         t = ko * OUTER_DT
         if moving and t > 1.5 and not moved:
-            d.qpos[sim.jadr] += 0.06
-            d.qpos[sim.jadr + 1] -= 0.04
+            d.qpos[sim.jadr] += dxy[0]
+            d.qpos[sim.jadr + 1] += dxy[1]
             mujoco.mj_forward(m, d)
             moved = True
         if t - last_track >= TRACK_DT:
@@ -213,23 +226,58 @@ def run_case(ctrl, moving, T=12.0):
                 success=contact_t is not None)
 
 
+def _one(args):
+    ctrl, moving, seed = args
+    try:
+        return run_case(ctrl, moving, seed=seed)
+    except Exception as e:
+        return dict(ctrl=ctrl, moving=moving, success=False,
+                    contact_t=float("nan"), rmse_deg=float("nan"),
+                    tilt_p50=float("nan"), reversals=0, comp_ms=0.0,
+                    task_err_mean=float("nan"), error=str(e)[:60])
+
+
 def main():
-    np.random.seed(0)
+    import argparse
+    from concurrent.futures import ProcessPoolExecutor
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--trials", type=int, default=100)
+    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--only", default=None)
+    ap.add_argument("--merge", default=None)
+    a = ap.parse_args()
+    ctrls = [a.only] if a.only else ["curobo", "taskmpc", "pinv"]
+    jobs = [(ctrl, moving, 1000 + i)
+            for moving in (False, True)
+            for ctrl in ctrls
+            for i in range(a.trials)]
     rows = []
-    print(f"{'case':7s} {'controller':9s} {'contact_s':>9} {'RMSE_deg':>9} "
-          f"{'task_err':>9} {'tilt_p50':>8} {'revs':>5} {'comp_ms':>8} {'ok':>3}")
+    with ProcessPoolExecutor(max_workers=a.workers) as ex:
+        for k, r in enumerate(ex.map(_one, jobs)):
+            rows.append(r)
+            if (k + 1) % 60 == 0:
+                print(f"  {k+1}/{len(jobs)} trials done", flush=True)
+    if a.merge:
+        prev = json.load(open(os.path.expanduser(a.merge)))
+        rows = [r for r in prev if r["ctrl"] not in ctrls] + rows
+    json.dump(rows, open(os.path.expanduser("~/pnp_rl/ctrl_compare_100.json"),
+                         "w"), indent=1)
+    print(f"{'case':7s} {'controller':9s} {'succ':>6} {'contact_s':>12} "
+          f"{'RMSE_deg':>12} {'tilt_p50':>9} {'revs':>6}")
     for moving in (False, True):
         for ctrl in ("curobo", "taskmpc", "pinv"):
-            r = run_case(ctrl, moving)
-            rows.append(r)
+            rs = [r for r in rows if r["ctrl"] == ctrl and r["moving"] == moving]
+            ok = [r for r in rs if r["success"]]
+            ct = np.array([r["contact_t"] for r in ok]) if ok else np.array([np.nan])
+            rm = np.array([r["rmse_deg"] for r in rs if r["rmse_deg"] == r["rmse_deg"]])
+            tl = np.array([r["tilt_p50"] for r in rs if r["tilt_p50"] == r["tilt_p50"]])
+            rv = np.array([r["reversals"] for r in rs])
             print(f"{'moving' if moving else 'static':7s} {ctrl:9s} "
-                  f"{r['contact_t']:9.2f} {r['rmse_deg']:9.2f} "
-                  f"{r['task_err_mean']*100 if r['task_err_mean']==r['task_err_mean'] else float('nan'):8.1f}c "
-                  f"{r['tilt_p50']:7.1f}d {r['reversals']:5d} "
-                  f"{r['comp_ms']:8.2f} {'Y' if r['success'] else 'N':>3}")
-    json.dump(rows, open(os.path.expanduser("~/pnp_rl/ctrl_compare.json"), "w"),
-              indent=1)
-    print("\nsaved ~/pnp_rl/ctrl_compare.json")
+                  f"{len(ok)/max(1,len(rs)):6.0%} "
+                  f"{np.nanmean(ct):6.2f}±{np.nanstd(ct):4.2f} "
+                  f"{rm.mean():6.2f}±{rm.std():4.2f} "
+                  f"{tl.mean():8.1f} {rv.mean():6.0f}")
+    print("\nsaved ~/pnp_rl/ctrl_compare_100.json")
 
 
 if __name__ == "__main__":
