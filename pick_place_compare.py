@@ -41,6 +41,10 @@ KV = 40.0
 DQ_MAX = np.radians(0.7)
 HOME = np.radians([0.0, -20.0, 80.0, 10.0, -90.0, 0.0])
 DOWN = [0.0, 1.0, 0.0, 0.0]
+# joint position limits (elbow box from the real robot / cuRobo config):
+# the task layer must never hand the planner -- or the hardware -- a
+# limit-violating state
+Q_LIM = np.radians([175.0, 69.0, 144.0, 175.0, 175.0, 175.0])
 PLACE_TOL = 0.035
 
 
@@ -171,18 +175,27 @@ def task_step(sim, x_goal, q_ref, ctrl):
     dw = np.clip(3.0 * np.cross(Rt[:, 2], [0.0, 0.0, -1.0]), -0.3, 0.3)
     Jt = np.vstack([Jp[:, :6], 1.2 * Jr[:, :6]])
     xt = np.concatenate([dx, 1.2 * dw])
+    # joint-limit AVOIDANCE (not just clipping): when a joint nears its
+    # limit, bias the solution away from it -- limit-blind least squares
+    # rides the clamp and converts 'descend' into lateral sliding
+    qn = d.qpos[:6]
+    near = np.abs(qn) > 0.82 * Q_LIM
+    lim_bias = np.where(near, -0.15 * (qn - 0.82 * Q_LIM * np.sign(qn)), 0.0)
     if ctrl == "taskmpc":
         P = Jt.T @ Jt + 1e-3 * np.eye(6)
         s = osqp.OSQP()
-        s.setup(sparse.csc_matrix((P + P.T) / 2), -Jt.T @ xt,
+        s.setup(sparse.csc_matrix((P + P.T) / 2), -Jt.T @ xt - 1e-3 * lim_bias,
                 sparse.csc_matrix(np.eye(6)), np.full(6, -DQ_MAX),
                 np.full(6, DQ_MAX), verbose=False, max_iter=200)
         r = s.solve()
         dq = r.x if r.info.status.startswith("solved") else np.zeros(6)
     else:
         Jd = Jt.T @ np.linalg.inv(Jt @ Jt.T + 2e-3 * np.eye(6))
-        dq = np.clip(Jd @ xt, -DQ_MAX, DQ_MAX)
+        dq = Jd @ xt
+        N = np.eye(6) - Jd @ Jt
+        dq = np.clip(dq + N @ lim_bias, -DQ_MAX, DQ_MAX)
     q_ref = q_ref + dq
+    q_ref = np.clip(q_ref, -Q_LIM, Q_LIM)          # joint position limits
     return np.clip(q_ref, d.qpos[:6] - np.radians(2.0),
                    d.qpos[:6] + np.radians(2.0))
 
@@ -215,6 +228,8 @@ def run_trial(ctrl, seed, T=60.0):
         return None, time.perf_counter() - t0
 
     if ctrl == "curobo":
+        rpc({"type": "detach"})          # defensive: failed trials may
+        rpc({"type": "clear_world"})     # leave sticky server state
         # world = clutter distractors (target excluded: we must touch it)
         cubs = []
         for k in range(1, 4):
@@ -228,7 +243,7 @@ def run_trial(ctrl, seed, T=60.0):
                                   1, 0, 0, 0]})
         rpc({"type": "set_world", "cuboids": cubs})
 
-    hover_h, carry_h = 0.06, 0.08
+    hover_h, carry_h = 0.06, 0.13
     n = int(T / OUTER_DT)
     for ko in range(n):
         t = ko * OUTER_DT
@@ -268,12 +283,10 @@ def run_trial(ctrl, seed, T=60.0):
                 held = True
                 phase = "lift"
                 if ctrl == "curobo":
-                    p0 = d.xpos[sim.bids[0]]
-                    rpc({"type": "attach",
-                         "grasp_q": [float(v) for v in d.qpos[:6]],
-                         "dims": [2 * float(v) for v in sim.dims[0]],
-                         "obj_pose": [float(p0[0]), float(p0[1]),
-                                      float(p0[2]), 1, 0, 0, 0]})
+                    # NOTE: planner-side attach (held-object spheres) is
+                    # trajopt-unstable in this server build; the carried
+                    # volume is instead handled geometrically -- transit
+                    # altitude keeps the held box above all clutter tops
                     traj = None
         elif phase == "lift":
             x_goal = np.array([d.site_xpos[sid][0], d.site_xpos[sid][1],
@@ -286,7 +299,7 @@ def run_trial(ctrl, seed, T=60.0):
             x_goal = np.array([sim.place[0], sim.place[1],
                                carry_h + sim.tgt_h])
             if ctrl == "curobo":
-                x_goal[2] = 0.05 + sim.tgt_h      # pre-place altitude
+                x_goal[2] = 0.11 + sim.tgt_h      # pre-place altitude (held-box spheres need clutter clearance)
             if np.linalg.norm(d.site_xpos[sid][:2] - sim.place) < 0.015:
                 phase = "place"
                 traj = None
@@ -299,7 +312,6 @@ def run_trial(ctrl, seed, T=60.0):
                 held = False
                 phase = "retreat"
                 if ctrl == "curobo":
-                    rpc({"type": "detach"})
                     traj = None
         elif phase == "retreat":
             x_goal = np.array([sim.place[0], sim.place[1], 0.20])
@@ -310,10 +322,14 @@ def run_trial(ctrl, seed, T=60.0):
             x_goal = d.site_xpos[sid].copy()
 
         # ---------- controller ----------
-        if ctrl == "curobo" and phase == "place":
-            # planners refuse colliding end states: plan got us to
-            # pre-place; the last cm is a direct downward reference nudge
-            q_ref = task_step(sim, x_goal, q_ref, "pinv")
+        if ctrl == "curobo" and phase in ("descend", "lift", "place"):
+            # HYBRID: cuRobo plans only the free-space transits (approach,
+            # transport); the contact-proximal short strokes (grasp
+            # descend, lift, final place) use the simple task controller --
+            # planners refuse near-contact end states and these plans were
+            # the failure-prone ones
+            q_ref = task_step(sim, x_goal, q_ref, "taskmpc")
+            traj = None
         elif ctrl == "curobo" and phase != "done":
             # plan-then-execute semantics: goal frozen per phase; replan
             # only on phase change or a real (>2 cm) goal displacement
