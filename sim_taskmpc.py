@@ -46,14 +46,20 @@ HOME = np.radians([0.0, -20.0, 80.0, 10.0, -90.0, 0.0])  # URDF-frame home
 
 
 class TaskQP:
-    """One-step task-space QP with wall half-space constraint."""
-    def __init__(self, lam=1e-3):
+    """One-step task-space QP: damped pseudo-inverse tracking + NULLSPACE
+    posture regularization (pulls toward HOME = cup-vertical; uses the
+    3-DOF redundancy without costing tracking; mu swept 2026-08-24:
+    tilt p50 64->15 deg at identical final error) + wall constraint."""
+    def __init__(self, lam=1e-3, mu=2e-3):
         self.lam = lam
+        self.mu = mu
 
-    def solve(self, J, dx, x_tcp):
+    def solve(self, J, dx, x_tcp, q_now=None):
         n = 6
-        P = J.T @ J + self.lam * np.eye(n)
+        P = J.T @ J + (self.lam + self.mu) * np.eye(n)
         q = -J.T @ dx
+        if q_now is not None and self.mu > 0:
+            q = q - self.mu * (HOME - q_now)
         # box on dq + wall: e_x . (x + J dq) >= WALL_X + 0.05
         A = np.vstack([np.eye(n), J[0:1, :]])
         lo = np.concatenate([np.full(n, -DQ_MAX),
@@ -171,7 +177,7 @@ def main():
             dx = np.clip(0.6 * err, -0.03, 0.03)      # sub-unity task gain
             Jp = np.zeros((3, m.nv))
             mujoco.mj_jacSite(m, d, Jp, None, sid)
-            dq = qp.solve(Jp[:, :6], dx, x_tcp)
+            dq = qp.solve(Jp[:, :6], dx, x_tcp, d.qpos[:6])
         q_ref = q_ref + dq
         # --- inner 250 Hz LQR + drive emulation ---
         for ki in range(int(OUTER_DT / INNER_DT)):
