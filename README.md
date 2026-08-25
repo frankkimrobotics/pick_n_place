@@ -249,7 +249,36 @@ Key rules encoded in the harnesses: reference rate strictly below the layer
 beneath; anti-windup clamp to measured state; joint POSITION limits +
 nullspace limit-avoidance in the task layer; planners only for free-space
 transits (near-contact plan failures compound); seal welds at the CURRENT
-relative pose (latch-jolt).
+relative pose (latch-jolt); scale dq UNIFORMLY, never clip per joint (a
+per-joint box bends the task direction as its active set flips -> ~5 Hz
+visible chatter; verified by band-split FFT of tcp accel — raw jerk metrics
+are dominated by invisible >12.5 Hz content) and rate-limit descent strokes
+(z <= 8 mm/tick) so the scaler never starves the xy correction.
+
+Extras: `render_mpc_demo.py --ctrl {taskmpc,lagmpcN,pinv,curobo}` renders
+any controller on a chosen scene (`--seed0`); `lagmpcN` = explicit
+lag-aware MPC inner loop (N=25 prediction steps @ 4 ms) executing N ticks
+open-loop before re-solving — exec sweep on one scene: 1 -> 12.1 s,
+2 -> 15.1 s, 8 -> 73.7 s (stale plans dominate, not horizon softness).
+
+## BC-mystery replication (`bc_mystery/`, 2026-08)
+
+Replication harness for seohong.me/blog/behavioral-cloning-mystery on the
+batched mujoco_warp PickEnv (training deferred; see `bc_mystery/PLAN.md`):
+
+```bash
+$PY bc_mystery/collect.py --episodes 2048 --out ~/pnp_bc/shard0  # demos
+$PY bc_mystery/evaluate.py --policy expert                       # anchors
+$PY bc_mystery/render_demo.py --episodes 6                       # video
+```
+
+`collect.py` = randomized Catmull-Rom spline expert (waypoint/speed/
+suction jitter) tracked by batched DLS with event gates (pin-until-sealed
+press, lift gate mid-transit, rest-height release). Expert: seal ~90%,
+V1=V2=V3 ~53%, d_p50 1.4 cm on the eval_bench ladder. `evaluate.py` =
+closed-loop harness, pluggable `act(obs[N,37]) -> [N,K,7]`, chunk/exec/
+history knobs, offline action-MSE probe (zero policy: half of random's
+MSE, same 0% success — Mystery 1 visible before any training).
 
 ---
 
