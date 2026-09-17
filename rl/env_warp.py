@@ -109,7 +109,8 @@ class PickEnv:
                  mode="full", dr=False, target_max=0.30,
                  lift_req=0.0, speed_bonus=0.0, release_mask=False,
                  mask_h=0.05, tilt_pen_w=None, drive="real", dq_max_deg=None,
-                 obs_lag=None, hover_range=(0.02, 0.04), smooth_w=None, transport_w=None):
+                 obs_lag=None, hover_range=(0.02, 0.04), smooth_w=None, transport_w=None,
+                 descend_sigma=0.07):
         """mode='attach': staged sub-task -- episodes START with the cup
         hovering 2-4 cm above the (jittered) grasp point; success = seal +
         hold + 2 cm lift within a 40-step episode. mode='full': whole task."""
@@ -132,6 +133,7 @@ class PickEnv:
         self.hover_range = tuple(hover_range)   # attach/pnp start height of the cup above the grasp point (m)
         self.smooth_w = W["smooth"] if smooth_w is None else float(smooth_w)
         self.transport_w = W["transport"] if transport_w is None else float(transport_w)
+        self.descend_sigma = float(descend_sigma)   # xy gate width of the descend potential (m)
         self.rng = np.random.default_rng(seed)
         if xml is None:
             xml = os.path.join(HERE, "_scene_rl.xml")
@@ -840,7 +842,7 @@ class PickEnv:
         # the object DOWN, so contact-release had no per-step gradient
         d_now = torch.norm(op[:, :2] - self.place_target, dim=-1)
         phi_d = -rest_h.clamp(min=0.0, max=0.40) * \
-            torch.exp(-(d_now ** 2) / (2 * 0.07 ** 2))
+            torch.exp(-(d_now ** 2) / (2 * self.descend_sigma ** 2))
         C["descend"] = W["descend"] * self.sealed.float() * \
             (phi_d - self.phi_desc)
         self.phi_desc = torch.where(self.sealed, phi_d, self.phi_desc)
