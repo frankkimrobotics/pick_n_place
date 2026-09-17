@@ -46,11 +46,12 @@ class PaperPickEnv(PickEnv):
                  ep_len=100, w_reach=1.0, w_lift=2.0, w_track_c=2.0, w_track_f=4.0,
                  sigma_reach=0.25, sigma_c=0.10, sigma_f=0.02, h_min=0.02,
                  lambda_max=0.02, goal_z=(0.05, 0.25), succ_tol=0.035, grasp_shaping=True,
-                 w_press=0.5, w_seal=2.0, **kw):
+                 w_press=0.5, w_seal=2.0, obs_ee=True, **kw):
         self.paper = dict(ep_len=int(ep_len), w_reach=w_reach, w_lift=w_lift, w_track_c=w_track_c,
                           w_track_f=w_track_f, sigma_reach=sigma_reach, sigma_c=sigma_c, sigma_f=sigma_f,
                           h_min=h_min, lambda_max=lambda_max, goal_z=tuple(goal_z), succ_tol=succ_tol,
-                          start=start, grasp_shaping=bool(grasp_shaping), w_press=w_press, w_seal=w_seal)
+                          start=start, grasp_shaping=bool(grasp_shaping), w_press=w_press, w_seal=w_seal,
+                          obs_ee=bool(obs_ee))
         self.reg_lambda = 0.0                     # set by the trainer: lambda(t) curriculum
         self._paper_ready = False
         super().__init__(nworld=nworld, device=device, seed=seed, xml=xml, mode="pnp", dr=dr,
@@ -94,6 +95,12 @@ class PaperPickEnv(PickEnv):
     # ---------------- observation (paper eq. 1) ----------------
     def observe(self):
         parts = [self.qpos[:, :6], self.qvel[:, :6], self._obj_pos(), self.goal, self.a_prev]
+        if self.paper["obs_ee"]:
+            # OBSERVATION EXTENSION (not in the paper): end-effector position, cup axis and the
+            # object-relative vector. The paper's 5-DoF SO-101 policy learns FK implicitly; with
+            # [q, p_obj] alone our 6-DoF policies plateaued ~10 cm from the object (paper2_*).
+            tcp, R = self._tcp()
+            parts += [tcp, R[:, :, 2], self._grasp_point() - tcp]
         if self.obs_lag:
             parts.append(self.q_target - self.qpos[:, :6])
         obs = torch.cat(parts, dim=-1)
