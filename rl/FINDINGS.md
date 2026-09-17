@@ -214,6 +214,23 @@ contact-release grade is only sampled below the mask. Relaunched from the 8M che
 as `rd_mix2_*` with `--mask_h 0.05` (the graded Laplace contact factor takes over from
 there: release at 5 cm = 0.54) and `--descend_sigma 0.15` (new flag).
 
+### mix2 result and the recommended next move (2026-09-17, end of session)
+
+`rd_mix2_real` (5 cm mask, 15 cm descend gate): placements appear — 1.6–2.0 % success
+(0.8–1.1 % in pnp worlds), graded set-down credit 5.3/ep, episodes 42 steps — and plateau
+there by 5M steps. `rd_mix2_ideal`: still 0 %, never releases (100-step timeouts). Both runs
+were left to finish 16M steps; check `~/pnp_rl/rd_mix2_*/log.jsonl`.
+
+Reading of the day: under the post-ppo4 reward code the full task no longer assembles from
+the attach skill by exploration on either drive, and each dense-term fix moves the stall by
+a few centimetres. The one route that worked today was the scripted-teacher bootstrap
+(attach: 0 % → 63.6 %). **Recommended next step: extend `rl/bc_bootstrap.py` to the full
+pick-and-place** (scripted descend → seal → lift 5 cm → IK carry to the target → lower →
+release at contact, per-world IK, DR on), clone the successful episodes, then PPO in mix
+mode from that init. It injects the whole behaviour, so PPO only has to refine timing and
+placement accuracy — the regime in which the graded terminals are known to work
+(ppo4/5/7).
+
 ## Plan from here (2026-09-17)
 
 Ordered by expected payoff; each step is a from-scratch or warm-chain run in the
