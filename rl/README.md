@@ -55,6 +55,14 @@ vector. With the paper's `[q, q̇, p_obj, p_goal, a_prev]` alone (5-DoF SO-101 i
 here) both drives plateaued with the cup ~10 cm from the object and never pressed (`paper2_*`).
 `--obs_ee 0` gives the paper's observation.
 
+Reach target (`--reach_target grasp`, default): the paper's reach term measures distance to the
+object *centre*; a suction cup then descends beside the box (replay of `paper3_ideal`: tcp below
+the top, cup tilted 30–43°). `grasp` = top centre + cup radius. `--reach_target centre` = paper.
+
+Bootstrap: `rl/bc_paper.py` clones a scripted reach → press → seal → lift → carry-to-goal teacher
+(same reasoning as the attach bootstrap: the sustained press is not discoverable), then
+`ppo.py --env paper --init ~/pnp_rl/bc_paper_real/bc_init.pt ...` refines.
+
 ```bash
 $PY rl/env_paper.py --nworld 512 --steps 30 --drive real         # smoke test
 $PY rl/ppo.py --env paper --arch paper --nworld 2048 --steps 8000000 --rollout 24 --epochs 5 \
