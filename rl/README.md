@@ -15,6 +15,16 @@ Environment: conda env with `mujoco`, `mujoco_warp`, `warp-lang`, `torch`
 $PY rl/drive_probe.py --drive real     # 10 deg step + 12 deg 0.5 Hz sine vs the 2026-09-17 hardware numbers
 ```
 
+## Measured-drive attach bootstrap (behaviour cloning)
+
+```bash
+$PY rl/bc_bootstrap.py --drive real --out ~/pnp_rl/bc_attach_real/bc_init.pt   # scripted teacher -> actor (63.5 % seal+lift)
+$PY rl/ppo.py --mode attach --dr --drive real --init ~/pnp_rl/bc_attach_real/bc_init.pt --out ~/pnp_rl/attach_real
+```
+
+Random exploration cannot discover the sustained press the real drive needs (FINDINGS);
+clone the scripted descend-press-lift first, then let PPO refine.
+
 ## Environment smoke test
 
 ```bash
