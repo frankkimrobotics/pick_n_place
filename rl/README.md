@@ -25,6 +25,33 @@ $PY rl/ppo.py --mode attach --dr --drive real --init ~/pnp_rl/bc_attach_real/bc_
 Random exploration cannot discover the sustained press the real drive needs (FINDINGS);
 clone the scripted descend-press-lift first, then let PPO refine.
 
+## Paper setup: Arafat et al., "Efficient Parallel PPO-Based RL for Generalized Pick and Place
+with Dense Reward Shaping" (IEEE QPAIN 2026, DOI 10.1109/QPAIN69676.2026.11545619)
+
+`rl/env_paper.py` re-hosts the paper's task on this twin (same physics, suction and the
+calibrated drive model):
+
+| paper | here |
+|---|---|
+| SO-101 + gripper, one cube, Isaac Lab / PhysX 5 | Pro 630 + suction cup, one box, mujoco_warp (`--drive real` or `ideal`) |
+| randomised object + goal poses | object xy/yaw on the table; goal = random 3-D point (xy within `--target_max`, z 5–25 cm) |
+| obs `[q, q̇, p_obj, p_goal, a_prev]` | same (25-D; +6 drive-lag block under the real drive) |
+| action `[a_arm, a_grip]` | joint-delta targets + suction logit |
+| reward reach / lift / track (coarse + fine) + λ(t)·reg | same forms; weights are documented assumptions in the file (reach σ 0.25 m: our home pose is 45 cm from the table) |
+| 5 s episodes, failure = root height | `--ep_len 100` decisions (10 s at our 10 Hz), failure = object off table |
+| success = final object–goal distance | object lifted and within `--succ_tol` (3.5 cm) at the time limit |
+| PPO [256,128,64] ELU, adaptive LR (KL 0.01), γ 0.98, 5 epochs, 4 minibatches, entropy 0.006, value clip | `--arch paper --kl_target 0.01 --gamma 0.98 --epochs 5 --minibatch 12288 --ent 0.006 --value_clip --vf_coef 1.0 --init_std 0.0` |
+
+Note the paper has **no release phase**: "placement" is holding the lifted object at the goal.
+
+```bash
+$PY rl/env_paper.py --nworld 512 --steps 30 --drive real         # smoke test
+$PY rl/ppo.py --env paper --arch paper --nworld 2048 --steps 8000000 --rollout 24 --epochs 5 \
+    --minibatch 12288 --gamma 0.98 --lam 0.95 --clip 0.2 --ent 0.006 --lr 1e-4 --kl_target 0.01 \
+    --vf_coef 1.0 --value_clip --init_std 0.0 --dr --drive real --scene rl/scenes/box_med.xml \
+    --out ~/pnp_rl/paper_real
+```
+
 ## Environment smoke test
 
 ```bash
