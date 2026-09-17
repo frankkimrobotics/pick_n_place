@@ -158,6 +158,20 @@ reached 54 % at 3.9M). Three probes localised it:
 `rd_attach_real3` = PPO warm-started from the ideal-drive policy (54 %) under the measured
 drive. First update: 0.34 % seal — the ideal policy's skill does not transfer as-is.
 
+### Exploration under the measured drive: bootstrap, don't search (2026-09-17, later)
+
+- Correlated (pink) exploration noise: ρ 0.7 → 0.10 %, ρ 0.9 → 0.16 % discovery (i.i.d. 0.05 %,
+  ideal drive 1.14 %); 80-step episodes do not help. Not enough on its own.
+- Warm start from the ideal-drive policy (54 %): 0.3–0.4 % under the measured drive, return
+  −5.5 — its fast jerky habits are punished and never produce the sustained press.
+- **`rl/bc_bootstrap.py`**: scripted descend-press-lift teacher (per-world IK direction,
+  1 °/decision, σ 0.15 action noise) collected 1058 successful episodes (28–37 % per batch)
+  under the measured drive; cloning them into the PPO actor gives **63.5 % deterministic
+  seal+lift** — better than the noisy teacher. PPO from that init (`rd_attach_real_bc`)
+  starts at 10.5 % under exploration noise (log-std −1) and is the current attach run.
+  Rule: when the plant filters exploration (dead-time + ramps), inject the behaviour with a
+  scripted teacher and let PPO refine; do not tune exploration noise.
+
 ## Plan from here (2026-09-17)
 
 Ordered by expected payoff; each step is a from-scratch or warm-chain run in the
