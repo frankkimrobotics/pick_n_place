@@ -62,6 +62,10 @@ DRIVE = dict(
     vmax=np.radians(50.0),     # drive velocity saturation (deg/s -> rad/s)
     amax=np.radians(800.0),    # acceleration cap at motor_accelaration 4x (250 deg/s^2 at 1x)
     dead=0.045,                # command -> motion dead-time (s); measured 36-52 ms to 0.02 deg
+    ferror=np.radians(1.5),    # anti-windup: the drive's position state may not lead the joint by more than this
+                               # (stalled against contact the real drive trips its following-error guard; robot_hal
+                               # clamps pos_cmd to +-3 deg of posfb). Without it q_drive integrated 28 deg into a
+                               # blocked object and released as a violent jump (probe 2026-09-17).
     cmd_dt=0.010,              # HAL command / feedback period (s)
     k0=20.0, k1=0.3, vff=1.0,  # deployed streaming law: u = vff*v_ref - k0*(q-q_ref) - k1*(qd-v_ref)
 )
@@ -105,7 +109,7 @@ class PickEnv:
                  mode="full", dr=False, target_max=0.30,
                  lift_req=0.0, speed_bonus=0.0, release_mask=False,
                  mask_h=0.05, tilt_pen_w=None, drive="real", dq_max_deg=None,
-                 obs_lag=None):
+                 obs_lag=None, hover_range=(0.02, 0.04)):
         """mode='attach': staged sub-task -- episodes START with the cup
         hovering 2-4 cm above the (jittered) grasp point; success = seal +
         hold + 2 cm lift within a 40-step episode. mode='full': whole task."""
@@ -125,6 +129,7 @@ class PickEnv:
         self.drive = drive
         self.dq_max = DQ_MAX if dq_max_deg is None else float(np.radians(dq_max_deg))
         self.obs_lag = (drive == "real") if obs_lag is None else bool(obs_lag)
+        self.hover_range = tuple(hover_range)   # attach/pnp start height of the cup above the grasp point (m)
         self.rng = np.random.default_rng(seed)
         if xml is None:
             xml = os.path.join(HERE, "_scene_rl.xml")
@@ -371,7 +376,7 @@ class PickEnv:
             off = torch.tensor(self.rng.uniform(
                 [-0.015, -0.015], [0.015, 0.015], size=(i_hover.numel(), 2)),
                 device=self.device, dtype=torch.float32)
-            hover = torch.tensor(self.rng.uniform(0.02, 0.04, size=i_hover.numel()),
+            hover = torch.tensor(self.rng.uniform(self.hover_range[0], self.hover_range[1], size=i_hover.numel()),
                                  device=self.device, dtype=torch.float32)
             qa = self.jadr_obj
             self.qpos[i_hover, qa:qa + 2] = tcp[i_hover, :2] + off
@@ -711,6 +716,13 @@ class PickEnv:
                 a_sat = torch.maximum(a_sat, (dv_raw.abs() > self.amax_w * dt_phys * 1.001).float())
                 self.v_drive = self.v_drive + dv
                 self.q_drive = self.q_drive + self.v_drive * dt_phys
+                # anti-windup against contact: bound the following error, zero the
+                # velocity state on the blocked side so it does not keep integrating
+                qj = self.qpos[:, :6]
+                lead = self.q_drive - qj
+                over = lead.abs() > DRIVE["ferror"]
+                self.q_drive = torch.where(over, qj + lead.clamp(-DRIVE["ferror"], DRIVE["ferror"]), self.q_drive)
+                self.v_drive = torch.where(over & (torch.sign(self.v_drive) == torch.sign(lead)), torch.zeros_like(self.v_drive), self.v_drive)
                 # drive position loop: stiff PD with damping on velocity error
                 tau = (self.gain_scale * (self.kp * (self.q_drive - self.qpos[:, :6])
                        - self.kd * (self.qvel[:, :6] - self.v_drive))).clamp(-self.tau_max, self.tau_max)

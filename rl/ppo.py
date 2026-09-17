@@ -72,6 +72,8 @@ def main():
                     help="real = measured Pro 630 velocity-drive model (2026-09-17); ideal = legacy stiff PD")
     ap.add_argument("--dq_max", type=float, default=2.0, help="per-decision joint delta clamp (deg)")
     ap.add_argument("--obs_lag", type=int, default=-1, help="append q_target-q to obs (-1: auto = drive==real)")
+    ap.add_argument("--hover", type=float, nargs=2, default=[0.02, 0.04], help="attach/pnp start height range above the grasp point (m)")
+    ap.add_argument("--init_std", type=float, default=None, help="initial policy log-std (default -0.5)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     dev = "cuda:0"
@@ -79,9 +81,13 @@ def main():
     wp.init()
     from env_warp import PickEnv
     env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode, dr=a.dr, target_max=a.target_max, lift_req=a.lift_req, speed_bonus=a.speed_bonus, release_mask=a.release_mask, mask_h=a.mask_h, tilt_pen_w=a.tilt_pen,
-                  drive=a.drive, dq_max_deg=a.dq_max, obs_lag=(None if a.obs_lag < 0 else bool(a.obs_lag)))
+                  drive=a.drive, dq_max_deg=a.dq_max, obs_lag=(None if a.obs_lag < 0 else bool(a.obs_lag)),
+                  hover_range=tuple(a.hover))
     ac = AC(obs_dim=env.observe().shape[-1]).to(dev)
-    print(f"[ppo] obs_dim {ac.obs_dim} drive={a.drive} dq_max={a.dq_max} deg", flush=True)
+    if a.init_std is not None:
+        with torch.no_grad():
+            ac.log_std.fill_(float(a.init_std))
+    print(f"[ppo] obs_dim {ac.obs_dim} drive={a.drive} dq_max={a.dq_max} deg hover={a.hover} init_std={a.init_std}", flush=True)
     if a.init:
         ck = torch.load(a.init, map_location=dev, weights_only=False)
         try:

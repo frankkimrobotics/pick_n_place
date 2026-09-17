@@ -137,6 +137,27 @@ low-probability seal discovery. `W["sat"]` is now 0 (still logged as a diagnosti
 behaviour the task needs** — measure the component on a scripted competent controller
 before giving it weight (the same `diag_factors` discipline as for grades).
 
+### Why the measured drive stalls attach-from-scratch (2026-09-17, later)
+
+Zeroing `sat` did not help (`rd_attach_real2`: 0.1 % at 2.5M steps while the ideal run
+reached 54 % at 3.9M). Three probes localised it:
+
+1. **Anti-windup was missing.** Against a blocked joint the drive integrator ran 28° ahead
+   of the joint in 0.7 s and released as a jump. The real firmware trips at its
+   following-error limit instead. `DRIVE["ferror"] = 1.5°` now bounds the drive state
+   (velocity state zeroed on the blocked side). Seals unaffected; it removes a violent
+   artefact from contact-rich exploration.
+2. **Start height is not the problem.** Random-policy discovery is 0.05–0.07 % for hover
+   2–4 cm, 0.5–2 cm and 0.2–1.2 cm alike (ideal drive: 1.14 %).
+3. **The binding gate is *pressing*.** Per 1000 random world-steps: near (< 12 mm) 13.4 vs
+   6.3, near∧want∧pressing 0.45 vs 0.10, all gates 0.378 vs 0.043 (ideal vs real). A random
+   walk's brief dips below the object top never propagate through 45 ms of dead-time and
+   the acceleration ramp; the seal needs a *sustained* push of ≥ 100–200 ms. That is a real
+   property of the arm, so the fix belongs in exploration/curriculum, not in the gate.
+
+`rd_attach_real3` = PPO warm-started from the ideal-drive policy (54 %) under the measured
+drive. First update: 0.34 % seal — the ideal policy's skill does not transfer as-is.
+
 ## Plan from here (2026-09-17)
 
 Ordered by expected payoff; each step is a from-scratch or warm-chain run in the
