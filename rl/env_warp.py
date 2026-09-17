@@ -50,7 +50,26 @@ BIN_XY = np.array([0.10, 0.40])
 BIN_HALF = 0.145
 TABLE_X = (0.24, 0.52)
 TABLE_Y = (-0.16, 0.16)
-DQ_MAX = np.radians(2.0)   # per-decision joint delta clamp
+DQ_MAX = np.radians(2.0)   # per-decision joint delta clamp (default; --dq_max)
+# ---- MEASURED DRIVE MODEL (Pro 630 hardware calibration, 2026-09-17) ----------
+# The real joints are velocity-mode drives behind a 10 ms CAN thread: the outer
+# law (robot_hal streaming mode, deployed) turns the streamed reference into a
+# velocity command every 10 ms; the drive then ramps at <= AMAX, saturates at
+# VMAX, and the motion appears ~45 ms after the command (CAN + firmware).
+# Feedback reaches the controller one 10 ms tick late. Numbers from
+# mycobot_mpc/README.md "Hardware calibration ... (2026-09-17)".
+DRIVE = dict(
+    vmax=np.radians(50.0),     # drive velocity saturation (deg/s -> rad/s)
+    amax=np.radians(800.0),    # acceleration cap at motor_accelaration 4x (250 deg/s^2 at 1x)
+    dead=0.045,                # command -> motion dead-time (s); measured 36-52 ms to 0.02 deg
+    ferror=np.radians(1.5),    # anti-windup: the drive's position state may not lead the joint by more than this
+                               # (stalled against contact the real drive trips its following-error guard; robot_hal
+                               # clamps pos_cmd to +-3 deg of posfb). Without it q_drive integrated 28 deg into a
+                               # blocked object and released as a violent jump (probe 2026-09-17).
+    cmd_dt=0.010,              # HAL command / feedback period (s)
+    k0=20.0, k1=0.3, vff=1.0,  # deployed streaming law: u = vff*v_ref - k0*(q-q_ref) - k1*(qd-v_ref)
+)
+DRIVE_DR = dict(vmax=(0.9, 1.1), amax=(0.75, 1.15), dead=(0.030, 0.065))
 EP_LEN = 150
 EP_LEN_ATTACH = 40
 EP_LEN_PNP = 100
@@ -60,7 +79,11 @@ W = dict(approach=1.0, align=0.3, press=0.5, seal=5.0, lift=4.0,
          transport=6.0, place=20.0, drop=-0.5, chatter=-0.05,
          act=-0.01, time=-0.005, table_slam=-0.5, off_table=-2.0,
          descend=4.0, tilt_pen=-0.4, rel_mask=-0.08,
-         place_align=-0.6, rel_far=-1.0)
+         place_align=-0.6, rel_far=-1.0,
+         sat=0.0,       # LOGGED ONLY: fraction of ticks with the velocity command saturated. With K0=20 and a
+                        # 45 ms dead-time every full 2 deg/decision step saturates, so as a penalty it just
+                        # taught the policy to move less and starved seal discovery (rd_attach_real, 2026-09-17)
+         smooth=-0.01)  # decision-to-decision change of the joint delta (jerk the accel-capped drive smooths anyway)
 
 
 def build_scene_xml(half_extents, kind, out_xml, seed=0):
@@ -85,7 +108,8 @@ class PickEnv:
                  xml=None, half_extents=(0.025, 0.025, 0.02), kind="box",
                  mode="full", dr=False, target_max=0.30,
                  lift_req=0.0, speed_bonus=0.0, release_mask=False,
-                 mask_h=0.05, tilt_pen_w=None):
+                 mask_h=0.05, tilt_pen_w=None, drive="real", dq_max_deg=None,
+                 obs_lag=None, hover_range=(0.02, 0.04)):
         """mode='attach': staged sub-task -- episodes START with the cup
         hovering 2-4 cm above the (jittered) grasp point; success = seal +
         hold + 2 cm lift within a 40-step episode. mode='full': whole task."""
@@ -99,6 +123,13 @@ class PickEnv:
         self.release_mask = release_mask  # hold seal if release cmd high
         self.mask_h = mask_h              # anneal 0.05 -> 0.015
         self.tilt_pen_w = W["tilt_pen"] if tilt_pen_w is None else tilt_pen_w
+        # drive="real": measured velocity-mode drive model (see DRIVE);
+        # drive="ideal": legacy stiff PD straight to the commanded target
+        assert drive in ("real", "ideal")
+        self.drive = drive
+        self.dq_max = DQ_MAX if dq_max_deg is None else float(np.radians(dq_max_deg))
+        self.obs_lag = (drive == "real") if obs_lag is None else bool(obs_lag)
+        self.hover_range = tuple(hover_range)   # attach/pnp start height of the cup above the grasp point (m)
         self.rng = np.random.default_rng(seed)
         if xml is None:
             xml = os.path.join(HERE, "_scene_rl.xml")
@@ -162,11 +193,33 @@ class PickEnv:
         self.kd = torch.tensor([40, 60, 40, 12, 4, 2], device=device,
                                dtype=torch.float32)
         self.tau_max = 100.0
+        if self.drive == "real":
+            # the measured drive's own position loop is stiff (posfb tracks
+            # motor_poscmd to 0.04 deg on hardware): 3x stiffer PD keeps
+            # |q_drive - q| <= 0.3 deg under gravity (probe 2026-09-17)
+            self.kp = self.kp * 3.0
+            self.kd = self.kd * 1.7
         self.gain_scale = torch.ones(nworld, 1, device=device)
         self.seal_dist_w = torch.full((nworld,), SEAL_DIST, device=device)
         self.seal_vel_w = torch.full((nworld,), SEAL_VEL, device=device)
         self.delay_mask = torch.zeros(nworld, dtype=torch.bool, device=device)
         self.prev_action = torch.zeros(nworld, 7, device=device)
+        # measured-drive state (per world)
+        self.n_cmd = int(round(1.0 / (CTRL_HZ * DRIVE["cmd_dt"])))          # 10 command ticks per decision
+        self.dead_max = 8                                                     # ring buffer length (80 ms)
+        self.q_drive = torch.zeros(nworld, 6, device=device)                  # drive's own position state
+        self.v_drive = torch.zeros(nworld, 6, device=device)                  # drive velocity
+        self.v_buf = torch.zeros(nworld, self.dead_max, 6, device=device)     # dead-time ring buffer
+        self.buf_i = 0
+        self.dead_ticks = torch.full((nworld,), int(round(DRIVE["dead"] / DRIVE["cmd_dt"])), dtype=torch.long, device=device)
+        self.vmax_w = torch.full((nworld, 1), DRIVE["vmax"], device=device)
+        self.amax_w = torch.full((nworld, 1), DRIVE["amax"], device=device)
+        self.q_target_prev = torch.zeros(nworld, 6, device=device)
+        self.q_meas_lag = torch.zeros(nworld, 6, device=device)               # feedback one cmd tick old
+        self.qd_meas_lag = torch.zeros(nworld, 6, device=device)
+        self.prev_dq = torch.zeros(nworld, 6, device=device)
+        self.sat_frac = torch.zeros(nworld, device=device)                    # drive-limit hits per decision
+        self.drive_law = "stream"                                             # or "waypoint" (probe only)
         # batched warp model/data
         self.m = mjw.put_model(self.mjm)
         self.d = mjw.put_data(self.mjm, mjd, nworld=nworld)
@@ -200,7 +253,8 @@ class PickEnv:
         self.RKEYS = ["approach", "align", "press", "seal", "lift",
                       "transport", "place", "drop", "chatter", "act",
                       "time", "table_slam", "off_table", "descend",
-                      "tilt_pen", "rel_mask", "place_align", "rel_far"]
+                      "tilt_pen", "rel_mask", "place_align", "rel_far",
+                      "sat", "smooth"]
         self.ep_comp = torch.zeros(N, len(self.RKEYS), device=device)
         self.max_lift = torch.zeros(N, device=device)
         self.wmode = torch.zeros(N, dtype=torch.long, device=device)
@@ -271,10 +325,23 @@ class PickEnv:
             self.seal_vel_w[idx] = SEAL_VEL * torch.tensor(
                 self.rng.uniform(0.8, 1.2, size=n_), device=self.device,
                 dtype=torch.float32)
+            # legacy 100 ms action latency only for the ideal drive; the
+            # measured drive model carries the real latencies itself
             self.delay_mask[idx] = torch.tensor(
-                self.rng.random(n_) < 0.5, device=self.device)
+                (self.rng.random(n_) < 0.5) & (self.drive == "ideal"), device=self.device)
             self.prev_action[idx] = 0.0
+            self.vmax_w[idx] = DRIVE["vmax"] * torch.tensor(self.rng.uniform(*DRIVE_DR["vmax"], size=(n_, 1)), device=self.device, dtype=torch.float32)
+            self.amax_w[idx] = DRIVE["amax"] * torch.tensor(self.rng.uniform(*DRIVE_DR["amax"], size=(n_, 1)), device=self.device, dtype=torch.float32)
+            dead = self.rng.uniform(*DRIVE_DR["dead"], size=n_)
+            self.dead_ticks[idx] = torch.tensor(np.clip(np.round(dead / DRIVE["cmd_dt"]), 1, self.dead_max - 1).astype(np.int64), device=self.device)
         self.q_target[idx] = self.qpos[idx, :6]
+        self.q_target_prev[idx] = self.qpos[idx, :6]
+        self.q_drive[idx] = self.qpos[idx, :6]
+        self.v_drive[idx] = 0.0
+        self.v_buf[idx] = 0.0
+        self.q_meas_lag[idx] = self.qpos[idx, :6]
+        self.qd_meas_lag[idx] = 0.0
+        self.prev_dq[idx] = 0.0
         # --- per-world curriculum mode ---------------------------------
         # 0 = pnp (unsealed hover start, must pick), 1 = carry (sealed at
         # table level, far target), 2 = place (sealed mid-carry, near
@@ -309,7 +376,7 @@ class PickEnv:
             off = torch.tensor(self.rng.uniform(
                 [-0.015, -0.015], [0.015, 0.015], size=(i_hover.numel(), 2)),
                 device=self.device, dtype=torch.float32)
-            hover = torch.tensor(self.rng.uniform(0.02, 0.04, size=i_hover.numel()),
+            hover = torch.tensor(self.rng.uniform(self.hover_range[0], self.hover_range[1], size=i_hover.numel()),
                                  device=self.device, dtype=torch.float32)
             qa = self.jadr_obj
             self.qpos[i_hover, qa:qa + 2] = tcp[i_hover, :2] + off
@@ -378,6 +445,16 @@ class PickEnv:
             self._assign_target(grp, tgt)
             self.q_target[grp] = self.qpos[grp, :6]
         mjw.forward(self.m, self.d)
+        # measured-drive state must start AT the final start pose (hover /
+        # carry poses are written above, after the early q_target init)
+        self.q_target[idx] = self.qpos[idx, :6]
+        self.q_target_prev[idx] = self.qpos[idx, :6]
+        self.q_drive[idx] = self.qpos[idx, :6]
+        self.v_drive[idx] = 0.0
+        self.v_buf[idx] = 0.0
+        self.q_meas_lag[idx] = self.qpos[idx, :6]
+        self.qd_meas_lag[idx] = 0.0
+        self.prev_dq[idx] = 0.0
         tcp, _ = self._tcp()
         lift_cap = max(self.lift_req, 0.10)
         self.phi_lift[idx] = self.max_lift[idx].clamp(0, lift_cap) / lift_cap
@@ -549,7 +626,9 @@ class PickEnv:
             eff = torch.where(self.delay_mask[:, None], self.prev_action, a)
             self.prev_action = a.clone()
             a = eff
-        self.q_target = self.q_target + a[:, :6] * DQ_MAX
+        dq = a[:, :6] * self.dq_max
+        self.q_target_prev = self.q_target.clone()
+        self.q_target = self.q_target + dq
         want = a[:, 6] > 0
         # suction hysteresis: a latched cup releases only after REL_N
         # consecutive off-commands -- action flicker was causing transient
@@ -580,12 +659,15 @@ class PickEnv:
             idx = torch.nonzero(released).squeeze(-1)
             self.sealed[idx] = False
             self.xfrc[idx, self.bid_obj] = 0.0
-        for _ in range(self.substeps):
-            tau = (self.gain_scale * (self.kp * (self.q_target - self.qpos[:, :6])
-                   - self.kd * self.qvel[:, :6])).clamp(-self.tau_max, self.tau_max)
-            self.ctrl[:, :6] = tau
-            self._apply_suction_force()
-            mjw.step(self.m, self.d)
+        if self.drive == "ideal":
+            for _ in range(self.substeps):
+                tau = (self.gain_scale * (self.kp * (self.q_target - self.qpos[:, :6])
+                       - self.kd * self.qvel[:, :6])).clamp(-self.tau_max, self.tau_max)
+                self.ctrl[:, :6] = tau
+                self._apply_suction_force()
+                mjw.step(self.m, self.d)
+        else:
+            self._step_real_drive()
         broke = self._check_break()
         self._last_tcp = self._tcp()[0].clone()
         self.t_step += 1
@@ -597,12 +679,70 @@ class PickEnv:
             self.reset(done)
         return obs, r, done, info
 
-    # ---------------- observation (privileged, 41-D) ----------------
+    # ---------------- measured drive model ----------------
+    def _step_real_drive(self, log=None):
+        """One 10 Hz decision through the measured Pro 630 drive chain.
+        The decision's joint delta becomes a linear reference ramp over the
+        decision period (what the Pi's chunk welder does with a streamed
+        waypoint). Every 10 ms command tick: outer law on ONE-TICK-OLD
+        feedback -> velocity command, clipped to the drive's saturation ->
+        dead-time ring buffer -> acceleration-limited drive velocity ->
+        integrated drive position, which the stiff joint PD (the drive's own
+        position loop) tracks at the 2 ms physics rate."""
+        dt_cmd = DRIVE["cmd_dt"]
+        dt_phys = float(self.mjm.opt.timestep)
+        sub_per_cmd = max(1, self.substeps // self.n_cmd)
+        v_ref = (self.q_target - self.q_target_prev) * CTRL_HZ          # rad/s over the decision
+        k0, k1, vff = DRIVE["k0"], DRIVE["k1"], DRIVE["vff"]
+        ar = torch.arange(self.nworld, device=self.device)
+        sat = torch.zeros(self.nworld, device=self.device)
+        for c in range(self.n_cmd):
+            s = (c + 1) / self.n_cmd
+            q_ref = self.q_target_prev + s * (self.q_target - self.q_target_prev)
+            if self.drive_law == "waypoint":                             # robot_hal waypoint mode (probe)
+                v_cmd = -6.0 * (self.q_meas_lag - self.q_target)
+            else:
+                v_cmd = vff * v_ref - k0 * (self.q_meas_lag - q_ref) - k1 * (self.qd_meas_lag - v_ref)
+            v_sat = (v_cmd.abs() >= 0.98 * self.vmax_w).float()
+            v_cmd = torch.maximum(torch.minimum(v_cmd, self.vmax_w), -self.vmax_w)
+            # dead-time: write now, read what was written dead_ticks ago
+            self.v_buf[:, self.buf_i] = v_cmd
+            v_eff = self.v_buf[ar, (self.buf_i - self.dead_ticks) % self.dead_max]
+            self.buf_i = (self.buf_i + 1) % self.dead_max
+            a_sat = torch.zeros_like(v_sat)
+            for _ in range(sub_per_cmd):
+                dv_raw = v_eff - self.v_drive
+                dv = dv_raw.clamp(-self.amax_w * dt_phys, self.amax_w * dt_phys)
+                a_sat = torch.maximum(a_sat, (dv_raw.abs() > self.amax_w * dt_phys * 1.001).float())
+                self.v_drive = self.v_drive + dv
+                self.q_drive = self.q_drive + self.v_drive * dt_phys
+                # anti-windup against contact: bound the following error, zero the
+                # velocity state on the blocked side so it does not keep integrating
+                qj = self.qpos[:, :6]
+                lead = self.q_drive - qj
+                over = lead.abs() > DRIVE["ferror"]
+                self.q_drive = torch.where(over, qj + lead.clamp(-DRIVE["ferror"], DRIVE["ferror"]), self.q_drive)
+                self.v_drive = torch.where(over & (torch.sign(self.v_drive) == torch.sign(lead)), torch.zeros_like(self.v_drive), self.v_drive)
+                # drive position loop: stiff PD with damping on velocity error
+                tau = (self.gain_scale * (self.kp * (self.q_drive - self.qpos[:, :6])
+                       - self.kd * (self.qvel[:, :6] - self.v_drive))).clamp(-self.tau_max, self.tau_max)
+                self.ctrl[:, :6] = tau
+                self._apply_suction_force()
+                mjw.step(self.m, self.d)
+            sat = sat + v_sat.mean(-1)          # accel clipping is normal drive behaviour, not a policy fault
+            # feedback the outer law will see on the NEXT tick (10 ms old)
+            self.q_meas_lag = self.qpos[:, :6].clone()
+            self.qd_meas_lag = self.qvel[:, :6].clone()
+            if log is not None:
+                log.append(self.qpos[:, :6].clone())
+        self.sat_frac = sat / self.n_cmd
+
+    # ---------------- observation (privileged, 37-D + 6 lag) ----------------
     def observe(self):
         tcp, R = self._tcp()
         op = self._obj_pos()
         rel_goal = self._grasp_point() - tcp
-        return torch.cat([
+        parts = [
             self.qpos[:, :6], self.qvel[:, :6],
             tcp, R[:, :, 0], R[:, :, 1],
             op - tcp, rel_goal,
@@ -613,8 +753,13 @@ class PickEnv:
             self.target_h[:, None],                        # place surface z
             (op[:, 2] - float(self.half[2]) - self.target_h)[:, None],
             self._obj_zaxis()[:, 2:3],                     # uprightness
-        ], dim=-1) + (torch.randn(self.nworld, 37, device=self.device) * 0.005
-                      if self.dr else 0.0)
+        ]
+        if self.obs_lag:                                   # commanded-vs-actual (drive lag state)
+            parts.append(self.q_target - self.qpos[:, :6])
+        obs = torch.cat(parts, dim=-1)
+        if self.dr:
+            obs = obs + torch.randn_like(obs) * 0.005
+        return obs
 
     # ---------------- reward ----------------
     def reward(self, want, latched_now, released, broke, tcp_before, obj_before, a):
@@ -712,6 +857,14 @@ class PickEnv:
         C["rel_mask"] = W["rel_mask"] * self._masked_rel.float()
         # 9 action penalty
         C["act"] = W["act"] * a[:, :6].pow(2).sum(-1)
+        # 9b drive-feasibility: fraction of command ticks (x joints) where the
+        # velocity command saturated -- the policy asked for more speed than
+        # the real arm has (dead-time lag makes the outer law wind up); 9c smoothness of the
+        # per-decision delta (jerk the accel-capped drive cannot render)
+        C["sat"] = W["sat"] * (self.sat_frac if self.drive == "real" else torch.zeros(N, device=self.device))
+        dq_now = a[:, :6] * self.dq_max
+        C["smooth"] = W["smooth"] * ((dq_now - self.prev_dq) / self.dq_max).pow(2).sum(-1)
+        self.prev_dq = dq_now
         # 10 table slam: cup below table plane proxy
         C["table_slam"] = W["table_slam"] * (tcp[:, 2] < 0.004).float()
 
@@ -806,9 +959,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--nworld", type=int, default=64)
     ap.add_argument("--steps", type=int, default=20)
+    ap.add_argument("--drive", default="real", choices=["real", "ideal"])
     args = ap.parse_args()
     wp.init()
-    env = PickEnv(nworld=args.nworld)
+    env = PickEnv(nworld=args.nworld, drive=args.drive)
     obs = env.observe()
     print(f"obs dim {obs.shape}, nworld {args.nworld}, substeps {env.substeps}")
     t0 = time.time()

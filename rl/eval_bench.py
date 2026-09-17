@@ -75,7 +75,7 @@ def main():
         if not os.path.exists(os.path.expanduser(path)):
             print(f"{name:24s} MISSING {path}")
             continue
-        ac = AC().to(dev)
+        ac = AC(obs_dim=env.observe().shape[-1]).to(dev)
         try:
             load_padded(ac, path, dev)
         except Exception as e:

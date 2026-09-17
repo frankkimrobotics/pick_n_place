@@ -211,7 +211,7 @@ def main():
     from ppo import AC
     env = PickEnv(nworld=a.nworld, mode="pnp", xml=a.scene, dr=True,
                   lift_req=a.lift_req)
-    teacher = AC().to(dev)
+    teacher = AC(obs_dim=env.observe().shape[-1]).to(dev)
     ck = torch.load(a.teacher, map_location=dev, weights_only=False)
     sd = ck["ac"]
     own = teacher.state_dict()

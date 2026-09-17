@@ -146,12 +146,90 @@ class Sim:
         cur = np.array([self.d.xpos[self.bids[k]][:2] for k in range(1, 4)])
         return float(np.max(np.linalg.norm(cur - self.clutter0, axis=1)))
 
-    def inner_tick(self, q_ref):
+    def _lagmpc_ctx(self):
+        """Per-joint lag-aware MPC (mirror of mycobot_mpc
+        controller_solvers._mpc_solve_lag): N=25 prediction steps at
+        INNER_DT with the 2-state [err, vel] drive-lag model."""
+        if hasattr(self, "_lm"):
+            return self._lm
+        N, kv, vmax, dt = 25, KV, 40.0, INNER_DT
+        qe, qv, r = 100.0, 1.0, 0.005
+        A = np.array([[1.0, dt], [0.0, 1.0 - kv * dt]])
+        B = np.array([[0.0], [kv * dt]])
+        Ap = [np.linalg.matrix_power(A, k) for k in range(N + 1)]
+        G = np.zeros((2 * N, N))
+        for k in range(1, N + 1):
+            for j in range(k):
+                G[2 * (k - 1):2 * k, j] = (Ap[k - 1 - j] @ B).ravel()
+        W = np.zeros(2 * N)
+        W[0::2] = qe
+        W[1::2] = qv
+        W[-2] = qe * 10.0
+        Wd = np.diag(W)
+        P = G.T @ Wd @ G + r * np.eye(N)
+        solvers = []
+        for _ in range(6):
+            s = osqp.OSQP()
+            s.setup(sparse.csc_matrix((P + P.T) / 2), np.zeros(N),
+                    sparse.eye(N, format="csc"), np.full(N, -vmax),
+                    np.full(N, vmax), verbose=False, max_iter=200,
+                    warm_start=True)
+            solvers.append(s)
+        self._lm = dict(N=N, Ap=Ap, GtW=G.T @ Wd, vmax=vmax,
+                        solvers=solvers, plan=np.zeros((6, N)), i=N)
+        return self._lm
+
+    def inner_tick_lagmpc(self, q_ref, exec_steps=8):
+        """Inner loop via explicit lag-MPC, executing exec_steps of the
+        25-step plan open-loop before re-solving (receding horizon with a
+        slow re-plan: exec_steps=1 ~= the LQR-clamp; 8 = 32 ms open-loop,
+        so the plan goes stale across ~1.5 outer reference updates)."""
         d, m = self.d, self.m
+        lm = self._lagmpc_ctx()
         for _ in range(int(OUTER_DT / INNER_DT)):
-            e = np.degrees(d.qpos[:6] - q_ref)
+            if lm["i"] >= exec_steps:
+                for j in range(6):
+                    x0 = np.array([np.degrees(d.qpos[j] - q_ref[j]),
+                                   np.degrees(d.qvel[j])])
+                    f = np.concatenate([lm["Ap"][k] @ x0
+                                        for k in range(1, lm["N"] + 1)])
+                    lm["solvers"][j].update(q=lm["GtW"] @ f)
+                    res = lm["solvers"][j].solve()
+                    lm["plan"][j] = (res.x if res.info.status.startswith(
+                        "solved") else np.full(lm["N"], np.clip(
+                            -2.0 * x0[0], -lm["vmax"], lm["vmax"])))
+                lm["i"] = 0
+            u = np.clip(lm["plan"][:, lm["i"]], -lm["vmax"], lm["vmax"])
+            lm["i"] += 1
+            vc = np.radians(u)
+            for _ in range(int(INNER_DT / DT)):
+                qacc = KV * (vc - d.qvel[:6])
+                d.qfrc_applied[:6] = np.clip(
+                    d.qfrc_bias[:6] + (m.dof_armature[:6] + 0.05) * qacc,
+                    -100, 100)
+                mujoco.mj_step(m, d)
+
+    def inner_tick(self, q_ref, interp=False):
+        d, m = self.d, self.m
+        n_in = int(OUTER_DT / INNER_DT)
+        q_from = getattr(self, "_qr_last", q_ref)
+        self._qr_last = q_ref.copy()
+        for i in range(n_in):
+            # interp: ramp the reference across the inner ticks instead of
+            # stepping it once per outer tick -- the 50 Hz staircase, not
+            # sensor noise, is what excites the drive-lag dynamics
+            if interp:
+                # ramped reference + matching velocity feedforward: a
+                # position-only ramp adds a half-tick delay the incremental
+                # outer loop can't tolerate (it hunts); the 2-DOF form
+                # tracks the ramp without fighting the damping term
+                qr = q_from + (q_ref - q_from) * ((i + 1) / n_in)
+                v_ff = np.degrees(q_ref - q_from) / OUTER_DT
+            else:
+                qr, v_ff = q_ref, 0.0
+            e = np.degrees(d.qpos[:6] - qr)
             v = np.degrees(d.qvel[:6])
-            u = np.clip(-(K_LQR[0] * e + K_LQR[1] * v), -40, 40)
+            u = np.clip(-(K_LQR[0] * e + K_LQR[1] * (v - v_ff)), -40, 40)
             vc = np.clip(np.radians(u), -VEL_LIMIT, VEL_LIMIT)
             for _ in range(int(INNER_DT / DT)):
                 qacc = KV * (vc - d.qvel[:6])
@@ -161,13 +239,16 @@ class Sim:
                 mujoco.mj_step(m, d)
 
 
-def task_step(sim, x_goal, q_ref, ctrl):
+def task_step(sim, x_goal, q_ref, ctrl, smooth=False):
     d, m, sid = sim.d, sim.m, sim.sid
     x_tcp = d.site_xpos[sid].copy()
     err = x_goal - x_tcp
     if np.linalg.norm(err) < 0.004:
         err = np.zeros(3)                  # deadband: don't chase noise
     dx = np.clip(0.6 * err, -0.03, 0.03)
+    if smooth:                             # low-pass the task correction
+        dx = 0.5 * getattr(sim, "_dx_f", dx) + 0.5 * dx
+        sim._dx_f = dx
     Jp = np.zeros((3, m.nv))
     Jr = np.zeros((3, m.nv))
     mujoco.mj_jacSite(m, d, Jp, Jr, sid)
@@ -182,25 +263,33 @@ def task_step(sim, x_goal, q_ref, ctrl):
     near = np.abs(qn) > 0.82 * Q_LIM
     lim_bias = np.where(near, -0.15 * (qn - 0.82 * Q_LIM * np.sign(qn)), 0.0)
     if ctrl == "taskmpc":
+        # loose box + UNIFORM post-scale: a tight per-joint +-DQ_MAX box
+        # bends the task-space direction whenever one joint saturates, and
+        # the active set flipping joint-to-joint as the pose evolves is a
+        # ~5 Hz direction chatter -- the dominant VISIBLE jitter (band
+        # test: 9.45 -> 2.03 rms accel, 5.7 Hz peak gone). Uniform scaling
+        # slows the step without turning it.
         P = Jt.T @ Jt + 1e-3 * np.eye(6)
         s = osqp.OSQP()
         s.setup(sparse.csc_matrix((P + P.T) / 2), -Jt.T @ xt - 1e-3 * lim_bias,
-                sparse.csc_matrix(np.eye(6)), np.full(6, -DQ_MAX),
-                np.full(6, DQ_MAX), verbose=False, max_iter=200)
+                sparse.csc_matrix(np.eye(6)), np.full(6, -10 * DQ_MAX),
+                np.full(6, 10 * DQ_MAX), verbose=False, max_iter=200)
         r = s.solve()
         dq = r.x if r.info.status.startswith("solved") else np.zeros(6)
+        dq = dq * min(1.0, DQ_MAX / (np.abs(dq).max() + 1e-12))
     else:
         Jd = Jt.T @ np.linalg.inv(Jt @ Jt.T + 2e-3 * np.eye(6))
         dq = Jd @ xt
         N = np.eye(6) - Jd @ Jt
-        dq = np.clip(dq + N @ lim_bias, -DQ_MAX, DQ_MAX)
+        dq = dq + N @ lim_bias
+        dq = dq * min(1.0, DQ_MAX / (np.abs(dq).max() + 1e-12))
     q_ref = q_ref + dq
     q_ref = np.clip(q_ref, -Q_LIM, Q_LIM)          # joint position limits
     return np.clip(q_ref, d.qpos[:6] - np.radians(2.0),
                    d.qpos[:6] + np.radians(2.0))
 
 
-def run_trial(ctrl, seed, T=60.0):
+def run_trial(ctrl, seed, T=60.0, frame_cb=None, smooth=False):
     np.random.seed(seed)
     sim = Sim(seed)
     d, m, sid = sim.d, sim.m, sim.sid
@@ -214,6 +303,7 @@ def run_trial(ctrl, seed, T=60.0):
     held = False
     frozen_goal, frozen_phase, plan_fails = None, None, 0
     slew_goal = None
+    aligned = False              # descend/place xy-align gate (hysteresis)
 
     def plan_to(x, quat=DOWN):
         t0 = time.perf_counter()
@@ -249,8 +339,17 @@ def run_trial(ctrl, seed, T=60.0):
         t = ko * OUTER_DT
         if t - last_track >= TRACK_DT:
             if pend is not None:
-                tracked = (pend if np.linalg.norm(pend - tracked) > 0.02
-                           else 0.7 * tracked + 0.3 * pend)
+                # capture-radius freeze (smooth mode): once the tcp is
+                # converged near the goal, stop folding fresh measurement
+                # noise into the tracked pose -- a real >2 cm object move
+                # still re-triggers via the jump branch
+                near_goal = smooth and phase in ("approach", "descend") and \
+                    np.linalg.norm(d.site_xpos[sid][:2] - tracked[:2]) < 0.02
+                ema = 0.15 if smooth else 0.3
+                if np.linalg.norm(pend - tracked) > 0.02:
+                    tracked = pend
+                elif not near_goal:
+                    tracked = (1 - ema) * tracked + ema * pend
             pend = d.xpos[sim.bids[0]].copy() + np.random.normal(0, 0.002, 3)
             last_track = t
 
@@ -263,6 +362,11 @@ def run_trial(ctrl, seed, T=60.0):
                 phase = "descend"
         elif phase == "descend":
             x_goal = top + np.array([0, 0, -0.015])
+            # rate-limited descent: uniform dq scaling means a big z-step
+            # starves the small xy correction (contact lands ~1 cm
+            # off-center); capping z at 8 mm/tick keeps the solve
+            # unsaturated so xy holds full authority all the way down
+            x_goal[2] = max(x_goal[2], d.site_xpos[sid][2] - 0.008)
             if sim.cup_obj_force(sim.gids[0]) > 1.0:
                 # weld at the CURRENT relative pose (avoids the latch-jolt
                 # snap to the authored relpose)
@@ -282,6 +386,7 @@ def run_trial(ctrl, seed, T=60.0):
                 d.eq_active[eq] = 1                    # SEAL
                 held = True
                 phase = "lift"
+                aligned = False
                 if ctrl == "curobo":
                     # NOTE: planner-side attach (held-object spheres) is
                     # trajopt-unstable in this server build; the carried
@@ -302,11 +407,13 @@ def run_trial(ctrl, seed, T=60.0):
                 x_goal[2] = 0.11 + sim.tgt_h      # pre-place altitude (held-box spheres need clutter clearance)
             if np.linalg.norm(d.site_xpos[sid][:2] - sim.place) < 0.015:
                 phase = "place"
+                aligned = False
                 traj = None
         elif phase == "place":
             # descend until the OBJECT (not the cup) meets the table
             x_goal = np.array([sim.place[0], sim.place[1],
                                sim.tgt_h + 0.002])
+            x_goal[2] = max(x_goal[2], d.site_xpos[sid][2] - 0.008)
             if sim.obj_table_force() > 1.0:
                 d.eq_active[sim.eqs[0]] = 0            # RELEASE
                 held = False
@@ -362,10 +469,17 @@ def run_trial(ctrl, seed, T=60.0):
                 slew_goal = d.site_xpos[sid].copy()
             step = np.clip(x_goal - slew_goal, -0.025, 0.025)
             slew_goal = slew_goal + step
-            q_ref = task_step(sim, slew_goal, q_ref, ctrl)
-        sim.inner_tick(q_ref)
+            q_ref = task_step(sim, slew_goal, q_ref,
+                              "taskmpc" if ctrl.startswith("lagmpc") else ctrl,
+                              smooth=smooth)
+        if ctrl.startswith("lagmpc"):
+            sim.inner_tick_lagmpc(q_ref, exec_steps=int(ctrl[6:] or "1"))
+        else:
+            sim.inner_tick(q_ref)
         logs["q"].append(np.degrees(d.qpos[:6]).copy())
         logs["ref"].append(np.degrees(q_ref).copy())
+        if frame_cb is not None:
+            frame_cb(sim, t, phase, held)
         if phase == "done" and t > (t_done or 0) + 1.0:
             break
 

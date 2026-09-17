@@ -81,3 +81,114 @@ Runs 8–14 (~150M steps) were spent finding the defects below rather than conve
 - The Lightning studio pulls **main** — merge before every launch and verify the
   deployed code with `grep` on the studio. A stale checkout silently wasted a 20M-step
   run. It also restarts on **CPU** after a stop; request the H100 explicitly.
+
+## Dynamics update from hardware calibration (2026-09-17)
+
+The arm was calibrated on the real Pro 630 the same day (`mycobot_mpc/README.md`,
+"Hardware calibration, agile tuning and latency"). `env_warp.py` now has a measured
+drive model (`--drive real`, default) in place of the legacy stiff PD straight to the
+commanded target (`--drive ideal`):
+
+| stage (per joint) | value | source |
+|---|---|---|
+| decision → reference | linear ramp over the 100 ms decision (what the Pi's chunk welder does) | robot_hal chunk mode |
+| outer law, every 10 ms, on 10 ms-old feedback | `u = vff·v_ref − K0·(q − q_ref) − K1·(q̇ − v_ref)`, K0 20, K1 0.3, vff 1 | deployed streaming law |
+| velocity saturation | 50 °/s (DR 0.9–1.1×) | drive saturates ≈ 50 °/s |
+| command → motion dead-time | 45 ms (DR 30–65 ms) | onset 36–52 ms |
+| acceleration cap | 800 °/s² (DR 0.75–1.15×) at `motor_accelaration` 4× (250 at 1×) | measured 720–870 |
+| drive position loop | 3× stiffer PD with damping on velocity error, |q_drive − q| ≤ 0.3° | posfb tracks to 0.04° on hardware |
+
+`rl/drive_probe.py` replays the hardware experiments on the model:
+
+| experiment | hardware | sim (real drive) | sim (ideal drive) |
+|---|---|---|---|
+| 10° step, waypoint law K0 = 6: onset / rise / overshoot / settle / peak | 36–52 ms / 0.27 s / 0.1 % / 0.43 s / 45–50 °/s | 60 ms / 0.24 s / 0.0 % / 0.43 s / 55 °/s | 10 ms / 0.12 s / 0 % / 0.17 s / 110 °/s |
+| 12° 0.5 Hz streamed sine: rms / max error | 0.10–0.12° / 0.22° | 0.12° / 0.18° | 0.33° / 0.50° |
+
+Consequences for training:
+
+- **Observation grows 37 → 43**: `q_target − q` (the drive-lag state) is appended, so the
+  policy can see how far the drive is behind its command (dead-time makes the plant
+  non-Markov in `q` alone). `AC.load_state_dict` zero-pads older checkpoints.
+- **Reward: two new dense terms.** `sat` (−0.1 × fraction of 10 ms command ticks with the
+  velocity command saturated: the policy asked for speed the arm does not have) and
+  `smooth` (−0.01 × squared decision-to-decision change of the joint delta). Both are mild
+  shaping costs on the scale of `act`. A first version also counted acceleration-limited
+  physics substeps as saturation and fired on ~77 % of ticks (−9/episode) — ramping at the
+  cap is normal drive behaviour, not a policy fault.
+- The legacy 100 ms action-delay DR is disabled for `--drive real` (the model carries the
+  real latencies); the `--dr` gain / seal / obs-noise jitter stays.
+- `--dq_max` (deg per decision, default 2 = 20 °/s) can be raised to 4 for agile variants;
+  the real arm tracks up to ~45 °/s.
+- Throughput is unchanged (~1.8k env-steps/s at 2048 worlds on the A5000).
+
+### First A/B result and a reward correction (2026-09-17, later)
+
+`rd_attach_ideal` vs `rd_attach_real` (attach from scratch, 2048 worlds, 4M steps): at 1.47M
+steps the ideal drive was at 18.7 % seal-and-lift and climbing, the measured drive flat at
+0.2 % with the return rising only through cheaper actions. `rl/seal_probe.py` (scripted
+descend-press-lift, no learning) shows the seal IS reachable under the measured drive —
+19–22 % latch at 0.5–1.0 °/decision vs 28–32 % ideal, same contact speeds, no breaks — so
+the dynamics were not the blocker. The `sat` penalty was: with K0 = 20 and 45 ms of
+dead-time, every full 2 °/decision command saturates the velocity command, so the term
+punished ordinary full-speed moves and trained the policy to move less, starving the
+low-probability seal discovery. `W["sat"]` is now 0 (still logged as a diagnostic);
+`rd_attach_real2` is the rerun. Rule: **a feasibility penalty must not fire on the
+behaviour the task needs** — measure the component on a scripted competent controller
+before giving it weight (the same `diag_factors` discipline as for grades).
+
+### Why the measured drive stalls attach-from-scratch (2026-09-17, later)
+
+Zeroing `sat` did not help (`rd_attach_real2`: 0.1 % at 2.5M steps while the ideal run
+reached 54 % at 3.9M). Three probes localised it:
+
+1. **Anti-windup was missing.** Against a blocked joint the drive integrator ran 28° ahead
+   of the joint in 0.7 s and released as a jump. The real firmware trips at its
+   following-error limit instead. `DRIVE["ferror"] = 1.5°` now bounds the drive state
+   (velocity state zeroed on the blocked side). Seals unaffected; it removes a violent
+   artefact from contact-rich exploration.
+2. **Start height is not the problem.** Random-policy discovery is 0.05–0.07 % for hover
+   2–4 cm, 0.5–2 cm and 0.2–1.2 cm alike (ideal drive: 1.14 %).
+3. **The binding gate is *pressing*.** Per 1000 random world-steps: near (< 12 mm) 13.4 vs
+   6.3, near∧want∧pressing 0.45 vs 0.10, all gates 0.378 vs 0.043 (ideal vs real). A random
+   walk's brief dips below the object top never propagate through 45 ms of dead-time and
+   the acceleration ramp; the seal needs a *sustained* push of ≥ 100–200 ms. That is a real
+   property of the arm, so the fix belongs in exploration/curriculum, not in the gate.
+
+`rd_attach_real3` = PPO warm-started from the ideal-drive policy (54 %) under the measured
+drive. First update: 0.34 % seal — the ideal policy's skill does not transfer as-is.
+
+## Plan from here (2026-09-17)
+
+Ordered by expected payoff; each step is a from-scratch or warm-chain run in the
+measured dynamics, and each is gated by the previous.
+
+1. **Re-establish the proven chain in the real drive**: `attach` from scratch (running:
+   `~/pnp_rl/rd_attach_real`, control `rd_attach_ideal`), then `pnp` warm-started from it
+   with the ppo4/5 spec (table targets, `--target_max 0.3`), then the ppo7 spec
+   (`--lift_req 0.35 --speed_bonus 0.3`). Success criterion: ≥ 95 % `pnp` at the ppo5
+   spec under the new dynamics. If the real-drive `attach` learns slower than the ideal
+   one, the lag observation is doing its job; if it does *not* learn, suspect the
+   dead-time (raise `--dq_max` so 2°-steps stop hiding inside the lag).
+2. **Agile variant**: `--dq_max 4` (40 °/s command envelope, the arm tracks ~45) with
+   `speed_bonus` — the hardware now settles a 10° move in 0.43 s, so the 3.8 s episodes
+   of ppo6c have ~2× headroom. Watch the `sat` component: > 0.5/episode means the policy
+   is riding the drive's saturation and the real arm will lag it.
+3. **Contact-release / tilt / verticality spec** (open since run 8): do NOT resume the
+   warm-chain repairs. Rerun the `diag_factors` audit on the new `attach → pnp` champion,
+   then a single `--mode mix --release_mask` run from that checkpoint with the graded
+   terminals as they are. The dynamics change alters the release timing (the drive now
+   takes ~100 ms to stop), so `mask_h` annealing should start at 0.03, not 0.008.
+4. **Sim-to-real check before distillation**: replay the champion's joint commands on
+   the real arm through `ctrl_tuner /api/stream_traj` (no suction) and compare the
+   measured joint trace with the sim rollout — the `drive_probe` numbers say they should
+   agree to ~0.3°; a larger gap means a missing dynamics term (gravity droop of the
+   real drive under load, cable drag) before any camera policy is trained.
+5. **Distill** the champion to RGBD (`rl/distill.py`) only after step 4 passes.
+
+Reward terms to leave alone: `place` (graded terminal), the max-lift potential, the
+Laplace grades, `rel_far`, `chatter` — every one of them was re-derived from a failure
+(see the rules above). The two new terms (`sat`, `smooth`) are shaping costs on the
+scale of `act`; if a run's `sat` sum exceeds ~1/episode, lower `--dq_max` rather than
+raising the weight.
+

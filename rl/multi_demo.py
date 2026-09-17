@@ -46,7 +46,7 @@ def main():
     env.qpos[0, 6:] = q0[6:]
     env.qvel[0, :] = 0.0
     mjw.forward(env.m, env.d)
-    net = AC().to(env.device)
+    net = AC(obs_dim=env.observe().shape[-1]).to(env.device)
     ck = torch.load(a.actor, map_location=env.device, weights_only=False)
     net.load_state_dict(ck["ac"])
     net.eval()
