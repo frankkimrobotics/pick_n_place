@@ -75,6 +75,7 @@ def main():
     ap.add_argument("--hover", type=float, nargs=2, default=[0.02, 0.04], help="attach/pnp start height range above the grasp point (m)")
     ap.add_argument("--init_std", type=float, default=None, help="initial policy log-std (default -0.5)")
     ap.add_argument("--smooth_w", type=float, default=None, help="weight of the delta-jerk cost (default W['smooth']=-0.01; 0 for the proven pnp economy)")
+    ap.add_argument("--transport_w", type=float, default=None, help="weight of the carry-toward-target potential (default W['transport']=6)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     dev = "cuda:0"
@@ -83,7 +84,7 @@ def main():
     from env_warp import PickEnv
     env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode, dr=a.dr, target_max=a.target_max, lift_req=a.lift_req, speed_bonus=a.speed_bonus, release_mask=a.release_mask, mask_h=a.mask_h, tilt_pen_w=a.tilt_pen,
                   drive=a.drive, dq_max_deg=a.dq_max, obs_lag=(None if a.obs_lag < 0 else bool(a.obs_lag)),
-                  hover_range=tuple(a.hover), smooth_w=a.smooth_w)
+                  hover_range=tuple(a.hover), smooth_w=a.smooth_w, transport_w=a.transport_w)
     ac = AC(obs_dim=env.observe().shape[-1]).to(dev)
     if a.init_std is not None:
         with torch.no_grad():

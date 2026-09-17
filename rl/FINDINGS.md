@@ -184,6 +184,22 @@ Classic never-release trap, re-created by adding a movement cost. Rerun as `rd_p
 with the proven ppo4 economy: `--lift_req 0 --speed_bonus 0 --smooth_w 0`, table scene.
 Rule (again): every new dense cost must be checked against the potentials it competes with.
 
+### pnp parks even with the ppo4 flags — the reward code moved on (2026-09-17, later)
+
+`rd_pnp_ideal2` (`--lift_req 0 --speed_bonus 0 --smooth_w 0`, table scene) parked exactly like
+the first run: seal 98 %, full lift, `transport` ≈ 0, never releases, 100-step timeouts.
+`rd_pnp_real` found the other local optimum: seal, lift a little, release early anywhere
+(`place` +3.9 from the graded set-down at ~10 cm, `rel_far` −0.8), 0.7 % success. A carry
+probe (scripted pick, then a 20° base rotation at 10 °/s) breaks 0.6 % of seals at ≤ 17°
+tilt, so physics is fine. The "ppo4 economy" no longer exists in the code: `tilt_pen`,
+`rel_far`, `place_align`, `chatter` and the suction hysteresis were all added for the
+contact-release spec after ppo4/5, and the plain `pnp` stage was never re-validated under
+them. With those costs, moving 13 cm is worth +0.8 (`transport` 6 × Δm) against −2 of dense
+costs, and the +20 terminal is never sampled. Relaunched as `rd_mix_{real,ideal}`:
+`--mode mix --release_mask --mask_h 0.03 --tilt_pen -0.15 --transport_w 15 --lift_req 0
+--speed_bonus 0 --smooth_w 0` from the attach checkpoints (carry/place worlds start sealed
+near the target; mix keeps the pick from being forgotten). `--transport_w` is new.
+
 ## Plan from here (2026-09-17)
 
 Ordered by expected payoff; each step is a from-scratch or warm-chain run in the

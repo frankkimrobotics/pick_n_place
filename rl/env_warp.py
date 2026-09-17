@@ -109,7 +109,7 @@ class PickEnv:
                  mode="full", dr=False, target_max=0.30,
                  lift_req=0.0, speed_bonus=0.0, release_mask=False,
                  mask_h=0.05, tilt_pen_w=None, drive="real", dq_max_deg=None,
-                 obs_lag=None, hover_range=(0.02, 0.04), smooth_w=None):
+                 obs_lag=None, hover_range=(0.02, 0.04), smooth_w=None, transport_w=None):
         """mode='attach': staged sub-task -- episodes START with the cup
         hovering 2-4 cm above the (jittered) grasp point; success = seal +
         hold + 2 cm lift within a 40-step episode. mode='full': whole task."""
@@ -131,6 +131,7 @@ class PickEnv:
         self.obs_lag = (drive == "real") if obs_lag is None else bool(obs_lag)
         self.hover_range = tuple(hover_range)   # attach/pnp start height of the cup above the grasp point (m)
         self.smooth_w = W["smooth"] if smooth_w is None else float(smooth_w)
+        self.transport_w = W["transport"] if transport_w is None else float(transport_w)
         self.rng = np.random.default_rng(seed)
         if xml is None:
             xml = os.path.join(HERE, "_scene_rl.xml")
@@ -801,7 +802,7 @@ class PickEnv:
         # 6 transport while sealed and lifted
         phi_t = -torch.norm(op[:, :2] - self.place_target, dim=-1)
         carrying = self.sealed & (lift_h > 0.015)   # low-carry counts
-        C["transport"] = W["transport"] * carrying.float() * (phi_t - self.phi_transport)
+        C["transport"] = self.transport_w * carrying.float() * (phi_t - self.phi_transport)
         self.phi_transport = phi_t
         # 7 drop penalty: released or broke while far from bin and airborne
         if self.mode in ("pnp", "place", "carry", "mix"):
