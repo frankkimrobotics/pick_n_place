@@ -46,12 +46,12 @@ class PaperPickEnv(PickEnv):
                  ep_len=100, w_reach=1.0, w_lift=2.0, w_track_c=2.0, w_track_f=4.0,
                  sigma_reach=0.25, sigma_c=0.10, sigma_f=0.02, h_min=0.02,
                  lambda_max=0.02, goal_z=(0.05, 0.25), succ_tol=0.035, grasp_shaping=True,
-                 w_press=0.5, w_seal=2.0, obs_ee=True, **kw):
+                 w_press=0.5, w_seal=2.0, obs_ee=True, reach_target="grasp", **kw):
         self.paper = dict(ep_len=int(ep_len), w_reach=w_reach, w_lift=w_lift, w_track_c=w_track_c,
                           w_track_f=w_track_f, sigma_reach=sigma_reach, sigma_c=sigma_c, sigma_f=sigma_f,
                           h_min=h_min, lambda_max=lambda_max, goal_z=tuple(goal_z), succ_tol=succ_tol,
                           start=start, grasp_shaping=bool(grasp_shaping), w_press=w_press, w_seal=w_seal,
-                          obs_ee=bool(obs_ee))
+                          obs_ee=bool(obs_ee), reach_target=reach_target)
         self.reg_lambda = 0.0                     # set by the trainer: lambda(t) curriculum
         self._paper_ready = False
         super().__init__(nworld=nworld, device=device, seed=seed, xml=xml, mode="pnp", dr=dr,
@@ -114,7 +114,10 @@ class PaperPickEnv(PickEnv):
         N = self.nworld
         tcp, R = self._tcp()
         op = self._obj_pos()
-        d_obj = torch.norm(op - tcp, dim=-1)
+        # reach distance: the paper uses the object CENTRE (a gripper encloses the cube from the
+        # side). For a suction cup that pulls the tcp down BESIDE the box (replay of paper3_ideal:
+        # tcp below the object top, cup tilted 30-43 deg). "grasp" = top centre + cup radius.
+        d_obj = torch.norm((self._grasp_point() if P["reach_target"] == "grasp" else op) - tcp, dim=-1)
         lift_h = op[:, 2] - float(self.half[2])
         lifted = lift_h > P["h_min"]
         d_goal = torch.norm(op - self.goal, dim=-1)
