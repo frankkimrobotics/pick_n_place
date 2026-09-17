@@ -76,7 +76,9 @@ W = dict(approach=1.0, align=0.3, press=0.5, seal=5.0, lift=4.0,
          act=-0.01, time=-0.005, table_slam=-0.5, off_table=-2.0,
          descend=4.0, tilt_pen=-0.4, rel_mask=-0.08,
          place_align=-0.6, rel_far=-1.0,
-         sat=-0.1,      # fraction of command ticks/joints with the velocity command saturated (drive cannot go faster)
+         sat=0.0,       # LOGGED ONLY: fraction of ticks with the velocity command saturated. With K0=20 and a
+                        # 45 ms dead-time every full 2 deg/decision step saturates, so as a penalty it just
+                        # taught the policy to move less and starved seal discovery (rd_attach_real, 2026-09-17)
          smooth=-0.01)  # decision-to-decision change of the joint delta (jerk the accel-capped drive smooths anyway)
 
 

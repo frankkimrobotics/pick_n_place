@@ -122,6 +122,21 @@ Consequences for training:
   the real arm tracks up to ~45 °/s.
 - Throughput is unchanged (~1.8k env-steps/s at 2048 worlds on the A5000).
 
+### First A/B result and a reward correction (2026-09-17, later)
+
+`rd_attach_ideal` vs `rd_attach_real` (attach from scratch, 2048 worlds, 4M steps): at 1.47M
+steps the ideal drive was at 18.7 % seal-and-lift and climbing, the measured drive flat at
+0.2 % with the return rising only through cheaper actions. `rl/seal_probe.py` (scripted
+descend-press-lift, no learning) shows the seal IS reachable under the measured drive —
+19–22 % latch at 0.5–1.0 °/decision vs 28–32 % ideal, same contact speeds, no breaks — so
+the dynamics were not the blocker. The `sat` penalty was: with K0 = 20 and 45 ms of
+dead-time, every full 2 °/decision command saturates the velocity command, so the term
+punished ordinary full-speed moves and trained the policy to move less, starving the
+low-probability seal discovery. `W["sat"]` is now 0 (still logged as a diagnostic);
+`rd_attach_real2` is the rerun. Rule: **a feasibility penalty must not fire on the
+behaviour the task needs** — measure the component on a scripted competent controller
+before giving it weight (the same `diag_factors` discipline as for grades).
+
 ## Plan from here (2026-09-17)
 
 Ordered by expected payoff; each step is a from-scratch or warm-chain run in the
