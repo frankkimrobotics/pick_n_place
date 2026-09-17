@@ -46,12 +46,12 @@ class PaperPickEnv(PickEnv):
                  ep_len=100, w_reach=1.0, w_lift=2.0, w_track_c=2.0, w_track_f=4.0,
                  sigma_reach=0.25, sigma_c=0.10, sigma_f=0.02, h_min=0.02,
                  lambda_max=0.02, goal_z=(0.05, 0.25), succ_tol=0.035, grasp_shaping=True,
-                 w_press=0.5, w_seal=2.0, obs_ee=True, reach_target="grasp", **kw):
+                 w_press=0.5, w_seal=2.0, obs_ee=True, reach_target="grasp", lift_dense=True, **kw):
         self.paper = dict(ep_len=int(ep_len), w_reach=w_reach, w_lift=w_lift, w_track_c=w_track_c,
                           w_track_f=w_track_f, sigma_reach=sigma_reach, sigma_c=sigma_c, sigma_f=sigma_f,
                           h_min=h_min, lambda_max=lambda_max, goal_z=tuple(goal_z), succ_tol=succ_tol,
                           start=start, grasp_shaping=bool(grasp_shaping), w_press=w_press, w_seal=w_seal,
-                          obs_ee=bool(obs_ee), reach_target=reach_target)
+                          obs_ee=bool(obs_ee), reach_target=reach_target, lift_dense=bool(lift_dense))
         self.reg_lambda = 0.0                     # set by the trainer: lambda(t) curriculum
         self._paper_ready = False
         super().__init__(nworld=nworld, device=device, seed=seed, xml=xml, mode="pnp", dr=dr,
@@ -123,7 +123,13 @@ class PaperPickEnv(PickEnv):
         d_goal = torch.norm(op - self.goal, dim=-1)
         C = {}
         C["reach"] = P["w_reach"] * (1 - torch.tanh(d_obj / P["sigma_reach"])) / CTRL_HZ
-        C["lift"] = P["w_lift"] * lifted.float() / CTRL_HZ
+        # lift: the paper's indicator 1[z > h_min] has no gradient below h_min; sealed policies
+        # kept pressing and never rose (paper4_* replay: sealed 55 steps, max lift 0.0 cm). A dense
+        # ramp to the threshold (same value at and above h_min) makes the first centimetres pay.
+        if P["lift_dense"]:
+            C["lift"] = P["w_lift"] * (lift_h / P["h_min"]).clamp(0.0, 1.0) / CTRL_HZ
+        else:
+            C["lift"] = P["w_lift"] * lifted.float() / CTRL_HZ
         C["track_c"] = P["w_track_c"] * lifted.float() * (1 - torch.tanh(d_goal / P["sigma_c"])) / CTRL_HZ
         C["track_f"] = P["w_track_f"] * lifted.float() * (1 - torch.tanh(d_goal / P["sigma_f"])) / CTRL_HZ
         # EMBODIMENT ADAPTATION (not in the paper): a parallel gripper closing on a cube grasps

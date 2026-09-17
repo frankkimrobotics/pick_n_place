@@ -101,6 +101,7 @@ def main():
     ap.add_argument("--grasp_shaping", type=int, default=1, help="paper env: suction press term + seal bonus (embodiment adaptation); 0 = pure paper reward")
     ap.add_argument("--obs_ee", type=int, default=1, help="paper env: append tcp position, cup axis and grasp-point-relative vector (0 = paper's obs only)")
     ap.add_argument("--reach_target", default="grasp", choices=["grasp", "centre"], help="paper env: reach term to the grasp point (suction) or the object centre (paper)")
+    ap.add_argument("--lift_dense", type=int, default=1, help="paper env: dense ramp to h_min instead of the paper's indicator (0 = paper)")
     ap.add_argument("--vf_coef", type=float, default=0.5, help="paper 1.0")
     ap.add_argument("--value_clip", action="store_true", help="clipped value loss (paper: enabled)")
     ap.add_argument("--reg_ramp", type=float, default=0.4, help="paper env: lambda(t) ramps 0->lambda_max over this fraction of --steps")
@@ -116,7 +117,7 @@ def main():
         from env_paper import PaperPickEnv
         env = PaperPickEnv(nworld=a.nworld, device=dev, xml=a.scene, dr=a.dr, drive=a.drive, dq_max_deg=a.dq_max,
                            obs_lag=(None if a.obs_lag < 0 else bool(a.obs_lag)), target_max=a.target_max,
-                           start=a.start, ep_len=a.ep_len, grasp_shaping=bool(a.grasp_shaping), obs_ee=bool(a.obs_ee), reach_target=a.reach_target)
+                           start=a.start, ep_len=a.ep_len, grasp_shaping=bool(a.grasp_shaping), obs_ee=bool(a.obs_ee), reach_target=a.reach_target, lift_dense=bool(a.lift_dense))
     else:
         env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode, dr=a.dr, target_max=a.target_max, lift_req=a.lift_req, speed_bonus=a.speed_bonus, release_mask=a.release_mask, mask_h=a.mask_h, tilt_pen_w=a.tilt_pen,
                       drive=a.drive, dq_max_deg=a.dq_max, obs_lag=(None if a.obs_lag < 0 else bool(a.obs_lag)),

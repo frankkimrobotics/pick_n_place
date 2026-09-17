@@ -59,6 +59,11 @@ Reach target (`--reach_target grasp`, default): the paper's reach term measures 
 object *centre*; a suction cup then descends beside the box (replay of `paper3_ideal`: tcp below
 the top, cup tilted 30–43°). `grasp` = top centre + cup radius. `--reach_target centre` = paper.
 
+Lift term (`--lift_dense 1`, default): the paper's indicator `1[z > h_min]` has no gradient below the
+threshold; bootstrapped policies sealed and then kept pressing (replay of `paper4_*`: sealed 55 steps,
+max lift 0 cm). A dense ramp to `h_min` (equal to the indicator at and above it) fixes this.
+`--lift_dense 0` = paper.
+
 Bootstrap: `rl/bc_paper.py` clones a scripted reach → press → seal → lift → carry-to-goal teacher
 (same reasoning as the attach bootstrap: the sustained press is not discoverable), then
 `ppo.py --env paper --init ~/pnp_rl/bc_paper_real/bc_init.pt ...` refines.
