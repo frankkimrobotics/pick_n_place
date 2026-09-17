@@ -6,7 +6,7 @@ discoverable by PPO exploration (paper_*, paper2_*, paper3_* runs, 2026-09-17), 
 scripted controller first and let PPO refine.
 
 Teacher (per world, CPU MuJoCo IK once per phase, joint-space rate limit `--rate` deg/decision):
-  1 hover : IK to grasp point + 4 cm (cup down)      until within 1.5 cm
+  1 hover : IK to grasp point + 4 cm (cup down)      until within 1.5 cm of that hover point
   2 press : IK to grasp point - 4 mm, suction ON      until sealed
   3 lift  : back to the hover joint pose              until lifted > h_min
   4 carry : IK to tcp target = goal + (tcp - obj) offset at seal   then hold
@@ -35,7 +35,7 @@ def main():
     ap.add_argument("--drive", default="real", choices=["real", "ideal"])
     ap.add_argument("--nworld", type=int, default=512)
     ap.add_argument("--batches", type=int, default=6)
-    ap.add_argument("--rate", type=float, default=1.5, help="deg/decision on the largest joint")
+    ap.add_argument("--rate", type=float, default=2.0, help="deg/decision on the largest joint (2 = the env's action clamp)")
     ap.add_argument("--noise", type=float, default=0.15)
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--out", default=os.path.expanduser("~/pnp_rl/bc_paper_real/bc_init.pt"))
@@ -78,8 +78,11 @@ def main():
             tcp, R = env._tcp()
             gpt = env._grasp_point()
             dist = torch.norm(tcp - gpt, dim=-1)
+            d_hover = torch.norm(tcp - (gpt + torch.tensor([0, 0, 0.04], device=dev)), dim=-1)
             lifted = (env._obj_pos()[:, 2] - float(env.half[2])) > env.paper["h_min"]
-            phase = torch.where((phase == 0) & (dist < 0.015), torch.ones_like(phase), phase)
+            # phase 0 -> 1 once the cup has arrived at the HOVER point (4 cm above the grasp point);
+            # the first version tested distance to the grasp point itself and never left hover
+            phase = torch.where((phase == 0) & (d_hover < 0.015), torch.ones_like(phase), phase)
             phase = torch.where((phase == 1) & env.sealed, torch.full_like(phase, 2), phase)
             newly_lifted = (phase == 2) & lifted
             if newly_lifted.any() and q_carry is None:
