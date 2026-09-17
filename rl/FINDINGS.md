@@ -200,6 +200,20 @@ costs, and the +20 terminal is never sampled. Relaunched as `rd_mix_{real,ideal}
 --speed_bonus 0 --smooth_w 0` from the attach checkpoints (carry/place worlds start sealed
 near the target; mix keeps the pick from being forgotten). `--transport_w` is new.
 
+### Mix curriculum: stuck a few cm above the surface (2026-09-17, later)
+
+`rd_mix_{ideal,real}` at 8M steps: seal 97 %, transport now positive on the ideal drive, but
+0 % placements. Deterministic replay in `place` worlds (start sealed 4 cm from the target,
+31 cm up) shows two stalls: the ideal policy descends only to 13 cm, drifts to 9.5 cm off
+target and never commands release (0/100 steps); the measured-drive policy descends to
+5 cm, gets within 3.5 cm in 25 % of worlds and commands release 29/100 steps — 27 of them
+blocked by the 3 cm mask (paying `rel_mask` −0.6/ep) — and never goes lower. The last
+centimetres pay nothing: the descend potential's xy gate (σ = 7 cm) is ~0.4–0.6 once the
+object has drifted 7–10 cm, so lowering costs more in `act` than it earns, and the
+contact-release grade is only sampled below the mask. Relaunched from the 8M checkpoints
+as `rd_mix2_*` with `--mask_h 0.05` (the graded Laplace contact factor takes over from
+there: release at 5 cm = 0.54) and `--descend_sigma 0.15` (new flag).
+
 ## Plan from here (2026-09-17)
 
 Ordered by expected payoff; each step is a from-scratch or warm-chain run in the
