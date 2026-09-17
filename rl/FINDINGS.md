@@ -122,3 +122,37 @@ Consequences for training:
   the real arm tracks up to ~45 °/s.
 - Throughput is unchanged (~1.8k env-steps/s at 2048 worlds on the A5000).
 
+## Plan from here (2026-09-17)
+
+Ordered by expected payoff; each step is a from-scratch or warm-chain run in the
+measured dynamics, and each is gated by the previous.
+
+1. **Re-establish the proven chain in the real drive**: `attach` from scratch (running:
+   `~/pnp_rl/rd_attach_real`, control `rd_attach_ideal`), then `pnp` warm-started from it
+   with the ppo4/5 spec (table targets, `--target_max 0.3`), then the ppo7 spec
+   (`--lift_req 0.35 --speed_bonus 0.3`). Success criterion: ≥ 95 % `pnp` at the ppo5
+   spec under the new dynamics. If the real-drive `attach` learns slower than the ideal
+   one, the lag observation is doing its job; if it does *not* learn, suspect the
+   dead-time (raise `--dq_max` so 2°-steps stop hiding inside the lag).
+2. **Agile variant**: `--dq_max 4` (40 °/s command envelope, the arm tracks ~45) with
+   `speed_bonus` — the hardware now settles a 10° move in 0.43 s, so the 3.8 s episodes
+   of ppo6c have ~2× headroom. Watch the `sat` component: > 0.5/episode means the policy
+   is riding the drive's saturation and the real arm will lag it.
+3. **Contact-release / tilt / verticality spec** (open since run 8): do NOT resume the
+   warm-chain repairs. Rerun the `diag_factors` audit on the new `attach → pnp` champion,
+   then a single `--mode mix --release_mask` run from that checkpoint with the graded
+   terminals as they are. The dynamics change alters the release timing (the drive now
+   takes ~100 ms to stop), so `mask_h` annealing should start at 0.03, not 0.008.
+4. **Sim-to-real check before distillation**: replay the champion's joint commands on
+   the real arm through `ctrl_tuner /api/stream_traj` (no suction) and compare the
+   measured joint trace with the sim rollout — the `drive_probe` numbers say they should
+   agree to ~0.3°; a larger gap means a missing dynamics term (gravity droop of the
+   real drive under load, cable drag) before any camera policy is trained.
+5. **Distill** the champion to RGBD (`rl/distill.py`) only after step 4 passes.
+
+Reward terms to leave alone: `place` (graded terminal), the max-lift potential, the
+Laplace grades, `rel_far`, `chatter` — every one of them was re-derived from a failure
+(see the rules above). The two new terms (`sat`, `smooth`) are shaping costs on the
+scale of `act`; if a run's `sat` sum exceeds ~1/episode, lower `--dq_max` rather than
+raising the weight.
+
