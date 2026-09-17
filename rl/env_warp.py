@@ -109,7 +109,7 @@ class PickEnv:
                  mode="full", dr=False, target_max=0.30,
                  lift_req=0.0, speed_bonus=0.0, release_mask=False,
                  mask_h=0.05, tilt_pen_w=None, drive="real", dq_max_deg=None,
-                 obs_lag=None, hover_range=(0.02, 0.04)):
+                 obs_lag=None, hover_range=(0.02, 0.04), smooth_w=None):
         """mode='attach': staged sub-task -- episodes START with the cup
         hovering 2-4 cm above the (jittered) grasp point; success = seal +
         hold + 2 cm lift within a 40-step episode. mode='full': whole task."""
@@ -130,6 +130,7 @@ class PickEnv:
         self.dq_max = DQ_MAX if dq_max_deg is None else float(np.radians(dq_max_deg))
         self.obs_lag = (drive == "real") if obs_lag is None else bool(obs_lag)
         self.hover_range = tuple(hover_range)   # attach/pnp start height of the cup above the grasp point (m)
+        self.smooth_w = W["smooth"] if smooth_w is None else float(smooth_w)
         self.rng = np.random.default_rng(seed)
         if xml is None:
             xml = os.path.join(HERE, "_scene_rl.xml")
@@ -863,7 +864,7 @@ class PickEnv:
         # per-decision delta (jerk the accel-capped drive cannot render)
         C["sat"] = W["sat"] * (self.sat_frac if self.drive == "real" else torch.zeros(N, device=self.device))
         dq_now = a[:, :6] * self.dq_max
-        C["smooth"] = W["smooth"] * ((dq_now - self.prev_dq) / self.dq_max).pow(2).sum(-1)
+        C["smooth"] = self.smooth_w * ((dq_now - self.prev_dq) / self.dq_max).pow(2).sum(-1)
         self.prev_dq = dq_now
         # 10 table slam: cup below table plane proxy
         C["table_slam"] = W["table_slam"] * (tcp[:, 2] < 0.004).float()

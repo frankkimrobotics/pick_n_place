@@ -172,6 +172,18 @@ drive. First update: 0.34 % seal — the ideal policy's skill does not transfer 
   Rule: when the plant filters exploration (dead-time + ramps), inject the behaviour with a
   scripted teacher and let PPO refine; do not tune exploration noise.
 
+### pnp under the new costs: lift-and-park (2026-09-17, later)
+
+`rd_pnp_ideal` (ideal drive, ppo7 spec: lift_req 0.35, speed_bonus 0.3, pedestal scene, new
+`smooth` cost) reached seal 98 % and full lift by 6M steps and then parked: 100-step timeouts,
+object hovering 16 cm from the target, suction never released, `transport` ≈ −0.04/ep.
+Economics: moving 13 cm to the target is worth +0.8 (`transport` 6 × Δm) against movement
+costs of −2.3 (`act`) − 1.2 (`smooth`) − 0.7 (`tilt_pen`) per episode, and the +20 place
+terminal is never experienced because releasing far away is priced (`rel_far`, `drop`).
+Classic never-release trap, re-created by adding a movement cost. Rerun as `rd_pnp_ideal2`
+with the proven ppo4 economy: `--lift_req 0 --speed_bonus 0 --smooth_w 0`, table scene.
+Rule (again): every new dense cost must be checked against the potentials it competes with.
+
 ## Plan from here (2026-09-17)
 
 Ordered by expected payoff; each step is a from-scratch or warm-chain run in the
