@@ -97,6 +97,8 @@ def main():
     ap.add_argument("--arch", default="default", choices=["default", "paper"], help="paper = [256,128,64] ELU actor/critic")
     ap.add_argument("--kl_target", type=float, default=None, help="adaptive LR on KL (paper 0.01): lr/1.5 if kl>2*target, lr*1.5 if kl<target/2")
     ap.add_argument("--max_grad_norm", type=float, default=1.0)
+    ap.add_argument("--lr_max", type=float, default=1e-3, help="ceiling for the adaptive LR (it ran to 3.8e-3 while the policy idled)")
+    ap.add_argument("--grasp_shaping", type=int, default=1, help="paper env: suction press term + seal bonus (embodiment adaptation); 0 = pure paper reward")
     ap.add_argument("--vf_coef", type=float, default=0.5, help="paper 1.0")
     ap.add_argument("--value_clip", action="store_true", help="clipped value loss (paper: enabled)")
     ap.add_argument("--reg_ramp", type=float, default=0.4, help="paper env: lambda(t) ramps 0->lambda_max over this fraction of --steps")
@@ -112,7 +114,7 @@ def main():
         from env_paper import PaperPickEnv
         env = PaperPickEnv(nworld=a.nworld, device=dev, xml=a.scene, dr=a.dr, drive=a.drive, dq_max_deg=a.dq_max,
                            obs_lag=(None if a.obs_lag < 0 else bool(a.obs_lag)), target_max=a.target_max,
-                           start=a.start, ep_len=a.ep_len)
+                           start=a.start, ep_len=a.ep_len, grasp_shaping=bool(a.grasp_shaping))
     else:
         env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode, dr=a.dr, target_max=a.target_max, lift_req=a.lift_req, speed_bonus=a.speed_bonus, release_mask=a.release_mask, mask_h=a.mask_h, tilt_pen_w=a.tilt_pen,
                       drive=a.drive, dq_max_deg=a.dq_max, obs_lag=(None if a.obs_lag < 0 else bool(a.obs_lag)),
@@ -235,7 +237,7 @@ def main():
                 if kl > 2.0 * a.kl_target:
                     g["lr"] = max(1e-5, g["lr"] / 1.5)
                 elif kl < 0.5 * a.kl_target and kl > 0.0:
-                    g["lr"] = min(1e-2, g["lr"] * 1.5)
+                    g["lr"] = min(a.lr_max, g["lr"] * 1.5)
         n_up += 1
         if n_up % 5 == 0:
             n_ep = max(1, ep["n"])

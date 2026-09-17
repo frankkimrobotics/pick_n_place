@@ -39,17 +39,18 @@ from env_warp import PickEnv, TABLE_X, TABLE_Y, CTRL_HZ  # noqa: E402
 
 
 class PaperPickEnv(PickEnv):
-    RKEYS_PAPER = ["reach", "lift", "track_c", "track_f", "reg_act", "reg_vel", "fail"]
+    RKEYS_PAPER = ["reach", "lift", "track_c", "track_f", "reg_act", "reg_vel", "fail", "press", "seal"]
 
     def __init__(self, nworld=1024, device="cuda:0", seed=0, xml=None, dr=False, drive="real",
                  dq_max_deg=None, obs_lag=None, target_max=0.30, start="home",
                  ep_len=100, w_reach=1.0, w_lift=2.0, w_track_c=2.0, w_track_f=4.0,
                  sigma_reach=0.25, sigma_c=0.10, sigma_f=0.02, h_min=0.02,
-                 lambda_max=0.02, goal_z=(0.05, 0.25), succ_tol=0.035, **kw):
+                 lambda_max=0.02, goal_z=(0.05, 0.25), succ_tol=0.035, grasp_shaping=True,
+                 w_press=0.5, w_seal=2.0, **kw):
         self.paper = dict(ep_len=int(ep_len), w_reach=w_reach, w_lift=w_lift, w_track_c=w_track_c,
                           w_track_f=w_track_f, sigma_reach=sigma_reach, sigma_c=sigma_c, sigma_f=sigma_f,
                           h_min=h_min, lambda_max=lambda_max, goal_z=tuple(goal_z), succ_tol=succ_tol,
-                          start=start)
+                          start=start, grasp_shaping=bool(grasp_shaping), w_press=w_press, w_seal=w_seal)
         self.reg_lambda = 0.0                     # set by the trainer: lambda(t) curriculum
         self._paper_ready = False
         super().__init__(nworld=nworld, device=device, seed=seed, xml=xml, mode="pnp", dr=dr,
@@ -115,6 +116,20 @@ class PaperPickEnv(PickEnv):
         C["lift"] = P["w_lift"] * lifted.float() / CTRL_HZ
         C["track_c"] = P["w_track_c"] * lifted.float() * (1 - torch.tanh(d_goal / P["sigma_c"])) / CTRL_HZ
         C["track_f"] = P["w_track_f"] * lifted.float() * (1 - torch.tanh(d_goal / P["sigma_f"])) / CTRL_HZ
+        # EMBODIMENT ADAPTATION (not in the paper): a parallel gripper closing on a cube grasps
+        # trivially; a suction cup must be pressed 3 mm into the top at low speed with suction
+        # on. Without a dense press term and a one-time seal bonus neither drive discovered a
+        # single seal in 2-4M steps (paper_real / paper_ideal, 2026-09-17). Same terms as
+        # env_warp's attach shaping; disable with grasp_shaping=False for the pure paper reward.
+        gp = self._grasp_point()
+        near = (~self.ever_sealed) & (torch.norm(tcp - gp, dim=-1) < 0.03)
+        press = near & want & (tcp[:, 2] < gp[:, 2])
+        if P["grasp_shaping"]:
+            C["press"] = P["w_press"] * press.float() / CTRL_HZ
+            C["seal"] = P["w_seal"] * latched_now.float()
+        else:
+            C["press"] = torch.zeros(N, device=self.device)
+            C["seal"] = torch.zeros(N, device=self.device)
         lam = float(self.reg_lambda)
         C["reg_act"] = -lam * (a - self.a_prev).pow(2).sum(-1) / CTRL_HZ
         C["reg_vel"] = -lam * self.qvel[:, :6].pow(2).sum(-1) / CTRL_HZ
