@@ -81,3 +81,44 @@ Runs 8–14 (~150M steps) were spent finding the defects below rather than conve
 - The Lightning studio pulls **main** — merge before every launch and verify the
   deployed code with `grep` on the studio. A stale checkout silently wasted a 20M-step
   run. It also restarts on **CPU** after a stop; request the H100 explicitly.
+
+## Dynamics update from hardware calibration (2026-09-17)
+
+The arm was calibrated on the real Pro 630 the same day (`mycobot_mpc/README.md`,
+"Hardware calibration, agile tuning and latency"). `env_warp.py` now has a measured
+drive model (`--drive real`, default) in place of the legacy stiff PD straight to the
+commanded target (`--drive ideal`):
+
+| stage (per joint) | value | source |
+|---|---|---|
+| decision → reference | linear ramp over the 100 ms decision (what the Pi's chunk welder does) | robot_hal chunk mode |
+| outer law, every 10 ms, on 10 ms-old feedback | `u = vff·v_ref − K0·(q − q_ref) − K1·(q̇ − v_ref)`, K0 20, K1 0.3, vff 1 | deployed streaming law |
+| velocity saturation | 50 °/s (DR 0.9–1.1×) | drive saturates ≈ 50 °/s |
+| command → motion dead-time | 45 ms (DR 30–65 ms) | onset 36–52 ms |
+| acceleration cap | 800 °/s² (DR 0.75–1.15×) at `motor_accelaration` 4× (250 at 1×) | measured 720–870 |
+| drive position loop | 3× stiffer PD with damping on velocity error, |q_drive − q| ≤ 0.3° | posfb tracks to 0.04° on hardware |
+
+`rl/drive_probe.py` replays the hardware experiments on the model:
+
+| experiment | hardware | sim (real drive) | sim (ideal drive) |
+|---|---|---|---|
+| 10° step, waypoint law K0 = 6: onset / rise / overshoot / settle / peak | 36–52 ms / 0.27 s / 0.1 % / 0.43 s / 45–50 °/s | 60 ms / 0.24 s / 0.0 % / 0.43 s / 55 °/s | 10 ms / 0.12 s / 0 % / 0.17 s / 110 °/s |
+| 12° 0.5 Hz streamed sine: rms / max error | 0.10–0.12° / 0.22° | 0.12° / 0.18° | 0.33° / 0.50° |
+
+Consequences for training:
+
+- **Observation grows 37 → 43**: `q_target − q` (the drive-lag state) is appended, so the
+  policy can see how far the drive is behind its command (dead-time makes the plant
+  non-Markov in `q` alone). `AC.load_state_dict` zero-pads older checkpoints.
+- **Reward: two new dense terms.** `sat` (−0.1 × fraction of 10 ms command ticks with the
+  velocity command saturated: the policy asked for speed the arm does not have) and
+  `smooth` (−0.01 × squared decision-to-decision change of the joint delta). Both are mild
+  shaping costs on the scale of `act`. A first version also counted acceleration-limited
+  physics substeps as saturation and fired on ~77 % of ticks (−9/episode) — ramping at the
+  cap is normal drive behaviour, not a policy fault.
+- The legacy 100 ms action-delay DR is disabled for `--drive real` (the model carries the
+  real latencies); the `--dr` gain / seal / obs-noise jitter stays.
+- `--dq_max` (deg per decision, default 2 = 20 °/s) can be raised to 4 for agile variants;
+  the real arm tracks up to ~45 °/s.
+- Throughput is unchanged (~1.8k env-steps/s at 2048 worlds on the A5000).
+

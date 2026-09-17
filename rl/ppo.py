@@ -20,11 +20,25 @@ from sac import mlp, OBS_DIM, ACT_DIM                      # noqa: E402
 
 
 class AC(nn.Module):
-    def __init__(self):
+    def __init__(self, obs_dim=OBS_DIM):
         super().__init__()
-        self.pi = mlp(OBS_DIM, ACT_DIM, ln=False)
+        self.obs_dim = int(obs_dim)
+        self.pi = mlp(self.obs_dim, ACT_DIM, ln=False)
         self.log_std = nn.Parameter(torch.full((ACT_DIM,), -0.5))
-        self.v = mlp(OBS_DIM, 1)
+        self.v = mlp(self.obs_dim, 1)
+
+    def load_state_dict(self, sd, strict=True):
+        """Obs-dim growth (37 -> 43 with the drive-lag obs, 2026-09-17):
+        zero-pad first-layer weights of older checkpoints."""
+        own = self.state_dict()
+        sd = dict(sd)
+        for k in list(sd.keys()):
+            if k in own and own[k].shape != sd[k].shape:
+                pad = torch.zeros_like(own[k])
+                sl = tuple(slice(0, n) for n in sd[k].shape)
+                pad[sl] = sd[k]
+                sd[k] = pad
+        return super().load_state_dict(sd, strict)
 
     def dist(self, obs):
         mu = self.pi(obs)
@@ -54,14 +68,20 @@ def main():
     ap.add_argument("--speed_bonus", type=float, default=0.0)
     ap.add_argument("--out", default=os.path.expanduser("~/pnp_rl/ppo1"))
     ap.add_argument("--scene", default=os.path.join(HERE, "scenes", "box_med.xml"))
+    ap.add_argument("--drive", default="real", choices=["real", "ideal"],
+                    help="real = measured Pro 630 velocity-drive model (2026-09-17); ideal = legacy stiff PD")
+    ap.add_argument("--dq_max", type=float, default=2.0, help="per-decision joint delta clamp (deg)")
+    ap.add_argument("--obs_lag", type=int, default=-1, help="append q_target-q to obs (-1: auto = drive==real)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     dev = "cuda:0"
     torch.manual_seed(0)
     wp.init()
     from env_warp import PickEnv
-    env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode, dr=a.dr, target_max=a.target_max, lift_req=a.lift_req, speed_bonus=a.speed_bonus, release_mask=a.release_mask, mask_h=a.mask_h, tilt_pen_w=a.tilt_pen)
-    ac = AC().to(dev)
+    env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode, dr=a.dr, target_max=a.target_max, lift_req=a.lift_req, speed_bonus=a.speed_bonus, release_mask=a.release_mask, mask_h=a.mask_h, tilt_pen_w=a.tilt_pen,
+                  drive=a.drive, dq_max_deg=a.dq_max, obs_lag=(None if a.obs_lag < 0 else bool(a.obs_lag)))
+    ac = AC(obs_dim=env.observe().shape[-1]).to(dev)
+    print(f"[ppo] obs_dim {ac.obs_dim} drive={a.drive} dq_max={a.dq_max} deg", flush=True)
     if a.init:
         ck = torch.load(a.init, map_location=dev, weights_only=False)
         try:
@@ -87,7 +107,7 @@ def main():
     json.dump(vars(a), open(os.path.join(a.out, "args.json"), "w"), indent=1)
 
     N, T = a.nworld, a.rollout
-    obs_b = torch.zeros(T, N, OBS_DIM, device=dev)
+    obs_b = torch.zeros(T, N, ac.obs_dim, device=dev)
     act_b = torch.zeros(T, N, ACT_DIM, device=dev)
     logp_b = torch.zeros(T, N, device=dev)
     rew_b = torch.zeros(T, N, device=dev)
@@ -133,7 +153,7 @@ def main():
             adv = (adv - adv.mean()) / (adv.std() + 1e-6)
         step += N * T
 
-        fo = obs_b.reshape(-1, OBS_DIM)
+        fo = obs_b.reshape(-1, ac.obs_dim)
         fa = act_b.reshape(-1, ACT_DIM)
         fl = logp_b.reshape(-1)
         fadv = adv.reshape(-1)

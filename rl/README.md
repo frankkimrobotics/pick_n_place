@@ -9,6 +9,12 @@ checkpoints with results in [`weights/`](weights/README.md).
 Environment: conda env with `mujoco`, `mujoco_warp`, `warp-lang`, `torch`
 (referred to below as `$PY`, e.g. `~/miniconda3/envs/mjwarp/bin/python`).
 
+## Drive-model probe (hardware replay)
+
+```bash
+$PY rl/drive_probe.py --drive real     # 10 deg step + 12 deg 0.5 Hz sine vs the 2026-09-17 hardware numbers
+```
+
 ## Environment smoke test
 
 ```bash
@@ -40,7 +46,10 @@ $PY rl/ppo.py --nworld 4096 --steps 30000000 --mode mix --dr \
     --init ~/pnp_rl/attach1/final.pt --out ~/pnp_rl/mix1
 ```
 
-Key flags: `--mode {attach,pnp,place,carry,mix}` (curriculum stage),
+Key flags: `--drive {real,ideal}` (measured Pro 630 velocity-drive model — the
+default since 2026-09-17 — vs the legacy stiff PD; see FINDINGS "Dynamics update"),
+`--dq_max DEG` (per-decision joint delta, 2 = 20 °/s), `--obs_lag {0,1}` (append
+`q_target − q`; auto-on for the real drive), `--mode {attach,pnp,place,carry,mix}` (curriculum stage),
 `--dr` (gain/seal/delay/obs randomization), `--release_mask --mask_h H`
 (suction release held while sealed > H above the target surface — a
 skill-forcing trainer aid; per-world in mix mode), `--tilt_pen W` (dense

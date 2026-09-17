@@ -41,7 +41,7 @@ def main():
     env = PickEnv(nworld=N, mode=a.mode, xml=a.scene, lift_req=0.35)
     ck = torch.load(a.actor, map_location=env.device, weights_only=False)
     if a.algo == "ppo":
-        net = AC().to(env.device)
+        net = AC(obs_dim=env.observe().shape[-1]).to(env.device)
         sd = ck["ac"]
         own = net.state_dict()
         for k in list(sd.keys()):                      # obs-dim growth: zero-pad
