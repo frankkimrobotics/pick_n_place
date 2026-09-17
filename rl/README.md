@@ -50,6 +50,11 @@ Under the pure paper reward neither drive discovered a single seal in 2–4M ste
 `paper_ideal`), so the env adds env_warp's dense press term and a one-time seal bonus.
 `--grasp_shaping 0` gives the pure paper reward.
 
+Observation extension (`--obs_ee 1`, default): tcp position, cup axis and the grasp-point-relative
+vector. With the paper's `[q, q̇, p_obj, p_goal, a_prev]` alone (5-DoF SO-101 in the paper, 6-DoF
+here) both drives plateaued with the cup ~10 cm from the object and never pressed (`paper2_*`).
+`--obs_ee 0` gives the paper's observation.
+
 ```bash
 $PY rl/env_paper.py --nworld 512 --steps 30 --drive real         # smoke test
 $PY rl/ppo.py --env paper --arch paper --nworld 2048 --steps 8000000 --rollout 24 --epochs 5 \
