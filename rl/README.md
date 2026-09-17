@@ -44,6 +44,12 @@ calibrated drive model):
 
 Note the paper has **no release phase**: "placement" is holding the lifted object at the goal.
 
+Embodiment adaptation (`--grasp_shaping 1`, default): the paper's parallel gripper grasps a cube
+by closing on it; our suction cup must be pressed 3 mm into the top at low speed with suction on.
+Under the pure paper reward neither drive discovered a single seal in 2–4M steps (`paper_real`,
+`paper_ideal`), so the env adds env_warp's dense press term and a one-time seal bonus.
+`--grasp_shaping 0` gives the pure paper reward.
+
 ```bash
 $PY rl/env_paper.py --nworld 512 --steps 30 --drive real         # smoke test
 $PY rl/ppo.py --env paper --arch paper --nworld 2048 --steps 8000000 --rollout 24 --epochs 5 \
