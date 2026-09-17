@@ -19,13 +19,28 @@ import warp as wp                                          # noqa: E402
 from sac import mlp, OBS_DIM, ACT_DIM                      # noqa: E402
 
 
+def mlp_paper(inp, out, hidden=(256, 128, 64)):
+    """Arafat et al. 2026 (QPAIN): MLP actor/critic [256,128,64], ELU, no normalisation."""
+    seq, d = [], inp
+    for h in hidden:
+        seq += [nn.Linear(d, h), nn.ELU()]
+        d = h
+    seq += [nn.Linear(d, out)]
+    return nn.Sequential(*seq)
+
+
 class AC(nn.Module):
-    def __init__(self, obs_dim=OBS_DIM):
+    def __init__(self, obs_dim=OBS_DIM, arch="default"):
         super().__init__()
         self.obs_dim = int(obs_dim)
-        self.pi = mlp(self.obs_dim, ACT_DIM, ln=False)
+        self.arch = arch
+        if arch == "paper":
+            self.pi = mlp_paper(self.obs_dim, ACT_DIM)
+            self.v = mlp_paper(self.obs_dim, 1)
+        else:
+            self.pi = mlp(self.obs_dim, ACT_DIM, ln=False)
+            self.v = mlp(self.obs_dim, 1)
         self.log_std = nn.Parameter(torch.full((ACT_DIM,), -0.5))
-        self.v = mlp(self.obs_dim, 1)
 
     def load_state_dict(self, sd, strict=True):
         """Obs-dim growth (37 -> 43 with the drive-lag obs, 2026-09-17):
@@ -77,16 +92,32 @@ def main():
     ap.add_argument("--smooth_w", type=float, default=None, help="weight of the delta-jerk cost (default W['smooth']=-0.01; 0 for the proven pnp economy)")
     ap.add_argument("--transport_w", type=float, default=None, help="weight of the carry-toward-target potential (default W['transport']=6)")
     ap.add_argument("--descend_sigma", type=float, default=0.07, help="xy gate width (m) of the descend-to-surface potential; 0.15 keeps it alive when the object drifts off target")
+    # ---- paper setup (Arafat et al., QPAIN 2026): env + PPO details ----
+    ap.add_argument("--env", default="pick", choices=["pick", "paper"], help="paper = env_paper.PaperPickEnv (reach/lift/track staged dense reward, no release)")
+    ap.add_argument("--arch", default="default", choices=["default", "paper"], help="paper = [256,128,64] ELU actor/critic")
+    ap.add_argument("--kl_target", type=float, default=None, help="adaptive LR on KL (paper 0.01): lr/1.5 if kl>2*target, lr*1.5 if kl<target/2")
+    ap.add_argument("--max_grad_norm", type=float, default=1.0)
+    ap.add_argument("--vf_coef", type=float, default=0.5, help="paper 1.0")
+    ap.add_argument("--value_clip", action="store_true", help="clipped value loss (paper: enabled)")
+    ap.add_argument("--reg_ramp", type=float, default=0.4, help="paper env: lambda(t) ramps 0->lambda_max over this fraction of --steps")
+    ap.add_argument("--ep_len", type=int, default=100, help="paper env: episode length in decisions (paper: 5 s)")
+    ap.add_argument("--start", default="home", choices=["home", "hover"], help="paper env start pose")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     dev = "cuda:0"
     torch.manual_seed(0)
     wp.init()
     from env_warp import PickEnv
-    env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode, dr=a.dr, target_max=a.target_max, lift_req=a.lift_req, speed_bonus=a.speed_bonus, release_mask=a.release_mask, mask_h=a.mask_h, tilt_pen_w=a.tilt_pen,
-                  drive=a.drive, dq_max_deg=a.dq_max, obs_lag=(None if a.obs_lag < 0 else bool(a.obs_lag)),
-                  hover_range=tuple(a.hover), smooth_w=a.smooth_w, transport_w=a.transport_w, descend_sigma=a.descend_sigma)
-    ac = AC(obs_dim=env.observe().shape[-1]).to(dev)
+    if a.env == "paper":
+        from env_paper import PaperPickEnv
+        env = PaperPickEnv(nworld=a.nworld, device=dev, xml=a.scene, dr=a.dr, drive=a.drive, dq_max_deg=a.dq_max,
+                           obs_lag=(None if a.obs_lag < 0 else bool(a.obs_lag)), target_max=a.target_max,
+                           start=a.start, ep_len=a.ep_len)
+    else:
+        env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode, dr=a.dr, target_max=a.target_max, lift_req=a.lift_req, speed_bonus=a.speed_bonus, release_mask=a.release_mask, mask_h=a.mask_h, tilt_pen_w=a.tilt_pen,
+                      drive=a.drive, dq_max_deg=a.dq_max, obs_lag=(None if a.obs_lag < 0 else bool(a.obs_lag)),
+                      hover_range=tuple(a.hover), smooth_w=a.smooth_w, transport_w=a.transport_w, descend_sigma=a.descend_sigma)
+    ac = AC(obs_dim=env.observe().shape[-1], arch=a.arch).to(dev)
     if a.init_std is not None:
         with torch.no_grad():
             ac.log_std.fill_(float(a.init_std))
@@ -161,6 +192,8 @@ def main():
             ret = adv + val_b[:T]
             adv = (adv - adv.mean()) / (adv.std() + 1e-6)
         step += N * T
+        if a.env == "paper":          # lambda(t): regularisation curriculum (paper sec. III-C-2)
+            env.reg_lambda = env.paper["lambda_max"] * min(1.0, step / max(1.0, a.reg_ramp * a.steps))
 
         fo = obs_b.reshape(-1, ac.obs_dim)
         fa = act_b.reshape(-1, ACT_DIM)
@@ -170,6 +203,8 @@ def main():
         idx_all = torch.randperm(fo.shape[0], device=dev)
         pl = vl = el = 0.0
         nb = 0
+        fv_old = val_b[:T].reshape(-1)
+        kl_sum = 0.0
         for _ in range(a.epochs):
             for k in range(0, fo.shape[0], a.minibatch):
                 mb = idx_all[k:k + a.minibatch]
@@ -179,14 +214,28 @@ def main():
                 l1 = ratio * fadv[mb]
                 l2 = ratio.clamp(1 - a.clip, 1 + a.clip) * fadv[mb]
                 lpi = -torch.min(l1, l2).mean()
-                lv = 0.5 * (ac.v(fo[mb]).squeeze(-1) - fret[mb]).pow(2).mean()
+                v_pred = ac.v(fo[mb]).squeeze(-1)
+                if a.value_clip:
+                    v_clip = fv_old[mb] + (v_pred - fv_old[mb]).clamp(-a.clip, a.clip)
+                    lv = 0.5 * torch.max((v_pred - fret[mb]).pow(2), (v_clip - fret[mb]).pow(2)).mean()
+                else:
+                    lv = 0.5 * (v_pred - fret[mb]).pow(2).mean()
                 lent = -dist.entropy().sum(-1).mean()
-                loss = lpi + 0.5 * lv + a.ent * lent
+                loss = lpi + a.vf_coef * lv + a.ent * lent
                 opt.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(ac.parameters(), 1.0)
+                nn.utils.clip_grad_norm_(ac.parameters(), a.max_grad_norm)
                 opt.step()
+                with torch.no_grad():
+                    kl_sum += float((fl[mb] - lp).mean())
                 pl += float(lpi); vl += float(lv); el += float(-lent); nb += 1
+        if a.kl_target is not None and nb > 0:      # adaptive LR (rsl_rl-style schedule)
+            kl = kl_sum / nb
+            for g in opt.param_groups:
+                if kl > 2.0 * a.kl_target:
+                    g["lr"] = max(1e-5, g["lr"] / 1.5)
+                elif kl < 0.5 * a.kl_target and kl > 0.0:
+                    g["lr"] = min(1e-2, g["lr"] * 1.5)
         n_up += 1
         if n_up % 5 == 0:
             n_ep = max(1, ep["n"])
@@ -197,7 +246,8 @@ def main():
                        succ_pnp=ep.get("placed_p", 0) / max(1, ep.get("n_p", 0)),
                        sps=step / (time.time() - t0),
                        comp={k: ep["comp"][i] / n_ep
-                             for i, k in enumerate(env.RKEYS)})
+                             for i, k in enumerate(env.RKEYS)},
+                       lr=opt.param_groups[0]["lr"], reg_lambda=getattr(env, "reg_lambda", None))
             log.write(json.dumps(rec) + "\n"); log.flush()
             print(f"[ppo] {step:>10,} | succ {rec['success']:.2%} pnp {rec['succ_pnp']:.2%} "
                   f"seal {rec['seal_rate']:.2%} ret {rec['ep_ret']:.2f} "
