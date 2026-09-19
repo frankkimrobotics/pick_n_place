@@ -165,6 +165,7 @@ def main():
 
     obs = env.observe()
     step, n_up, t0 = 0, 0, time.time()
+    best_succ = -1.0
     ep = dict(n=0, ret=0.0, len=0.0, placed=0, sealed=0,
               comp=np.zeros(len(env.RKEYS)))
     while step < a.steps:
@@ -265,6 +266,10 @@ def main():
                       comp=np.zeros(len(env.RKEYS)))
             torch.save(dict(ac=ac.state_dict(), step=step),
                        os.path.join(a.out, "ac.pt"))
+            if rec["success"] > best_succ:          # keep the peak (runs decay after it)
+                best_succ = rec["success"]
+                torch.save(dict(ac=ac.state_dict(), step=step, success=best_succ),
+                           os.path.join(a.out, "best.pt"))
     torch.save(dict(ac=ac.state_dict(), step=step),
                os.path.join(a.out, "final.pt"))
     print("[ppo] done", flush=True)
