@@ -90,8 +90,9 @@ def plan_to_targets(start_q, goal_pos_sim, tool_off, dq_max):
 class Teacher:
     """Phase controller; cuRobo for transits when available, IK waypoints otherwise."""
 
-    def __init__(self, env, demo, dik, use_planner, press_rate, tool_off, dq_max):
+    def __init__(self, env, demo, dik, use_planner, press_rate, tool_off, dq_max, press_depth=0.012):
         self.env, self.demo, self.dik = env, demo, dik
+        self.press_depth = press_depth       # IK press target below the grasp point (m); 4 mm was marginal vs the 3 mm latch
         self.use_planner, self.tool_off, self.dq_max = use_planner, tool_off, dq_max
         self.press_rate = math.radians(press_rate)
         self.rate = 0.9 * dq_max
@@ -116,7 +117,7 @@ class Teacher:
         self.q_carry = [None] * N
         for w in range(N):
             qh = self.ik(gp[w] + [0, 0, 0.04], q0[w]); self.q_hover[w] = qh if qh is not None else q0[w]
-            qg = self.ik(gp[w] + [0, 0, -0.004], self.q_hover[w]); self.q_grasp[w] = qg if qg is not None else self.q_hover[w]
+            qg = self.ik(gp[w] + [0, 0, -self.press_depth], self.q_hover[w]); self.q_grasp[w] = qg if qg is not None else self.q_hover[w]
             self.plans[w] = None
             if self.use_planner:
                 p = plan_to_targets(q0[w], gp[w] + [0, 0, 0.04], self.tool_off, self.dq_max)
@@ -233,6 +234,8 @@ def main():
     ap.add_argument("--dagger_iters", type=int, default=3)
     ap.add_argument("--dagger_batches", type=int, default=3)
     ap.add_argument("--press_rate", type=float, default=0.6, help="deg/decision during the press (slow for the real drive)")
+    ap.add_argument("--press_depth", type=float, default=0.02, help="press target below the grasp point (m); sweep 2026-09-19: 4 mm 3 %, 8 mm 65 %, 12 mm 80 %, 20 mm 91 % teacher success on the measured drive")
+    ap.add_argument("--ep_len", type=int, default=100, help="episode length (decisions); 150 for the measured drive (slower arm)")
     ap.add_argument("--noise", type=float, default=0.1)
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--no_planner", action="store_true", help="IK waypoints for transits too (no cuRobo)")
@@ -242,7 +245,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     wp.init()
     import mujoco
-    env = PaperPickEnv(nworld=a.nworld, xml=a.scene, dr=True, drive=a.drive)
+    env = PaperPickEnv(nworld=a.nworld, xml=a.scene, dr=True, drive=a.drive, ep_len=a.ep_len)
     env.auto_reset = False
     demo = {"__file__": os.path.join(os.path.dirname(HERE), "mjwarp_pick_demo.py")}
     exec(open(demo["__file__"]).read().split("if __name__")[0], demo)
@@ -258,7 +261,7 @@ def main():
         fk = rpc({"type": "fk", "q": q0}); p = np.array(fk["pos"][0]); Rm = R[0].cpu().numpy()
         tool_off = Rm.T @ (tcp[0].cpu().numpy() - p)          # sim cup tip in cuRobo tool frame
         print(f"[dagger] tool offset (tool frame) {np.round(tool_off, 4).tolist()} ({1000 * np.linalg.norm(tool_off):.1f} mm)", flush=True)
-    teacher = Teacher(env, demo, dik, use_planner, a.press_rate, tool_off, env.dq_max)
+    teacher = Teacher(env, demo, dik, use_planner, a.press_rate, tool_off, env.dq_max, press_depth=a.press_depth)
     from ppo import AC
     metrics = []
     X, Y = [], []

@@ -263,6 +263,15 @@ the twin. Findings, each from a replay of the stalled policy:
 10. Warm-starting the measured drive from the strong ideal policy: 0 % seals (`paper11_real`),
    as for attach — cross-drive transfer of a finished policy does not work; the measured drive
    needs its own DAgger teacher (or the dynamics curriculum).
+11. **The measured-drive teacher was failing at the press, not the reach.** Its IK press target
+   sat 4 mm below the grasp point against a 3 mm latch requirement, so with DR and tracking error
+   the cup stopped 1–2 mm short: 97 % of teacher episodes stuck pressing (34 % even on the ideal
+   drive). Press-depth sweep on the measured drive (150-step episodes): 4 mm 3 %, 8 mm 65 %,
+   12 mm 80 %, **20 mm 91 %** teacher success (ideal: 66 → 96 %). `--press_depth 0.02` is the default.
+12. Cross-drive transfer fails for reasons the dead-time curriculum cannot fix: the 89.8 %
+   ideal checkpoint scores 1–2 % in the measured-drive env even at zero dead-time and 5× accel,
+   because the streamed outer law, the 100 ms ramps, the velocity ceiling and the delayed
+   feedback remain. Each drive needs its own policy trained under its own dynamics.
 8. Planner throughput is the DAgger bottleneck (one server, ~40 % of hover goals rejected near
    the wall keep-out / camera mount → IK fallback). Table slab for the planner must clear the
    robot base (a slab through the base = every plan "no solution").

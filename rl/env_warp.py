@@ -223,6 +223,10 @@ class PickEnv:
         self.qd_meas_lag = torch.zeros(nworld, 6, device=device)
         self.prev_dq = torch.zeros(nworld, 6, device=device)
         self.sat_frac = torch.zeros(nworld, device=device)                    # drive-limit hits per decision
+        # dynamics curriculum: drive_scale 0 = near-ideal (no dead-time, 5x accel cap), 1 = measured
+        self.drive_scale = 1.0
+        self.dead_mult = torch.ones(nworld, device=device)
+        self.amax_mult = torch.ones(nworld, device=device)
         self.drive_law = "stream"                                             # or "waypoint" (probe only)
         # batched warp model/data
         self.m = mjw.put_model(self.mjm)
@@ -335,9 +339,9 @@ class PickEnv:
                 (self.rng.random(n_) < 0.5) & (self.drive == "ideal"), device=self.device)
             self.prev_action[idx] = 0.0
             self.vmax_w[idx] = DRIVE["vmax"] * torch.tensor(self.rng.uniform(*DRIVE_DR["vmax"], size=(n_, 1)), device=self.device, dtype=torch.float32)
-            self.amax_w[idx] = DRIVE["amax"] * torch.tensor(self.rng.uniform(*DRIVE_DR["amax"], size=(n_, 1)), device=self.device, dtype=torch.float32)
-            dead = self.rng.uniform(*DRIVE_DR["dead"], size=n_)
-            self.dead_ticks[idx] = torch.tensor(np.clip(np.round(dead / DRIVE["cmd_dt"]), 1, self.dead_max - 1).astype(np.int64), device=self.device)
+            self.amax_mult[idx] = torch.tensor(self.rng.uniform(*DRIVE_DR["amax"], size=n_), device=self.device, dtype=torch.float32)
+            self.dead_mult[idx] = torch.tensor(self.rng.uniform(*DRIVE_DR["dead"], size=n_) / DRIVE["dead"], device=self.device, dtype=torch.float32)
+            self.apply_drive_scale(idx)
         self.q_target[idx] = self.qpos[idx, :6]
         self.q_target_prev[idx] = self.qpos[idx, :6]
         self.q_drive[idx] = self.qpos[idx, :6]
@@ -682,6 +686,15 @@ class PickEnv:
         if done.any() and getattr(self, "auto_reset", True):
             self.reset(done)
         return obs, r, done, info
+
+    def apply_drive_scale(self, idx=None):
+        """Set per-world dead-time and accel cap from the DR multipliers and the curriculum scale."""
+        idx = torch.arange(self.nworld, device=self.device) if idx is None else idx
+        sc = float(self.drive_scale)
+        dead = DRIVE["dead"] * self.dead_mult[idx] * sc
+        self.dead_ticks[idx] = (dead / DRIVE["cmd_dt"]).round().clamp(0, self.dead_max - 1).long()
+        amax = DRIVE["amax"] * self.amax_mult[idx] * (1.0 + 4.0 * (1.0 - sc))
+        self.amax_w[idx] = amax[:, None]
 
     # ---------------- measured drive model ----------------
     def _step_real_drive(self, log=None):

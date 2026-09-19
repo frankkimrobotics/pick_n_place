@@ -105,6 +105,7 @@ def main():
     ap.add_argument("--w_track_c", type=float, default=2.0, help="paper env: coarse goal-tracking weight (sigma 0.10 m)")
     ap.add_argument("--w_track_f", type=float, default=4.0, help="paper env: fine goal-tracking weight (sigma 0.02 m)")
     ap.add_argument("--w_reach", type=float, default=1.0, help="paper env: reach weight")
+    ap.add_argument("--drive_ramp", type=float, default=0.0, help="dynamics curriculum: anneal the measured drive's dead-time/accel from near-ideal (0) to measured (1) over this fraction of --steps (0 = off)")
     ap.add_argument("--vf_coef", type=float, default=0.5, help="paper 1.0")
     ap.add_argument("--value_clip", action="store_true", help="clipped value loss (paper: enabled)")
     ap.add_argument("--reg_ramp", type=float, default=0.4, help="paper env: lambda(t) ramps 0->lambda_max over this fraction of --steps")
@@ -202,6 +203,9 @@ def main():
             ret = adv + val_b[:T]
             adv = (adv - adv.mean()) / (adv.std() + 1e-6)
         step += N * T
+        if a.drive_ramp > 0 and a.drive == "real":
+            env.drive_scale = min(1.0, step / max(1.0, a.drive_ramp * a.steps))
+            env.apply_drive_scale()
         if a.env == "paper":          # lambda(t): regularisation curriculum (paper sec. III-C-2)
             env.reg_lambda = env.paper["lambda_max"] * min(1.0, step / max(1.0, a.reg_ramp * a.steps))
 
@@ -257,7 +261,8 @@ def main():
                        sps=step / (time.time() - t0),
                        comp={k: ep["comp"][i] / n_ep
                              for i, k in enumerate(env.RKEYS)},
-                       lr=opt.param_groups[0]["lr"], reg_lambda=getattr(env, "reg_lambda", None))
+                       lr=opt.param_groups[0]["lr"], reg_lambda=getattr(env, "reg_lambda", None),
+                       drive_scale=getattr(env, "drive_scale", None))
             log.write(json.dumps(rec) + "\n"); log.flush()
             print(f"[ppo] {step:>10,} | succ {rec['success']:.2%} pnp {rec['succ_pnp']:.2%} "
                   f"seal {rec['seal_rate']:.2%} ret {rec['ep_ret']:.2f} "
