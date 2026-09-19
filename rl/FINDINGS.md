@@ -231,6 +231,34 @@ mode from that init. It injects the whole behaviour, so PPO only has to refine t
 placement accuracy — the regime in which the graded terminals are known to work
 (ppo4/5/7).
 
+### Paper reproduction track (Arafat et al. QPAIN 2026), 2026-09-18/19
+
+`rl/env_paper.py` hosts the paper's task (reach → lift → hold at a 3-D goal, no release) on
+the twin. Findings, each from a replay of the stalled policy:
+
+1. Pure paper reward: reach learns, **no seal ever** on either drive — a gripper closing on a
+   cube grasps trivially, a suction cup needs a sustained 3 mm press (`--grasp_shaping`).
+2. Paper observation `[q, q̇, p_obj, p_goal, a_prev]`: 6-DoF policies plateau 10 cm from the
+   object (implicit FK); `--obs_ee` adds tcp, cup axis, grasp-relative vector.
+3. Reach to the object **centre** pulls a suction cup down beside the box, tilted 30–43°;
+   `--reach_target grasp` (top centre + cup radius).
+4. Lift indicator at 2 cm has no gradient below it: sealed policies pressed for the rest of the
+   episode; `--lift_dense` ramps to the threshold.
+5. **Teacher + DAgger is what made it learn** (`rl/bc_curobo.py`: cuRobo transits, slow press,
+   IK-waypoint relabeling). One-shot BC = 0 % every time; 3 DAgger rounds → 11 % deterministic
+   (ideal), student-driven 15 %. Clone in PPO's pre-tanh space (`mu = atanh(a)`): the squashed
+   clone lost its behaviour in one update (0.3 % seals), the corrected one kept 9.9 %.
+6. **The paper's weight emphasis matters**: with reach 1 / tracking 2+4 the DAgger-initialised
+   run peaked at 14 % and decayed (return kept rising on lift credit); with reach 0.5 /
+   tracking 4+8 (`--w_reach --w_track_c --w_track_f`) it climbed 5 → 20 % by 4M steps
+   (`paper9_ideal`, 4096 worlds).
+7. Measured drive: cuRobo teacher 31 % success (slow press 0.6 °/decision is what lets it seal),
+   DAgger student seals 45 % at round 1 then regresses; PPO from that round (`paper9_real`) is
+   the current run. Every stage is ~3× slower than the ideal drive.
+8. Planner throughput is the DAgger bottleneck (one server, ~40 % of hover goals rejected near
+   the wall keep-out / camera mount → IK fallback). Table slab for the planner must clear the
+   robot base (a slab through the base = every plan "no solution").
+
 ## Plan from here (2026-09-17)
 
 Ordered by expected payoff; each step is a from-scratch or warm-chain run in the
