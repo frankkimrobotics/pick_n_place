@@ -272,6 +272,16 @@ the twin. Findings, each from a replay of the stalled policy:
    ideal checkpoint scores 1–2 % in the measured-drive env even at zero dead-time and 5× accel,
    because the streamed outer law, the 100 ms ramps, the velocity ceiling and the delayed
    feedback remain. Each drive needs its own policy trained under its own dynamics.
+13. **Deep-press DAgger (2026-09-19, `dagger4_*`, `--press_depth 0.02 --press_rate 0.6`)**:
+   ideal teacher 90 %, student 0 → 0 → 20 → **44.5 %** deterministic over 3 rounds (one-shot BC
+   still 0 %); measured drive (150-step episodes, 6 teacher batches) teacher 80 %, student
+   0 → 0 (seal 68 %) → 0 → **14.5 %** — the first non-zero clone on the measured drive. The
+   student-driven relabel batches (β = 0.1) succeed 34–35 % on the measured drive, so the
+   student is close; the deterministic replay is what lags. PPO from the round-3 checkpoints:
+   `paper13_ideal` 28 → 39 → 46 → 52 % in the first 2M steps (starts where `paper10` peaked);
+   `paper13_real` from `bc_iter3.pt`, in progress.
+14. Ideal-drive champion so far: `paper12_ideal` **83.1 %** at 9.8M steps with no late decay
+   (entropy 0.0015, no value clip, vf_coef 0.5; `rl/weights/paper12_ideal_best.pt`, 8/8 replay).
 8. Planner throughput is the DAgger bottleneck (one server, ~40 % of hover goals rejected near
    the wall keep-out / camera mount → IK fallback). Table slab for the planner must clear the
    robot base (a slab through the base = every plan "no solution").
