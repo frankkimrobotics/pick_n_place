@@ -97,6 +97,13 @@ def main():
     ap.add_argument("--arch", default="default", choices=["default", "paper"], help="paper = [256,128,64] ELU actor/critic")
     ap.add_argument("--kl_target", type=float, default=None, help="adaptive LR on KL (paper 0.01): lr/1.5 if kl>2*target, lr*1.5 if kl<target/2")
     ap.add_argument("--max_grad_norm", type=float, default=1.0)
+    # ---- demonstration anchor (DAPG-style): keeps a DAgger-initialised policy near the teacher ----
+    ap.add_argument("--bc_data", default=None, help="bc_curobo dataset.pt {X obs, Y actions}; adds bc_coef * MSE(pi(X), atanh(Y)) to the loss")
+    ap.add_argument("--bc_coef", type=float, default=1.0, help="initial weight of the demo MSE term")
+    ap.add_argument("--bc_coef_min", type=float, default=0.1, help="floor the weight decays to")
+    ap.add_argument("--bc_decay_steps", type=float, default=6e6, help="linear decay bc_coef -> bc_coef_min over this many env steps")
+    ap.add_argument("--bc_batch", type=int, default=4096)
+    ap.add_argument("--critic_warmup", type=int, default=0, help="updates during which only the critic is trained (actor frozen)")
     ap.add_argument("--lr_max", type=float, default=1e-3, help="ceiling for the adaptive LR (it ran to 3.8e-3 while the policy idled)")
     ap.add_argument("--grasp_shaping", type=int, default=1, help="paper env: suction press term + seal bonus (embodiment adaptation); 0 = pure paper reward")
     ap.add_argument("--obs_ee", type=int, default=1, help="paper env: append tcp position, cup axis and grasp-point-relative vector (0 = paper's obs only)")
@@ -153,6 +160,13 @@ def main():
         except Exception as e:
             print("[ppo] warm-start skipped:", e, flush=True)
     opt = torch.optim.Adam(ac.parameters(), lr=a.lr)
+    bcX = bcY = None
+    if a.bc_data:
+        dsb = torch.load(a.bc_data, map_location=dev, weights_only=False)
+        bcX, bcY = dsb["X"].to(dev), torch.atanh(dsb["Y"].to(dev).clamp(-0.97, 0.97))
+        if bcX.shape[1] != ac.obs_dim:
+            raise SystemExit(f"[ppo] bc_data obs {bcX.shape[1]} != env obs {ac.obs_dim}")
+        print(f"[ppo] demo anchor: {bcX.shape[0]} steps, coef {a.bc_coef} -> {a.bc_coef_min} over {a.bc_decay_steps:.0f} steps", flush=True)
     log = open(os.path.join(a.out, "log.jsonl"), "a")
     json.dump(vars(a), open(os.path.join(a.out, "args.json"), "w"), indent=1)
 
@@ -215,7 +229,7 @@ def main():
         fadv = adv.reshape(-1)
         fret = ret.reshape(-1)
         idx_all = torch.randperm(fo.shape[0], device=dev)
-        pl = vl = el = 0.0
+        pl = vl = el = bl = 0.0
         nb = 0
         fv_old = val_b[:T].reshape(-1)
         kl_sum = 0.0
@@ -235,7 +249,17 @@ def main():
                 else:
                     lv = 0.5 * (v_pred - fret[mb]).pow(2).mean()
                 lent = -dist.entropy().sum(-1).mean()
-                loss = lpi + a.vf_coef * lv + a.ent * lent
+                if n_up < a.critic_warmup:
+                    loss = a.vf_coef * lv
+                else:
+                    loss = lpi + a.vf_coef * lv + a.ent * lent
+                if bcX is not None and n_up >= a.critic_warmup:
+                    frac = min(1.0, step / max(1.0, a.bc_decay_steps))
+                    bc_c = a.bc_coef + (a.bc_coef_min - a.bc_coef) * frac
+                    jb = torch.randint(0, bcX.shape[0], (a.bc_batch,), device=dev)
+                    lbc = (ac.pi(bcX[jb]) - bcY[jb]).pow(2).mean()
+                    loss = loss + bc_c * lbc
+                    bl += float(lbc)
                 opt.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(ac.parameters(), a.max_grad_norm)
@@ -258,7 +282,7 @@ def main():
                        ep_ret=ep["ret"] / n_ep, ep_len=ep["len"] / n_ep,
                        success=ep["placed"] / n_ep, seal_rate=ep["sealed"] / n_ep,
                        succ_pnp=ep.get("placed_p", 0) / max(1, ep.get("n_p", 0)),
-                       sps=step / (time.time() - t0),
+                       sps=step / (time.time() - t0), bc_mse=(bl / nb if bcX is not None else None),
                        comp={k: ep["comp"][i] / n_ep
                              for i, k in enumerate(env.RKEYS)},
                        lr=opt.param_groups[0]["lr"], reg_lambda=getattr(env, "reg_lambda", None),

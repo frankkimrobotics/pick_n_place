@@ -241,6 +241,8 @@ def main():
     ap.add_argument("--no_planner", action="store_true", help="IK waypoints for transits too (no cuRobo)")
     ap.add_argument("--out", default=os.path.expanduser("~/pnp_rl/dagger_real"))
     ap.add_argument("--scene", default=os.path.join(HERE, "scenes", "box_med.xml"))
+    ap.add_argument("--resume", default=None, help="continue DAgger from this run dir (dataset.pt + last bc_iter*.pt + metrics.json); teacher batches are skipped")
+    ap.add_argument("--beta_min", type=float, default=0.0, help="floor of the teacher-mixing schedule 0.5, 0.3, 0.1, ...")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     wp.init()
@@ -268,13 +270,29 @@ def main():
     t0 = time.time()
     # ---- iteration 0: teacher demonstrations ----
     n_ok = n_ep = 0
-    for b in range(a.teacher_batches):
+    start = 0
+    if a.resume:
+        metrics = json.load(open(os.path.join(a.resume, "metrics.json")))
+        start = metrics[-1]["iter"] + 1
+        ds = torch.load(os.path.join(a.resume, "dataset.pt"), map_location=dev, weights_only=False)
+        X, Y = [ds["X"].to(dev)], [ds["Y"].to(dev)]
+        n_ok, n_ep = int(round(metrics[-1]["teacher_success"] * 1000)), 1000
+        print(f"[dagger] resume {a.resume}: dataset {X[0].shape[0]} steps, continuing at iter {start}", flush=True)
+    for b in range(a.teacher_batches if not a.resume else 0):
         O, Aexp, ok, es = rollout(env, teacher, None, a.noise, EP, 1.0)
         X.append(O.reshape(-1, O.shape[-1])); Y.append(Aexp.reshape(-1, 7))      # DAgger keeps ALL states
         n_ok += int(ok.sum()); n_ep += env.nworld
         print(f"[dagger] teacher batch {b}: success {100 * ok.float().mean():.1f} %  sealed {100 * es.float().mean():.0f} %  plan fails {teacher.n_plan_fail}  ({(time.time() - t0) / 60:.1f} min)", flush=True)
     ac = AC(obs_dim=X[0].shape[1], arch="paper").to(dev)
-    for it in range(a.dagger_iters + 1):
+    if a.resume:
+        ac.load_state_dict(torch.load(os.path.join(a.resume, f"bc_iter{start - 1}.pt"), map_location=dev, weights_only=False)["ac"])
+    for it in range(start, a.dagger_iters + 1):
+        if it > 0:                                          # relabel batches driven by the previous student
+            beta = max(a.beta_min, 0.5 - 0.2 * (it - 1))    # mixing: 0.5, 0.3, 0.1, beta_min ...
+            for b in range(a.dagger_batches):
+                O, Aexp, ok, es = rollout(env, teacher, ac.pi, 0.0, EP, beta)
+                X.append(O.reshape(-1, O.shape[-1])); Y.append(Aexp.reshape(-1, 7))
+                print(f"[dagger]   relabel batch {b} (beta {beta:.1f}): student-driven success {100 * ok.float().mean():.1f} %  sealed {100 * es.float().mean():.0f} %", flush=True)
         Xc, Yc = torch.cat(X), torch.cat(Y)
         mse = fit(ac, Xc, Yc, a.epochs, dev)
         with torch.no_grad():
@@ -287,13 +305,6 @@ def main():
         print(f"[dagger] iter {it}: dataset {Xc.shape[0]} mse {mse:.4f} | student success {100 * succ:.1f} % seal {100 * seal:.0f} % return {ret:.2f}", flush=True)
         json.dump(metrics, open(os.path.join(a.out, "metrics.json"), "w"), indent=1)
         torch.save({"ac": ac.state_dict(), "step": 0}, os.path.join(a.out, f"bc_iter{it}.pt"))
-        if it == a.dagger_iters:
-            break
-        beta = max(0.0, 0.5 - 0.2 * it)                    # mixing: 0.5, 0.3, 0.1
-        for b in range(a.dagger_batches):
-            O, Aexp, ok, es = rollout(env, teacher, ac.pi, 0.0, EP, beta)
-            X.append(O.reshape(-1, O.shape[-1])); Y.append(Aexp.reshape(-1, 7))
-            print(f"[dagger]   relabel batch {b} (beta {beta:.1f}): student-driven success {100 * ok.float().mean():.1f} %  sealed {100 * es.float().mean():.0f} %", flush=True)
     torch.save({"ac": ac.state_dict(), "step": 0}, os.path.join(a.out, "bc_init.pt"))
     print(f"[dagger] saved {a.out}/bc_init.pt", flush=True)
 
