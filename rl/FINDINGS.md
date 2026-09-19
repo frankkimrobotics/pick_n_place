@@ -255,6 +255,14 @@ the twin. Findings, each from a replay of the stalled policy:
 7. Measured drive: cuRobo teacher 31 % success (slow press 0.6 °/decision is what lets it seal),
    DAgger student seals 45 % at round 1 then regresses; PPO from that round (`paper9_real`) is
    the current run. Every stage is ~3× slower than the ideal drive.
+9. **The paper's adaptive LR is what made every DAgger-initialised run peak and decay** (peaks
+   14–20 %, then 2–4 %): the KL rule raises the rate 10× above 1e-4 once the policy settles.
+   Same init, same weights, fixed lr 1e-4, entropy 0.003: **11 → 15 → 20 → 34 → 51 → 68 %**
+   success by 3.9M steps, seal 92 % (`paper10_ideal`, 4096 worlds; 6/6 deterministic replay).
+   `ppo.py` now saves `best.pt` at the peak success.
+10. Warm-starting the measured drive from the strong ideal policy: 0 % seals (`paper11_real`),
+   as for attach — cross-drive transfer of a finished policy does not work; the measured drive
+   needs its own DAgger teacher (or the dynamics curriculum).
 8. Planner throughput is the DAgger bottleneck (one server, ~40 % of hover goals rejected near
    the wall keep-out / camera mount → IK fallback). Table slab for the planner must clear the
    robot base (a slab through the base = every plan "no solution").
