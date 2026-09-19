@@ -47,8 +47,9 @@ def main():
         env = PickEnv(nworld=N, mode=a.mode, xml=a.scene, lift_req=0.35, drive=a.drive)
     ck = torch.load(a.actor, map_location=env.device, weights_only=False)
     if a.algo == "ppo":
-        net = AC(obs_dim=env.observe().shape[-1]).to(env.device)
         sd = ck["ac"]
+        arch = "paper" if sd["pi.0.weight"].shape[0] == 256 else "default"   # infer the architecture from the checkpoint
+        net = AC(obs_dim=env.observe().shape[-1], arch=arch).to(env.device)
         own = net.state_dict()
         for k in list(sd.keys()):                      # obs-dim growth: zero-pad
             if k in own and own[k].shape != sd[k].shape:
