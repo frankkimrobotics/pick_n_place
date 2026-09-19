@@ -439,7 +439,7 @@ def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, ob
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--policy", default=os.path.join(HERE, "weights", "dagger5_real_iter7"), help="stem of .plan/.pt (dagger5_real_iter7: 84 % in sim on the measured drive)")
+    ap.add_argument("--policy", default=os.path.join(HERE, "weights", "dagger6_real_iter10"), help="stem of .plan/.pt (dagger6_real_iter10: 87.8 % in sim on the measured drive, 1024 episodes)")
     ap.add_argument("--obs_noise", type=float, default=OBS_NOISE, help="Gaussian noise added to the observation (training value; 0 makes the policy stall)")
     ap.add_argument("--lead_max", type=float, default=LEAD_MAX_DEG, help="max lead (deg) of the streamed reference over the measured joint")
     ap.add_argument("--no_contact", action="store_true", help="disable the torque contact guard / attach emulation")

@@ -166,7 +166,7 @@ in FINDINGS) but no checkpoint assembles the full V3 task yet.
 ## Deploying a policy on the real Pro 630 (2026-09-19)
 
     PY=~/miniconda3/envs/mjwarp/bin/python
-    $PY rl/export_trt.py rl/weights/dagger5_real_iter7.pt --obs_dim 40      # -> .onnx + .plan (TensorRT), verified vs torch
+    $PY rl/export_trt.py rl/weights/dagger6_real_iter10.pt --obs_dim 40     # -> .onnx + .plan (TensorRT), verified vs torch
     $PY rl/real_policy_ctrl.py --selftest --episodes 256                     # controller path vs the simulator (~80 %)
     # Pi: LinuxCNC + robot_hal running (mycobot_mpc/launch_mpc_stack.sh), arm at config.START_Q, object on the table
     $PY rl/real_policy_ctrl.py --obj 0.38 0.0 0.02 --goal 0.30 -0.12 0.14            # dry run (prints, sends nothing)
