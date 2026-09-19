@@ -12,6 +12,7 @@ PPO files hold `{"ac": state_dict, "step": int}`, the student holds
 | `ppo15_attach_fixedphys.pt` | `attach` | **corrected suction physics** | 74.6% seal+lift — warm-start for new runs |
 | `distill1_student_rgbd.pt` | vision | DAgger from `ppo7_ped` | lift 33.4 cm, landing 4.0 cm/s, placement 11.4 cm |
 | `paper10_ideal_best.pt` | `--env paper` (Arafat et al. 2026 task: reach/lift/hold at goal) | ideal drive, cuRobo+DAgger init, fixed LR, 4096 worlds | **70.5 %** at 8.4M steps, 6/6 deterministic replay |
+| `paper12_ideal_best.pt` | `--env paper` | same init; entropy 0.0015, no value clipping, vf_coef 0.5 | **83.1 %** at 9.8M steps, no late decay (final 82.2 %) |
 
 `ppo*` observe the privileged 37-D state (`rl/env_warp.py: observe()`).
 `distill1_student_rgbd` observes only 2×RGBD 96×96 + proprio + goal
