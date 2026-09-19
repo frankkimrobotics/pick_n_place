@@ -188,7 +188,7 @@ def rollout(env, teacher, policy, noise, EP, beta):
             a = a_exp.clone(); a[:, :6] += torch.randn(N, 6, device=dev) * noise
         else:
             with torch.no_grad():
-                a = policy(obs).clamp(-1, 1)
+                a = torch.tanh(policy(obs))
             use_t = torch.rand(N, device=dev) < beta
             a = torch.where(use_t[:, None], a_exp, a)
         O.append(obs.clone()); A.append(a_exp.clone())
@@ -197,7 +197,13 @@ def rollout(env, teacher, policy, noise, EP, beta):
     return torch.stack(O, 1), torch.stack(A, 1), ok, env.ever_sealed.clone()
 
 
+def pre_tanh(a):
+    """PPO executes tanh(mu + noise): clone mu = atanh(a) so the deterministic policy reproduces a."""
+    return torch.atanh(a.clamp(-0.97, 0.97))
+
+
 def fit(ac, X, Y, epochs, dev):
+    Y = pre_tanh(Y)
     opt = torch.optim.Adam(ac.pi.parameters(), lr=1e-3)
     idx = torch.arange(X.shape[0], device=dev)
     for ep in range(epochs):
@@ -214,7 +220,7 @@ def evaluate(env, ac, EP):
     env.reset(torch.ones(N, dtype=torch.bool, device=dev))
     for k in range(EP):
         with torch.no_grad():
-            a = ac.pi(env.observe()).clamp(-1, 1)
+            a = torch.tanh(ac.pi(env.observe()))
         _, r, done, info = env.step(a)
     return float(info["placed"].float().mean()), float(env.ever_sealed.float().mean()), float(info["ep_comp"].sum(-1).mean())
 
@@ -269,8 +275,9 @@ def main():
         Xc, Yc = torch.cat(X), torch.cat(Y)
         mse = fit(ac, Xc, Yc, a.epochs, dev)
         with torch.no_grad():
-            ac.log_std.fill_(-1.0)
+            ac.log_std.fill_(-1.5)
         succ, seal, ret = evaluate(env, ac, EP)
+        torch.save({"X": Xc.cpu(), "Y": Yc.cpu()}, os.path.join(a.out, "dataset.pt"))
         rec = dict(iter=it, dataset=int(Xc.shape[0]), mse=mse, student_success=succ, student_seal=seal, student_return=ret,
                    teacher_success=n_ok / max(1, n_ep), minutes=(time.time() - t0) / 60)
         metrics.append(rec)
