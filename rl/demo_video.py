@@ -31,6 +31,7 @@ def main():
     ap.add_argument("--algo", default="sac", choices=["sac", "ppo"])
     ap.add_argument("--horizon", type=int, default=45)
     ap.add_argument("--drive", default="real", choices=["real", "ideal"], help="drive model (2026-09-17: real = measured Pro 630)")
+    ap.add_argument("--env", default="pick", choices=["pick", "paper"], help="paper = env_paper.PaperPickEnv (reach/lift/hold task)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     wp.init()
@@ -39,11 +40,16 @@ def main():
     from ppo import AC
 
     N = a.episodes
-    env = PickEnv(nworld=N, mode=a.mode, xml=a.scene, lift_req=0.35, drive=a.drive)
+    if a.env == "paper":
+        from env_paper import PaperPickEnv
+        env = PaperPickEnv(nworld=N, xml=a.scene, dr=False, drive=a.drive)
+    else:
+        env = PickEnv(nworld=N, mode=a.mode, xml=a.scene, lift_req=0.35, drive=a.drive)
     ck = torch.load(a.actor, map_location=env.device, weights_only=False)
     if a.algo == "ppo":
-        net = AC(obs_dim=env.observe().shape[-1]).to(env.device)
         sd = ck["ac"]
+        arch = "paper" if sd["pi.0.weight"].shape[0] == 256 else "default"   # infer the architecture from the checkpoint
+        net = AC(obs_dim=env.observe().shape[-1], arch=arch).to(env.device)
         own = net.state_dict()
         for k in list(sd.keys()):                      # obs-dim growth: zero-pad
             if k in own and own[k].shape != sd[k].shape:
