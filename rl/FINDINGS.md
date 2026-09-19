@@ -282,6 +282,23 @@ the twin. Findings, each from a replay of the stalled policy:
    `paper13_real` from `bc_iter3.pt`, in progress.
 14. Ideal-drive champion so far: `paper12_ideal` **83.1 %** at 9.8M steps with no late decay
    (entropy 0.0015, no value clip, vf_coef 0.5; `rl/weights/paper12_ideal_best.pt`, 8/8 replay).
+15. **DAgger alone solves the measured drive (2026-09-19, `dagger5_real`, resumed from `dagger4_real` with
+   `bc_curobo.py --resume`, beta 0 relabels)**: rounds 4-7 give 12 -> 41 -> 36 -> **84.8 %** deterministic
+   student success (83-86 % on 1024 fresh episodes, `rl/weights/dagger5_real_iter7.pt`), teacher 80 %.
+   PPO on top of the DAgger init never got past 24 % on this drive (paper13/14_real) and decayed even
+   with the demonstration anchor (`--bc_data`, `--critic_warmup`; the anchor did hold the ideal run
+   at 41-52 % instead of decaying to 40 %, but far below paper12's 83 %). Rounds 8-9 (`dagger6_real`)
+   regress to 62-70 %: keep the best round, not the last.
+16. **The BC policy needs the training observation noise at test time**: nominal sim, no noise 31 %;
+   with the env's 0.005 Gaussian obs noise 78 %; full DR 85 %. Deterministic observations let the
+   clone stall at a fixed point (hover/press). `real_policy_ctrl.py` adds the noise (`--obs_noise`).
+17. **Deployment path** (`rl/export_trt.py`, `rl/real_policy_ctrl.py`): checkpoint -> ONNX -> TensorRT
+   engine (max |trt - torch| 3e-5, 120-170 us/call on the A5000), observation rebuilt on the desktop
+   exactly like `PaperPickEnv.observe()` (max diff 3e-7 on the first step, 2e-3 over an episode from
+   float32 FK), closed loop through the engine reproduces the direct evaluation (80.9 % vs 78 %).
+   Robot side: 10 Hz chunks into `robot_hal`'s stream welder (K0 20, K1 0.3, vff 1), reference lead
+   bounded to 3 deg, torque contact guard (contact_detector thresholds), attach emulation (no object
+   tracking), suction via a new `{"suction": 0/1}` robot_hal command.
 8. Planner throughput is the DAgger bottleneck (one server, ~40 % of hover goals rejected near
    the wall keep-out / camera mount → IK fallback). Table slab for the planner must clear the
    robot base (a slab through the base = every plan "no solution").

@@ -162,3 +162,19 @@ $PY rl/distill.py --teacher rl/weights/ppo7_ped_teacher.pt \
 Status: V1/V2 solved by the ppo4→ppo7 line (see `weights/README.md`);
 V3 remains open — all component skills train (see place-curriculum results
 in FINDINGS) but no checkpoint assembles the full V3 task yet.
+
+## Deploying a policy on the real Pro 630 (2026-09-19)
+
+    PY=~/miniconda3/envs/mjwarp/bin/python
+    $PY rl/export_trt.py rl/weights/dagger5_real_iter7.pt --obs_dim 40      # -> .onnx + .plan (TensorRT), verified vs torch
+    $PY rl/real_policy_ctrl.py --selftest --episodes 256                     # controller path vs the simulator (~80 %)
+    # Pi: LinuxCNC + robot_hal running (mycobot_mpc/launch_mpc_stack.sh), arm at config.START_Q, object on the table
+    $PY rl/real_policy_ctrl.py --obj 0.38 0.0 0.02 --goal 0.30 -0.12 0.14            # dry run (prints, sends nothing)
+    $PY rl/real_policy_ctrl.py --obj 0.38 0.0 0.02 --goal 0.30 -0.12 0.14 --exec     # runs 15 s at 10 Hz
+
+`--obj` is the object CENTRE in the robot base frame (training box 5x5x4 cm: `--half 0.025 0.025 0.02`),
+or `--obj_from_tcp` after jogging the cup onto the object top. The object top must be at z = 0.02..0.07 m
+(the training table top is z = 0; config.TABLE_Z = -0.10 needs a ~10 cm riser or `--force`).
+Safety: nothing is sent without `--exec`; 2 deg/decision; elbow box; wall keep-out; reference lead <= 3 deg;
+torque contact guard (firm = hold, hard = abort); SIGINT = suction off + hold. Suction goes through the new
+`{"suction": 0/1}` command of `robot_hal.py` (mycobot_mpc, copy to the Pi).
