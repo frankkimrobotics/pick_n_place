@@ -287,8 +287,9 @@ the twin. Findings, each from a replay of the stalled policy:
    student success (83-86 % on 1024 fresh episodes, `rl/weights/dagger5_real_iter7.pt`), teacher 80 %.
    PPO on top of the DAgger init never got past 24 % on this drive (paper13/14_real) and decayed even
    with the demonstration anchor (`--bc_data`, `--critic_warmup`; the anchor did hold the ideal run
-   at 41-52 % instead of decaying to 40 %, but far below paper12's 83 %). Rounds 8-9 (`dagger6_real`)
-   regress to 62-70 %: keep the best round, not the last.
+   at 41-52 % instead of decaying to 40 %, but far below paper12's 83 %). Rounds 8-10 (`dagger6_real`):
+   62 -> 70 -> **87.8 %** (1024 episodes; round 7 84.4 % on the same episodes) -- the rounds are noisy,
+   keep the best-scoring one (`rl/weights/dagger6_real_iter10.pt`, the controller default).
 16. **The BC policy needs the training observation noise at test time**: nominal sim, no noise 31 %;
    with the env's 0.005 Gaussian obs noise 78 %; full DR 85 %. Deterministic observations let the
    clone stall at a fixed point (hover/press). `real_policy_ctrl.py` adds the noise (`--obs_noise`).
