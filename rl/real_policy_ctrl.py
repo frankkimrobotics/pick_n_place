@@ -376,6 +376,32 @@ class SimLink:
         pass
 
 
+# ---------------------------------------------------------------- live object tracking (rl/d435_track.py over UDP)
+class ObjectTracker:
+    """Latest D435 detection {cx, cy, top, n} from rl/d435_track.py (udp 127.0.0.1:9701)."""
+
+    def __init__(self, port=9701):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", port))
+        self.sock.setblocking(False)
+        self.last = None
+        self.t_last = 0.0
+
+    def poll(self):
+        while True:
+            try:
+                data = self.sock.recv(4096)
+            except BlockingIOError:
+                break
+            try:
+                m = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if m.get("cx") is not None:
+                self.last, self.t_last = m, time.time()
+        return self.last if (time.time() - self.t_last) < 0.5 else None
+
+
 # ---------------------------------------------------------------- safety
 class Guard:
     def __init__(self, obs_builder, obj_top_z, force=False):
@@ -408,9 +434,30 @@ class Guard:
         return v
 
 
+TRACK_MAX_STEP = 0.05
+
+
+def retract_to_hover(link, ob, guard, q_now, tip_now, z_hover):
+    """IK straight up to z_hover above the current tip xy, streamed as a slow path; returns the hover joints."""
+    import mujoco
+    demo = {"__file__": os.path.join(ROOT, "mjwarp_pick_demo.py")}
+    exec(open(demo["__file__"]).read().split("if __name__")[0], demo)
+    q_up, err = demo["ik"](ob.m, mujoco.MjData(ob.m), "tcp", [float(tip_now[0]), float(tip_now[1]), float(z_hover)], demo["R_DOWN"], q_now)
+    q_up = np.array(q_up)
+    T = max(0.5, np.degrees(np.abs(q_up - q_now)).max() / 10.0)
+    n = int(T / 0.1) + 1
+    qs = [q_now + (q_up - q_now) * i / (n - 1) for i in range(n)]
+    if any(guard.check_q(qq) for qq in qs):
+        return q_now.copy()
+    link.send_path(qs, 0.1, time.time() + 0.2)
+    time.sleep(T + 0.6)
+    q_meas, _, _ = link.state()
+    return q_meas.copy()
+
+
 # ---------------------------------------------------------------- controller loop
 def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, obs_noise=OBS_NOISE, lead_max_deg=LEAD_MAX_DEG,
-                tau_base=None, verbose=True, touch_only=False):
+                tau_base=None, verbose=True, touch_only=False, tracker=None, track_freeze=0.03):
     """10 Hz policy loop on the real robot.
     q_virtual : the policy's integrated target (what the observation's lag term uses; it may wind up
                 during a press exactly as in training)
@@ -431,6 +478,8 @@ def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, ob
     lead_max = math.radians(lead_max_deg)
     attached, attach_off, t_contact_on = False, None, None
     p_obj = np.asarray(p_obj, float).copy()
+    n_track = [0]
+    n_retract = [0]
     t0 = time.time()
     rows = []
     reason = "timeout"
@@ -446,6 +495,31 @@ def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, ob
         tcp_now, _ = ob.fk(q)
         if attached:
             p_obj = tcp_now + attach_off
+        elif tracker is not None and np.linalg.norm(ob.grasp_point(p_obj) - tcp_now) > track_freeze:
+            det = tracker.poll()          # follow the object in xy while the cup is still far enough not to corrupt the detection
+            if det is not None and det["n"] > 300:
+                new_xy = np.array([det["cx"], det["cy"]])
+                step = new_xy - p_obj[:2]
+                dist = np.linalg.norm(step)
+                if dist < 0.30:
+                    if dist > TRACK_MAX_STEP:                             # rate limit: <= 5 cm per decision (0.5 m/s)
+                        step = step * (TRACK_MAX_STEP / dist)
+                    p_obj[:2] = p_obj[:2] + step
+                    n_track[0] += 1
+        # object moved away while the cup was already low: the policy never saw that in training (run 2,
+        # 2026-09-20: it pressed the table 30 cm from the object). Retract to a hover and let it re-approach.
+        d_g = np.linalg.norm(ob.grasp_point(p_obj) - tcp_now)
+        if tracker is not None and tcp_now[2] < 0.15 and d_g > 0.12 and not attached:
+            if verbose:
+                print(f"[ctrl] step {k}: object moved away (|tip-grasp| {100 * d_g:.0f} cm at tip z {tcp_now[2]:.2f}) -> retract to hover and re-approach")
+            q_hover = retract_to_hover(link, ob, guard, q, tcp_now, 0.15)
+            q_virtual = q_hover.copy(); q_send_prev = q_hover.copy(); a_prev[:] = 0.0
+            t0 = time.time() - k * CTRL_DT                                  # keep the decision clock
+            n_retract[0] += 1
+            if n_retract[0] > 2:
+                reason = "object kept moving away (3 retracts)"
+                break
+            continue
         obs, tcp, R = ob.build(q, qd, p_obj, p_goal, a_prev, q_virtual)
         if obs_noise > 0:
             obs = obs + rng.normal(0, obs_noise, size=obs.shape).astype(np.float32)
@@ -485,6 +559,10 @@ def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, ob
         # (TAU_HARD) stays armed everywhere as the backstop.
         near = np.linalg.norm(ob.grasp_point(p_obj) - tcp_now) < 0.03
         firm = (tau >= TAU_FIRM) and near
+        if tau >= TAU_FIRM and not near and tcp_now[2] < guard.z_floor + 0.02:
+            reason = f"firm contact at the floor away from the object (tau {tau:.3f}, |tip-grasp| {100 * d_g:.0f} cm) -- stopping"
+            link.send_segment(q_send_prev, q, t_dec, seq=k)
+            break
         if firm and touch_only:
             reason = f"TOUCH (tau {tau:.3f}) at tip {np.round(tcp_now, 4).tolist()} -- touch-only demo ends here"
             link.send_segment(q_send_prev, q, t_dec, seq=k)
@@ -513,7 +591,7 @@ def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, ob
         a_prev = a
     if log:
         json.dump(rows, open(log, "w"))
-    print(f"[ctrl] episode end: {reason} after {len(rows)} decisions")
+    print(f"[ctrl] episode end: {reason} after {len(rows)} decisions" + (f"  (object tracked: {n_track[0]} updates, final estimate {np.round(p_obj, 3).tolist()})" if tracker is not None else ""))
     return rows, sealed_cmd
 
 
@@ -524,6 +602,7 @@ def main():
     ap.add_argument("--lead_max", type=float, default=LEAD_MAX_DEG, help="max lead (deg) of the streamed reference over the measured joint")
     ap.add_argument("--no_contact", action="store_true", help="disable the torque contact guard / attach emulation")
     ap.add_argument("--no_extrap", action="store_true", help="fix-1 off: two-point segments (reference runs dry between chunks)")
+    ap.add_argument("--track", action="store_true", help="follow the object live from rl/d435_track.py (udp :9701); xy updated each decision until the cup is within 8 cm")
     ap.add_argument("--ref", default="spline", choices=["linear", "spline"],
                     help="fix 3: reference sent to the Pi -- linear (sampled chunk, velocity kinks at every segment joint) or spline (uniform cubic B-spline control points, C2)")
     ap.add_argument("--lead", type=float, default=0.045, help="fix 2: Pi samples the reference this far ahead (s) = drive dead-time; 0 = off")
@@ -656,8 +735,18 @@ def main():
         tau_base = link.torque_baseline(1.0)
         print(f"[contact] torque baseline (1 s median) {np.round(tau_base, 3).tolist()}  firm {TAU_FIRM} hard {TAU_HARD}")
     print(f"[ctrl] {'EXECUTING' if a.exec else 'DRY RUN'}: {a.steps} decisions at {1 / CTRL_DT:.0f} Hz, dq_max {a.dq_max} deg, lead_max {a.lead_max} deg, obs noise {a.obs_noise}, gains {STREAM_GAINS}")
+    tracker = None
+    if a.track:
+        tracker = ObjectTracker()
+        t_w = time.time()
+        while tracker.poll() is None and time.time() - t_w < 3.0:
+            time.sleep(0.1)
+        d0 = tracker.poll()
+        print(f"[track] live detection {'OK: ' + str({k: (round(v, 3) if isinstance(v, float) else v) for k, v in d0.items()}) if d0 else 'NOT RECEIVED (is rl/d435_track.py running?)'}")
+        if d0 is None:
+            raise SystemExit("[abort] --track requested but no detections on udp :9701")
     rows, sealed = run_episode(link, policy, ob, guard, p_obj, p_goal, a.steps, dq_max, a.log, obs_noise=a.obs_noise, lead_max_deg=a.lead_max,
-                               tau_base=tau_base, touch_only=a.touch_only)
+                               tau_base=tau_base, touch_only=a.touch_only, tracker=tracker)
     if a.touch_only:
         sealed = False
         link.suction(False)                       # belt and braces: the pin is never set in this mode
