@@ -35,6 +35,11 @@ def main():
     ap.add_argument("--top", type=float, default=0.05, help="object height (m) for the plane fallback")
     ap.add_argument("--vmax", type=int, default=100, help="HSV value threshold: object pixels are darker than this (table V 116-157, grey cylinder 49-86, black base 20-68 on 2026-09-20)")
     ap.add_argument("--known", type=float, nargs=3, default=None, help="debug: project this base-frame point into the image (magenta)")
+    ap.add_argument("--mode", default="diff", choices=["dark", "hue", "diff"], help="dark: V < vmax (grey/black objects); hue: H in [hue_lo, hue_hi] and S > smin (coloured objects); diff: Lab distance from the table's median colour > dthr (anything that is not table)")
+    ap.add_argument("--dthr", type=float, default=18.0, help="Lab distance threshold for --mode diff")
+    ap.add_argument("--min_top", type=float, default=0.012, help="reject depth-derived blobs lower than this (paper, shadows)")
+    ap.add_argument("--hue", type=int, nargs=2, default=[15, 40], help="OpenCV hue range (0-179) for --mode hue; yellow ~ 20-35, red ~ 0-8/170-179, blue ~ 100-125")
+    ap.add_argument("--smin", type=int, default=80, help="min saturation for --mode hue")
     ap.add_argument("--min_px", type=int, default=300)
     ap.add_argument("--zmax", type=float, default=0.15, help="reject blobs whose depth height exceeds this (arm)")
     ap.add_argument("--debug", default=None, help="write an annotated image here (every 20th frame, or once)")
@@ -76,7 +81,16 @@ def main():
         col = np.asanyarray(fs.get_color_frame().get_data())
         dep = np.asanyarray(fs.get_depth_frame().get_data()).astype(np.float32) * ds
         hsv = cv2.cvtColor(col, cv2.COLOR_BGR2HSV)
-        mask = ((hsv[:, :, 2] < a.vmax) & (roi > 0)).astype(np.uint8) * 255
+        if a.mode == "dark":
+            sel = hsv[:, :, 2] < a.vmax
+        elif a.mode == "diff":
+            lab = cv2.cvtColor(col, cv2.COLOR_BGR2LAB).astype(np.float32)
+            med = np.median(lab[roi > 0].reshape(-1, 3), axis=0)
+            sel = np.linalg.norm(lab - med, axis=2) > a.dthr
+        else:
+            h = hsv[:, :, 0]
+            sel = (h >= a.hue[0]) & (h <= a.hue[1]) & (hsv[:, :, 1] > a.smin) & (hsv[:, :, 2] > 60)
+        mask = (sel & (roi > 0)).astype(np.uint8) * 255
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kern)
         ncc, lab, stats, cents = cv2.connectedComponentsWithStats(mask)
         det = None
@@ -106,6 +120,8 @@ def main():
                 p = o + s * d
                 cand = dict(cx=float(p[0]), cy=float(p[1]), top=a.top, n=int(area), src="plane")
             if cand["top"] > a.zmax or not (XR[0] < cand["cx"] < XR[1] and YR[0] < cand["cy"] < YR[1]):
+                continue
+            if cand["src"] == "depth" and cand["top"] < a.min_top:
                 continue
             cands.append((area, cand, i))
         if cands:

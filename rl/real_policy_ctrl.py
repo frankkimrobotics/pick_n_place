@@ -69,7 +69,9 @@ OBS_NOISE = 0.005                   # training observation noise (env dr): the B
 LEAD_MAX_DEG = 3.0                  # sent reference may lead the measured joint by this much: K0*3 deg saturates the
                                     # Pi law at vmax (full speed) while a blocked joint only ever sees a bounded ref
 TAU_FIRM, TAU_HARD, W_J3 = 0.08, 0.13, 0.5   # contact_detector thresholds on the :9999 torque field
-ATTACH_AFTER = 0.5                  # s of firm contact with suction on before the object is assumed attached
+TAU_ABORT = 0.25                    # pick mode: >= TAU_HARD holds position (vacuum builds), only this aborts
+TAU_ABORT_ATTACHED = 0.40           # after the attach the arm lifts and carries: posture torque rises, only a real collision aborts
+ATTACH_AFTER = 1.0                  # s of contact with suction on before the object is assumed attached (vacuum build-up; 0.5 s lost a taller object)
 
 
 # ---------------------------------------------------------------- observation (mirrors PaperPickEnv.observe)
@@ -435,6 +437,7 @@ class Guard:
 
 
 TRACK_MAX_STEP = 0.05
+TRAIN_GRASP_Z = 0.048               # sim training: object top 0.04 + cup radius; the policy descends to this absolute height
 
 
 def retract_to_hover(link, ob, guard, q_now, tip_now, z_hover):
@@ -450,7 +453,7 @@ def retract_to_hover(link, ob, guard, q_now, tip_now, z_hover):
     if any(guard.check_q(qq) for qq in qs):
         return q_now.copy()
     link.send_path(qs, 0.1, time.time() + 0.2)
-    time.sleep(T + 0.6)
+    time.sleep(T + 1.4)
     q_meas, _, _ = link.state()
     return q_meas.copy()
 
@@ -480,6 +483,12 @@ def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, ob
     p_obj = np.asarray(p_obj, float).copy()
     n_track = [0]
     n_retract = [0]
+    n_hadapt = [0]
+    tq_hist = []
+    z_shift_frozen = [0.0]
+    min_tip_near = [9.9]
+    if 2 * float(ob.half[2]) + CUP_R < TRAIN_GRASP_Z - 0.005:
+        print(f"[ctrl] thin object (top {2 * float(ob.half[2]):.3f} m): observation z shifted by +{TRAIN_GRASP_Z - (2 * float(ob.half[2]) + CUP_R):.3f} m so the policy sees its trained grasp height")
     t0 = time.time()
     rows = []
     reason = "timeout"
@@ -495,7 +504,7 @@ def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, ob
         tcp_now, _ = ob.fk(q)
         if attached:
             p_obj = tcp_now + attach_off
-        elif tracker is not None and np.linalg.norm(ob.grasp_point(p_obj) - tcp_now) > track_freeze:
+        elif tracker is not None and (tcp_now[2] - ob.grasp_point(p_obj)[2]) > 0.15 and np.linalg.norm(ob.grasp_point(p_obj) - tcp_now) > track_freeze:
             det = tracker.poll()          # follow the object in xy while the cup is still far enough not to corrupt the detection
             if det is not None and det["n"] > 300:
                 new_xy = np.array([det["cx"], det["cy"]])
@@ -520,11 +529,22 @@ def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, ob
                 reason = "object kept moving away (3 retracts)"
                 break
             continue
-        obs, tcp, R = ob.build(q, qd, p_obj, p_goal, a_prev, q_virtual)
+        z_shift = max(0.0, TRAIN_GRASP_Z - (2 * float(ob.half[2]) + CUP_R)) if not attached else z_shift_frozen[0]
+        z_shift_frozen[0] = z_shift if not attached else z_shift_frozen[0]
+        obs, tcp, R = ob.build(q, qd, p_obj + [0, 0, z_shift], p_goal + [0, 0, z_shift], a_prev, q_virtual)
+        obs[24] += z_shift                                   # tcp z (obs layout: q6 qd6 p_obj3 goal3 a_prev7 tcp3 ...)
         if obs_noise > 0:
             obs = obs + rng.normal(0, obs_noise, size=obs.shape).astype(np.float32)
         a = np.clip(policy(obs), -1, 1).astype(np.float32)
-        dq = a[:6] * dq_max
+        if not attached and tau_base is not None:
+            gz = ob.grasp_point(p_obj)[2]
+            lateral = np.hypot(*(ob.grasp_point(p_obj)[:2] - tcp_now[:2]))
+            if lateral < 0.02 and tcp_now[2] < gz - 0.008 and tau < 0.05 and ob.half[2] > 0.008:
+                ob.half[2] -= 0.004; p_obj[2] = ob.half[2]          # no contact where the top should be: lower the estimate 4 mm
+                n_hadapt[0] += 1
+        d_land = np.linalg.norm(ob.grasp_point(p_obj) - tcp_now)
+        soft = 0.6 if (d_land < 0.03 and not attached) else 1.0       # soft landing: <= 12 deg/s in the last 3 cm
+        dq = a[:6] * dq_max * soft
         q_new = q_virtual + dq
         viol = guard.check_q(q_new)
         if viol:
@@ -545,39 +565,58 @@ def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, ob
             sealed_cmd = want
             if verbose:
                 print(f"[ctrl] step {k}: suction {'ON' if want else 'OFF'}{' (touch-only: not sent)' if touch_only else ''}")
-        # contact from the drive torque
+        # contact from the drive torque; the baseline follows the posture until the cup is within 5 cm of the
+        # grasp point (gravity torque at an extended reach differs from the home-pose baseline by > 0.1)
         tau = 0.0
         if tau_base is not None:
             tq = link.torque()
+            tq_hist.append(tq)
+            if not attached and np.linalg.norm(ob.grasp_point(p_obj) - tcp_now) > 0.05 and len(tq_hist) >= 5:
+                tau_base = np.median(np.array(tq_hist[-5:]), axis=0)
             tau = abs(tq[1] - tau_base[1]) + W_J3 * abs(tq[2] - tau_base[2])
-        if tau >= TAU_HARD:
-            reason = f"HARD contact (tau {tau:.3f} >= {TAU_HARD})"
+        abort_lvl = TAU_HARD if touch_only else (TAU_ABORT_ATTACHED if attached else TAU_ABORT)
+        if tau >= abort_lvl:
+            reason = f"HARD contact (tau {tau:.3f} >= {abort_lvl})"
             link.send_segment(q_send_prev, q, t_dec, seq=k)
             break
+        hard_hold = (tau >= TAU_HARD) and not attached   # before the attach: hold, let the vacuum build, never press further
         # firm contact is only meaningful near the object (contact_detector's ARM gate): the first
         # acceleration from rest gave tau 0.084 on 2026-09-20 and ended a demo at step 1. Hard contact
         # (TAU_HARD) stays armed everywhere as the backstop.
         near = np.linalg.norm(ob.grasp_point(p_obj) - tcp_now) < 0.03
-        firm = (tau >= TAU_FIRM) and near
+        firm = ((tau >= TAU_FIRM) and near) or hard_hold
         if tau >= TAU_FIRM and not near and tcp_now[2] < guard.z_floor + 0.02:
             reason = f"firm contact at the floor away from the object (tau {tau:.3f}, |tip-grasp| {100 * d_g:.0f} cm) -- stopping"
             link.send_segment(q_send_prev, q, t_dec, seq=k)
             break
+        gp_now = ob.grasp_point(p_obj)
+        lat_now = np.hypot(*(gp_now[:2] - tcp_now[:2]))
+        pressed = sealed_cmd and not attached and lat_now < 0.025 and tcp_now[2] <= gp_now[2] + 0.015
+        if sealed_cmd and not attached and lat_now < 0.03:
+            min_tip_near[0] = min(min_tip_near[0], tcp_now[2])
+        # lift-after-press: the policy only lifts once it believes the seal is on (sim semantics)
+        if sealed_cmd and not attached and min_tip_near[0] <= gp_now[2] + 0.02 and tcp_now[2] > min_tip_near[0] + 0.015 and t_contact_on is not None and time.time() - t_contact_on >= ATTACH_AFTER:
+            ob.half[2] = max(0.008, (min_tip_near[0] - CUP_R) / 2); p_obj[2] = ob.half[2]
+            attached, attach_off = True, p_obj - tcp_now
+            if verbose:
+                print(f"[ctrl] step {k}: lift after press with suction on -> object assumed ATTACHED (pressed to z {min_tip_near[0]:.3f}, offset {np.round(attach_off, 3).tolist()})")
         if firm and touch_only:
             reason = f"TOUCH (tau {tau:.3f}) at tip {np.round(tcp_now, 4).tolist()} -- touch-only demo ends here"
             link.send_segment(q_send_prev, q, t_dec, seq=k)
             break
-        if firm and sealed_cmd and not attached:
+        if (firm or pressed) and sealed_cmd and not attached:
             t_contact_on = t_contact_on or time.time()
-            if time.time() - t_contact_on >= ATTACH_AFTER:
+            if time.time() - t_contact_on >= (ATTACH_AFTER if firm else ATTACH_AFTER + 0.3):
+                ob.half[2] = max(0.008, (tcp_now[2] - CUP_R) / 2); p_obj[2] = ob.half[2]   # top = touch height (sim convention)
                 attached, attach_off = True, p_obj - tcp_now
+                q_new = q.copy()                                          # forget the wound-up press target: lift from here
                 if verbose:
-                    print(f"[ctrl] step {k}: firm contact + suction for {ATTACH_AFTER} s -> object assumed ATTACHED (offset {np.round(attach_off, 3).tolist()})")
-        elif not firm:
+                    print(f"[ctrl] step {k}: firm contact + suction for {ATTACH_AFTER} s -> object assumed ATTACHED (offset {np.round(attach_off, 3).tolist()}, top set to {2 * ob.half[2]:.3f}; height adapted {n_hadapt[0]}x)")
+        elif not (firm or pressed):
             t_contact_on = None
         # reference actually streamed: bounded lead; hold on firm contact
         lead = np.clip(q_new - q, -lead_max, lead_max)
-        q_send = q if (firm and not attached) else q + lead
+        q_send = q if ((firm or pressed) and not attached) else q + lead   # dwell pressed until the attach timer elapses (vacuum build-up)
         link.send_segment(q_send_prev, q_send, t_dec, seq=k)
         rows.append(dict(k=k, t=round(t_dec - t0, 3), q=np.round(q, 4).tolist(), qd=np.round(qd, 3).tolist(), tcp=np.round(tcp, 4).tolist(),
                          a=np.round(a, 3).tolist(), q_virtual=np.round(q_new, 4).tolist(), q_send=np.round(q_send, 4).tolist(),
@@ -703,6 +742,7 @@ def main():
         print("[warn] " + msg)
     p_goal = np.asarray(a.goal, float) if a.goal is not None else p_obj + np.array([0.0, -0.12, 0.10])
     print(f"[task] object centre {np.round(p_obj, 3).tolist()} half {a.half}  goal {np.round(p_goal, 3).tolist()}  grasp point {np.round(ob.grasp_point(p_obj), 3).tolist()}")
+    p_obj0 = np.asarray(p_obj, float).copy()
     guard = Guard(ob, obj_top, force=a.force)
 
     def stop(*_):
@@ -722,7 +762,7 @@ def main():
         qs = [q + (START_Q - q) * (i / (n - 1)) for i in range(n)]
         print(f"[home] streaming to START_Q over {T:.1f} s ({dq_home:.1f} deg max){'' if a.exec else '  [dry run]'}")
         link.send_path(qs, 0.1, time.time() + 0.2)
-        time.sleep(T + 1.2)
+        time.sleep(T + 1.6)
         q, _, _ = link.state()
     dev = np.degrees(np.abs(q - START_Q)).max()
     if dev > 6.0 and not a.force:
@@ -775,11 +815,66 @@ def main():
                 print(f"[guard] {lab} path violates limits -> stopping here"); break
             print(f"[ctrl] {lab}: {T:.1f} s{'' if a.exec else ' [dry run]'}")
             link.send_path(qs, 0.1, time.time() + 0.2)
-            time.sleep(T + 0.8 + (1.0 if lab.startswith("to place") else 0.0))
-    if sealed and not a.keep_suction:
-        time.sleep(0.5)
+            time.sleep(T + 1.4 + (1.0 if lab.startswith("to place") else 0.0))
+    if not sealed and not a.touch_only:
         link.suction(False)
-        print("[ctrl] suction off")
+        q_now, _, _ = link.state(); tip_now, _ = ob.fk(q_now)
+        import mujoco
+        demo = {"__file__": os.path.join(ROOT, "mjwarp_pick_demo.py")}
+        exec(open(demo["__file__"]).read().split("if __name__")[0], demo)
+        q_up, err = demo["ik"](ob.m, mujoco.MjData(ob.m), "tcp", [float(tip_now[0]), float(tip_now[1]), float(tip_now[2]) + 0.08], demo["R_DOWN"], q_now)
+        for q_to, lab in ((np.array(q_up), "retract 8 cm"), (START_Q, "home")):
+            q_from, _, _ = link.state()
+            T = max(0.5, np.degrees(np.abs(q_to - q_from)).max() / 6.0); n = int(T / 0.1) + 1
+            qs = [q_from + (q_to - q_from) * i / (n - 1) for i in range(n)]
+            if any(guard.check_q(qq) for qq in qs):
+                print(f"[guard] {lab} path violates limits -> stopping here"); break
+            print(f"[ctrl] {lab}: {T:.1f} s")
+            link.send_path(qs, 0.1, time.time() + 0.2); time.sleep(T + 1.4)
+    if sealed and not a.keep_suction:
+        # gentle place-down: lower the (assumed) held object onto the table at the current xy, then release
+        q_now, _, _ = link.state()
+        tip_now, _ = ob.fk(q_now)
+        z_place = 2 * float(ob.half[2]) + CUP_R + 0.004          # object bottom on the table, cup still pressed on the top
+        import mujoco
+        demo = {"__file__": os.path.join(ROOT, "mjwarp_pick_demo.py")}
+        exec(open(demo["__file__"]).read().split("if __name__")[0], demo)
+        q_dn, err = demo["ik"](ob.m, mujoco.MjData(ob.m), "tcp", [float(tip_now[0]), float(tip_now[1]), max(z_place, 0.03)], demo["R_DOWN"], q_now)
+        q_dn = np.array(q_dn)
+        if err < 0.005 and not any(guard.check_q(q_now + (q_dn - q_now) * i / 9) for i in range(10)):
+            T = max(0.8, np.degrees(np.abs(q_dn - q_now)).max() / 6.0)
+            n = int(T / 0.1) + 1
+            print(f"[ctrl] place-down to z {max(z_place, 0.03):.3f} at ({tip_now[0]:.3f},{tip_now[1]:.3f}) over {T:.1f} s{'' if a.exec else ' [dry run]'}")
+            link.send_path([q_now + (q_dn - q_now) * i / (n - 1) for i in range(n)], 0.1, time.time() + 0.2)
+            time.sleep(T + 1.4)
+        else:
+            print(f"[ctrl] place-down IK/guard failed (err {err:.4f}) -> releasing where it is")
+        link.suction(False)
+        print("[ctrl] suction off (released)")
+        time.sleep(0.6)
+        q_now, _, _ = link.state(); tip_now, _ = ob.fk(q_now)
+        q_up, err = demo["ik"](ob.m, mujoco.MjData(ob.m), "tcp", [float(tip_now[0]), float(tip_now[1]), float(tip_now[2]) + 0.08], demo["R_DOWN"], q_now)
+        for q_to, lab in ((np.array(q_up), "retract 8 cm"), (START_Q, "home")):
+            q_from, _, _ = link.state()
+            T = max(0.5, np.degrees(np.abs(q_to - q_from)).max() / 6.0); n = int(T / 0.1) + 1
+            qs = [q_from + (q_to - q_from) * i / (n - 1) for i in range(n)]
+            if any(guard.check_q(qq) for qq in qs):
+                print(f"[guard] {lab} path violates limits -> stopping here"); break
+            print(f"[ctrl] {lab}: {T:.1f} s")
+            link.send_path(qs, 0.1, time.time() + 0.2); time.sleep(T + 1.4)
+        # verify with the tracker once the arm is out of the way: is the object at the goal?
+        if tracker is not None:
+            det = None
+            t_w = time.time()
+            while det is None and time.time() - t_w < 3.0:
+                det = tracker.poll(); time.sleep(0.1)
+            if det is not None:
+                moved = float(np.hypot(det["cx"] - p_obj0[0], det["cy"] - p_obj0[1]))
+                d_goal = float(np.hypot(det["cx"] - p_goal[0], det["cy"] - p_goal[1]))
+                verdict = "PICK AND PLACE OK" if d_goal < 0.06 else ("pushed, not picked" if moved > 0.03 else "seal FAILED (object did not move)")
+                print(f"[result] object now at ({det['cx']:.3f},{det['cy']:.3f}); {100 * d_goal:.1f} cm from the goal, displaced {100 * moved:.1f} cm -> {verdict}")
+            else:
+                print("[result] tracker sees no object after the run")
     print(f"[ctrl] done: {len(rows)} decisions, guard clips {guard.n_clip}, final tip {rows[-1]['tcp'] if rows else None}")
     link.close()
 
