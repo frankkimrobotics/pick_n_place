@@ -178,3 +178,11 @@ or `--obj_from_tcp` after jogging the cup onto the object top. The object top mu
 Safety: nothing is sent without `--exec`; 2 deg/decision; elbow box; wall keep-out; reference lead <= 3 deg;
 torque contact guard (firm = hold, hard = abort); SIGINT = suction off + hold. Suction goes through the new
 `{"suction": 0/1}` command of `robot_hal.py` (mycobot_mpc, copy to the Pi).
+
+**Current default policy (2026-09-20)**: `rl/weights/resid1_real_best` — the DAgger round-10 base
+with the bounded residual fused in (94.7 % in the twin vs 87.8 % for the base alone). The full
+pick-and-place run on the robot is driven by `rl/run_pick.sh N [goal_x goal_y]`, which reads the
+live D435 tracker (`rl/rgb_track.py --mode diff`, UDP :9701), subtracts the measured tracker bias,
+picks a goal and calls `real_policy_ctrl.py --track --touch_calib --go_home --exec`. Pipeline
+overview, curriculum and the robot results are in the top-level
+[`README.md`](../README.md#training-procedure-rl-2026-09).

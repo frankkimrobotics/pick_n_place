@@ -11,6 +11,191 @@ conventions and ROS2 bridge (siblings `../mycobot_mpc`, `../ros2node`).
 
 ---
 
+## Training procedure (RL, 2026-09)
+
+The policy that picks and places on the real arm today is **not** PPO from scratch. It is a
+student cloned from a cuRobo-based scripted expert, corrected by **DAgger**, then fine-tuned by a
+**bounded residual PPO**, all inside the `mujoco_warp` twin running a **hardware-calibrated Pro 630
+drive model**. The planner produces data only — at run time the fused network is the only thing
+that runs. Every number below comes from [`rl/FINDINGS.md`](rl/FINDINGS.md) (items 1–22); the
+training flags live in [`rl/README.md`](rl/README.md) and the checkpoints in
+[`rl/weights/README.md`](rl/weights/README.md).
+
+### Pipeline
+
+```mermaid
+flowchart TD
+    TWIN["mujoco_warp twin - rl/env_paper.py on rl/env_warp.py<br/>4096 worlds, 10 Hz decisions, 2 deg per joint + suction bit<br/>measured Pro 630 drive: 50 deg/s cap, 800 deg/s^2, 45 ms dead time<br/>Pi streaming law K0 10, K1 0.3, vff 1, 45 ms reference lead, B-spline reference<br/>DR: vmax 0.9-1.1x, amax 0.75-1.15x, dead time 30-65 ms, obs noise 0.005"]
+    TEACH["cuRobo teacher - rl/bc_curobo.py<br/>plan_pose transits, IK waypoints when the planner server saturates<br/>slow press 20 mm at 0.6 deg per decision, suction on, lift, carry to the goal<br/>80 percent success on the measured drive"]
+    BC["behaviour cloning<br/>6 teacher batches, MSE on the pre-tanh mean, 40 epochs<br/>one-shot clone: 0 percent"]
+    DAG["DAgger, 10 rounds<br/>roll the student, teacher mix beta 0.5, 0.3, 0.1, 0<br/>IK-waypoint relabelling of every visited state, refit on the growing set<br/>round 7: 84.8 percent, round 10: 87.8 percent on 1024 episodes"]
+    RES["residual PPO - rl/ppo.py --residual_base<br/>frozen DAgger base + bounded 0.3 residual, output layer zero-initialised<br/>privileged critic, lr 5e-5, clip 0.1, entropy 0.0015, 8M steps<br/>87.9 to 94.7 percent paired deterministic, seal 91.6 to 96.5"]
+    TRT["TensorRT export - rl/export_trt.py<br/>fused base + residual, checkpoint to ONNX to engine<br/>max deviation from torch 3e-5, 120-170 us per decision"]
+    CTRL["real-robot controller - rl/real_policy_ctrl.py<br/>10 Hz, observation rebuilt from Pi feedback and MuJoCo FK, plus training noise<br/>torque contact guard, guarded press, scripted 8 cm lift, guarded settle<br/>live D435 colour tracker, touch height calibration before each run"]
+    ROBOT["Pro 630 through robot_hal stream mode<br/>series 2: 9 runs, 7 carries, 5 placed within 3.5 cm"]
+
+    TWIN --> TEACH --> BC --> DAG --> RES --> TRT --> CTRL --> ROBOT
+    DAG -.->|"student states to relabel"| TEACH
+    TWIN -.->|"same twin and DR for rollouts, PPO and self-test"| RES
+    RES -.->|"self-test 80.9 percent through the controller code path"| CTRL
+```
+
+In words: the twin is calibrated against the arm, the planner writes demonstrations into
+it, the network is fitted to those demonstrations and then to its own mistakes, PPO adds a small
+bounded correction, and the result is compiled and streamed to the Pi.
+
+### Curriculum and schedule
+
+```mermaid
+timeline
+    title Measured-drive curriculum, 2026-09
+    Twin : rl/drive_probe.py replays the hardware step and sine : no learning
+    Teacher : cuRobo transits plus a 20 mm press at 0.6 deg per decision : 80 percent
+    BC clone : 6 teacher batches, MSE on the pre-tanh mean : 0 percent
+    DAgger 1-3 : beta 0.5, 0.3, 0.1 : 0, 0, 14.5 percent
+    DAgger 4-7 : beta 0, resumed dataset : 12, 41, 36, 84.8 percent
+    DAgger 8-10 : beta 0, best round kept : 62, 70, 87.8 percent
+    Residual PPO : frozen base plus a bounded 0.3 residual, 8M steps : 94.7 percent
+    Export : TensorRT engine and controller self-test : 80.9 percent
+    Robot : two suction pick-and-place series on the Pro 630 : 7 of 9 carried, 5 within 3.5 cm
+```
+
+| # | Stage | What is trained | Data / teacher | Objective | Steps or rounds | Metric at the end |
+|---|---|---|---|---|---|---|
+| 0 | Twin calibration | nothing | hardware step + sine replay (`rl/drive_probe.py`) | — | — | sim 10° step onset 60 ms / rise 0.24 s / settle 0.43 s vs hardware 36–52 ms / 0.27 s / 0.43 s; 12° 0.5 Hz sine rms 0.12° vs 0.10–0.12° |
+| 1 | Scripted expert | nothing | `rl/bc_curobo.py`: cuRobo `plan_pose` transits + scripted press | — | 6 teacher batches | **80 %** teacher success on the measured drive (press-depth sweep: 4 mm 3 %, 8 mm 65 %, 12 mm 80 %, **20 mm 91 %**) |
+| 2 | Behaviour cloning | actor `pi` | the teacher batches | MSE on `mu = atanh(a)` (pre-tanh space) | 40 epochs | **0 %** — the seal basin is too narrow for a one-shot clone |
+| 3 | DAgger rounds 1–3 | actor `pi` | student rollouts relabelled by the teacher | same MSE on the growing set | 3 rounds, β 0.5 / 0.3 / 0.1 | **14.5 %** deterministic (`dagger4_real`) |
+| 4 | DAgger rounds 4–7 | actor `pi` | `bc_curobo.py --resume`, β 0 relabels | same | 4 rounds | **84.8 %** (`dagger5_real_iter7.pt`) |
+| 5 | DAgger rounds 8–10 | actor `pi` | continued rounds, keep the best-scoring one | same | 3 rounds, ≈1.4 M states | **87.8 %** on 1024 episodes (`dagger6_real_iter10.pt`) |
+| 6 | Residual PPO | a second actor only | on-policy rollouts in the same twin | PPO clipped surrogate on the paper reward below; executed action `clip(base + 0.3·tanh(r))`, residual zero-initialised, critic from scratch with 5 privileged dims, 8 critic-only warm-up updates, demo anchor decaying 1.0 → 0.1 | 8 M steps, 4096 worlds, γ 0.98, 3 epochs, minibatch 24576 | **94.7 %** paired deterministic, seal 96.5 %, residual magnitude ≈0.02, no decay (`resid1_real_best.pt`) |
+| 7 | Export + self-test | nothing | — | — | — | engine vs torch 3e-5; closed loop through the controller **80.9 %** vs 78 % direct |
+| 8 | Real robot | nothing | — | — | 2 series, 19 runs | series 1: 5 of 10 full pick-and-place; series 2: 7 of 9 carried, **5 placed within 3.5 cm** |
+
+The ideal-drive line is kept as a control, not as a deployment path: plain PPO with the same
+recipe reaches **83.1 %** there (`paper12_ideal_best.pt`) but scores **1–2 %** in the
+measured-drive env (see "why" below).
+
+**Domain randomisation** (`--dr`, `rl/env_warp.py DRIVE_DR`):
+
+| knob | range |
+|---|---|
+| drive velocity cap | 50 °/s × U(0.9, 1.1) |
+| drive acceleration cap | 800 °/s² × U(0.75, 1.15) |
+| command → motion dead time | U(30, 65) ms (nominal 45 ms) |
+| observation noise | Gaussian σ **0.005** — also required at test time, see below |
+| PD gain scale, seal tolerance | per-world jitter |
+| action latency | the legacy 100 ms action-delay DR is **off** under `--drive real`; the drive model already carries the real latency |
+
+**Reward of the paper-style env** (`rl/env_paper.py`; weights are the working recipe, the paper's
+own values in brackets where they differ):
+
+| term | form | weight |
+|---|---|---|
+| `reach` | `1 − tanh(d_tcp→grasp / 0.25 m)`, measured to the **grasp point** (top centre + cup radius), not the object centre | 0.5 [1] |
+| `lift` | dense ramp to `h_min` = 2 cm, equal to the paper's indicator at and above it | 2 |
+| `track_c` | gated on lifted, `1 − tanh(d_goal / 0.10 m)` | 4 [2] |
+| `track_f` | gated on lifted, `1 − tanh(d_goal / 0.02 m)` | 8 [4] |
+| `press` | dense credit for a sustained press into the top (embodiment fix: a suction cup has no "close the gripper") | 0.5 |
+| `seal` | one-time latch bonus | 2 |
+| `reg_act`, `reg_vel` | `−λ(t)·(‖Δa‖² + ‖q̇‖²)`, λ ramps to 0.02 | `--reg_ramp 0.4` |
+| `fail` | object off the table | −1 |
+| `speed` | hinge `−w · Σⱼ relu(abs(q̇ⱼ) − 30 °/s) / 30` and the same on acceleration above 400 °/s² — not in the paper, it keeps the motion inside the 36 °/s following-error ceiling | 0 by default; 0.5 / 0.2 in the speed run |
+| `time` | flat cost per decision until the object is lifted **and** at the goal — makes *finishing* pay | 0 by default; on in the speed retraining |
+
+Success = object lifted and within `--succ_tol` 3.5 cm of the goal at the 150-decision limit.
+
+### Why the pipeline looks like this
+
+Three negative results shaped it, and each is expensive to rediscover:
+
+- **Plain PPO from a DAgger init decays on the measured drive.** `paper13/14_real` peaked at
+  ≤ 24 % and fell back; even the demonstration anchor (`--bc_data --critic_warmup`) did not fix it.
+  The on-policy updates destroy the narrow press behaviour. A *bounded, zero-initialised* residual
+  cannot: training starts exactly at 87.9 % and the base is frozen.
+- **Cross-drive transfer fails.** An 89.8 % ideal-drive checkpoint scores 1–2 % in the
+  measured-drive env *even at zero dead time and 5× acceleration* — the streamed outer law, the
+  100 ms ramps, the velocity ceiling and the delayed feedback remain. Each drive needs its own
+  policy trained under its own dynamics, which is why the twin must match the drive.
+- **The clone needs its training observation noise at test time.** Nominal sim, no noise: 31 %;
+  with the env's 0.005 Gaussian noise: 78 %; full DR: 85 %. Deterministic observations let the
+  clone stall at a fixed point. `real_policy_ctrl.py --obs_noise 0.005` is the default on the robot.
+
+### Deployment on the real arm
+
+Safety rules, port map and the object-height precondition are documented once in
+[`rl/README.md`](rl/README.md#deploying-a-policy-on-the-real-pro-630-2026-09-19) and the bring-up
+sequence in [Real robot — complete start procedure](#real-robot--complete-start-procedure) below —
+they are not repeated here. In short: nothing is sent without `--exec`, the per-decision delta is
+≤ 2°, the streamed reference may lead the measured joint by ≤ 3°, the elbow box and wall keep-out
+are enforced on every decision, a torque contact guard holds at "firm" and aborts at "hard", and
+SIGINT drops suction and stops streaming.
+
+```bash
+PY=~/miniconda3/envs/mjwarp/bin/python
+
+# 1. export the current policy (fused base + residual) -> ONNX + TensorRT engine
+$PY rl/export_trt.py rl/weights/resid1_real_best.pt --obs_dim 40 --out rl/weights/resid1_real_best
+
+# 2. self-test the controller path against the twin (no robot, same observation code)
+$PY rl/real_policy_ctrl.py --policy rl/weights/resid1_real_best --selftest --episodes 16
+
+# 3. live object tracker on the fixed D435 (Lab distance from the table colour) -> UDP :9701
+PYTHONPATH=~/librealsense/build/release python3 rl/rgb_track.py --mode diff --top 0.098
+
+# 4. one pick-and-place run: tracker xy, touch height calibration, random goal
+bash rl/run_pick.sh 01              # or: bash rl/run_pick.sh 01 <goal_x> <goal_y>
+```
+
+`rl/run_pick.sh` reads the tracker, subtracts the measured tracker bias
+(`~/pnp_rl/tracker_bias.json`, +0.7 / −16.9 mm), picks a goal, then runs
+`real_policy_ctrl.py --track --touch_calib --go_home --exec` and asks the success monitor on
+UDP :9702 for a verdict. Controller behaviour that the two robot series forced in (all in
+`rl/real_policy_ctrl.py`, FINDINGS 20–22):
+
+- **guarded press** — vertical 2 cm/s until the contact metric reaches 0.11, never more than 15 mm
+  below the calibrated top, then a 0.5 s dwell with suction on;
+- **touch height calibration** before every run — camera tops read 1–6 cm low on cups;
+- **attach** = contact for `ATTACH_AFTER` with suction on, by torque **or** by position **or** by
+  lift-after-press, followed by a **scripted 8 cm lift** (the policy's post-attach press is
+  unreliable off its trained height);
+- **tracking frozen** once the cup is within 15 cm vertically — the arm's shadow shifts the blob;
+- **flat hold chunks**, a carry-phase action filter for the 5 Hz dither, a **guarded settle**
+  before release, and always retract + home;
+- all scripted legs are **min-jerk** paths at a 25 °/s peak that wait on feedback instead of a
+  blind pad, with a `[timeline]` line and a `.phases.json` written per run (35–45 s runs should
+  land at 20–25 s; the policy itself is ~8 s of that).
+
+### Results on the robot, 2026-09-20
+
+| series | runs | outcome |
+|---|---|---|
+| touch-only demos | 6 | touch at 5.1 s at full training speed, 3.9 s on a 10 cm object outside the trained 2–7 cm range, 6.1 s at x = 0.26 near the base — generalises in height and position without retraining |
+| suction series 1 | 10 | **5 full pick-and-place**, placed 1.0–5.5 cm from the goal; failures were controller shakedown, a sloped top and a 2 cm thin object |
+| suction series 2 | 9 | **7 carries, 5 placed within 3.5 cm**, 2 set down ~6 cm off, 1 tipped on release before the guarded settle existed; 2 failures on an open-top cup |
+
+Known hardware nuisances from these sessions: the Pi's `:9999` feedback broadcaster died silently
+four times (command port `:9998` kept answering) — relaunch the stack; and after one relaunch
+joint 6 stopped responding with status word 0x8637, the August "deaf drive" signature.
+
+### What is next
+
+- **IL v2 — planned, nothing built yet** ([`policy/PLAN_IL_V2_CUROBO_WARP.md`](policy/PLAN_IL_V2_CUROBO_WARP.md)):
+  diverse objects, a cell with walls and 0–3 distractors, a batched cuRobo v3 expert with TOPP-RA
+  retiming, and DP / CFM / ACT / BC heads over 1.5 s B-spline chunks, evaluated closed-loop in warp.
+- **env v2 DAgger plateau** — `rl/env_v2.py` `DiverseEnv` (47-D obs, shapes box/cyl/hex): teacher
+  only ~50 % (box 63 / cyl 50 / hex 37), student plateaus around **46 %** at rounds 10–16
+  (`~/pnp_rl/dagger_v2c`). The ceiling is the teacher, so the press-rate sweep has to be redone there.
+- **Speed retraining, in progress** — the policies still peak at ~61 °/s in the twin. `resid2_speed`
+  added the speed and acceleration hinges (`--w_speed 0.5 --w_acc 0.2 --v_soft 30 --a_soft 400`) and
+  held ~89 % without trimming the peaks; the run going in today is a residual on a **3° action bound**
+  (`--dq_max 3` with `--base_scale 0.667`) plus the **time penalty** `--w_time`.
+- **Two-camera success monitor** — `rl/success_monitor.py` judges a run from the two idle D405s
+  (before/after Lab diff, 3-D on the fixed camera, a live-fitted homography on the wrist camera).
+  The controller's own D435 verdict is unreliable as soon as a second object is in view.
+
+---
+
 ## System / stack
 
 ```
