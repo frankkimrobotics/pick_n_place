@@ -126,6 +126,13 @@ def main():
                     help="frozen base policy checkpoint; executed action = clamp(tanh(base.pi(o)) + bound*tanh(r), -1, 1) "
                          "with r ~ N(pi(o), std) the trainable residual (PPO is run on r)")
     ap.add_argument("--residual_bound", type=float, default=0.3, help="max |residual| per action dim (action units)")
+    # ---- drive-envelope shaping: keep the learnt motion inside the Pro 630 limits ----
+    ap.add_argument("--w_speed", type=float, default=0.0,
+                    help="weight of the joint-SPEED hinge penalty: -w * sum_j relu(|qd_j| - v_soft)/v_soft per decision (0 = off)")
+    ap.add_argument("--w_acc", type=float, default=0.0,
+                    help="weight of the joint-ACCEL hinge penalty: -w * sum_j relu(|qdd_j| - a_soft)/a_soft per decision (0 = off)")
+    ap.add_argument("--v_soft", type=float, default=30.0, help="soft joint speed cap, deg/s (hard drive ceiling 36)")
+    ap.add_argument("--a_soft", type=float, default=400.0, help="soft joint accel cap, deg/s^2 (design cap 600)")
     ap.add_argument("--critic_priv", action="store_true",
                     help="asymmetric critic: append env.privileged() (5 DR dims) to the critic input")
     a = ap.parse_args()
@@ -139,11 +146,13 @@ def main():
         env = PaperPickEnv(nworld=a.nworld, device=dev, xml=a.scene, dr=a.dr, drive=a.drive, dq_max_deg=a.dq_max,
                            obs_lag=(None if a.obs_lag < 0 else bool(a.obs_lag)), target_max=a.target_max,
                            start=a.start, ep_len=a.ep_len, grasp_shaping=bool(a.grasp_shaping), obs_ee=bool(a.obs_ee), reach_target=a.reach_target, lift_dense=bool(a.lift_dense),
-                           w_track_c=a.w_track_c, w_track_f=a.w_track_f, w_reach=a.w_reach)
+                           w_track_c=a.w_track_c, w_track_f=a.w_track_f, w_reach=a.w_reach,
+                           w_speed=a.w_speed, w_acc=a.w_acc, v_soft_deg=a.v_soft, a_soft_deg=a.a_soft)
     else:
         env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode, dr=a.dr, target_max=a.target_max, lift_req=a.lift_req, speed_bonus=a.speed_bonus, release_mask=a.release_mask, mask_h=a.mask_h, tilt_pen_w=a.tilt_pen,
                       drive=a.drive, dq_max_deg=a.dq_max, obs_lag=(None if a.obs_lag < 0 else bool(a.obs_lag)),
-                      hover_range=tuple(a.hover), smooth_w=a.smooth_w, transport_w=a.transport_w, descend_sigma=a.descend_sigma)
+                      hover_range=tuple(a.hover), smooth_w=a.smooth_w, transport_w=a.transport_w, descend_sigma=a.descend_sigma,
+                      w_speed=a.w_speed, w_acc=a.w_acc, v_soft_deg=a.v_soft, a_soft_deg=a.a_soft)
     PRIV_DIM = 5
     obs_dim = env.observe().shape[-1]
     ac = AC(obs_dim=obs_dim, arch=a.arch, critic_extra=(PRIV_DIM if a.critic_priv else 0)).to(dev)
@@ -218,7 +227,7 @@ def main():
     obs = env.observe()
     step, n_up, t0 = 0, 0, time.time()
     best_succ = -1.0
-    ep = dict(n=0, ret=0.0, len=0.0, placed=0, sealed=0,
+    ep = dict(n=0, ret=0.0, len=0.0, placed=0, sealed=0, peak_qd=0.0, peak_qd_max=0.0,
               comp=np.zeros(len(env.RKEYS)))
     while step < a.steps:
         with torch.no_grad():
@@ -250,6 +259,10 @@ def main():
                     ep["placed_p"] = ep.get("placed_p", 0) + int(info["placed"][di][pm].sum())
                     ep["sealed"] += int(info["ever_sealed"][di].sum())
                     ep["comp"] += info["ep_comp"][di].sum(0).cpu().numpy()
+                    if "peak_qd" in info:          # per-episode peak |qd| over joints (rad/s -> deg/s)
+                        pq = np.degrees(info["peak_qd"][di].cpu().numpy())
+                        ep["peak_qd"] += float(pq.sum())
+                        ep["peak_qd_max"] = max(ep["peak_qd_max"], float(pq.max()))
             val_b[T] = vf(obs, env.privileged() if a.critic_priv else None)
             adv = torch.zeros(T, N, device=dev)
             gae = torch.zeros(N, device=dev)
@@ -334,13 +347,15 @@ def main():
                              for i, k in enumerate(env.RKEYS)},
                        res_mag=(rmag / nb if base is not None else None),
                        lr=opt.param_groups[0]["lr"], reg_lambda=getattr(env, "reg_lambda", None),
+                       peak_qd=ep["peak_qd"] / n_ep, peak_qd_max=ep["peak_qd_max"],
                        drive_scale=getattr(env, "drive_scale", None))
             log.write(json.dumps(rec) + "\n"); log.flush()
             print(f"[ppo] {step:>10,} | succ {rec['success']:.2%} pnp {rec['succ_pnp']:.2%} "
                   f"seal {rec['seal_rate']:.2%} ret {rec['ep_ret']:.2f} "
                   + (f"res {rec['res_mag']:.4f} " if base is not None else "")
+                  + f"qd {rec['peak_qd']:.0f}/{rec['peak_qd_max']:.0f} "
                   + f"sps {rec['sps']:,.0f}", flush=True)
-            ep = dict(n=0, ret=0.0, len=0.0, placed=0, sealed=0,
+            ep = dict(n=0, ret=0.0, len=0.0, placed=0, sealed=0, peak_qd=0.0, peak_qd_max=0.0,
                       comp=np.zeros(len(env.RKEYS)))
             torch.save(dict(ac=ac.state_dict(), step=step, **ck_extra),
                        os.path.join(a.out, "ac.pt"))

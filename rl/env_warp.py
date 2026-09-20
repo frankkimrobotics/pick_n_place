@@ -110,7 +110,8 @@ class PickEnv:
                  lift_req=0.0, speed_bonus=0.0, release_mask=False,
                  mask_h=0.05, tilt_pen_w=None, drive="real", dq_max_deg=None,
                  obs_lag=None, hover_range=(0.02, 0.04), smooth_w=None, transport_w=None,
-                 descend_sigma=0.07):
+                 descend_sigma=0.07, w_speed=0.0, w_acc=0.0,
+                 v_soft_deg=30.0, a_soft_deg=400.0):
         """mode='attach': staged sub-task -- episodes START with the cup
         hovering 2-4 cm above the (jittered) grasp point; success = seal +
         hold + 2 cm lift within a 40-step episode. mode='full': whole task."""
@@ -133,6 +134,15 @@ class PickEnv:
         self.hover_range = tuple(hover_range)   # attach/pnp start height of the cup above the grasp point (m)
         self.smooth_w = W["smooth"] if smooth_w is None else float(smooth_w)
         self.transport_w = W["transport"] if transport_w is None else float(transport_w)
+        # ---- drive-envelope (speed/accel) penalty, OPTIONAL (default off) ----
+        # The Pro 630's firmware following-error ceiling is 36 deg/s and its design
+        # acceleration cap ~600 deg/s^2 (urdf_audit 2026-09-20); policies trained
+        # without this term peak at 45-65 deg/s and 1000-1300 deg/s^2.  v_soft/a_soft
+        # sit BELOW the hard limits so the penalty bites before the drive faults.
+        self.w_speed = float(w_speed)
+        self.w_acc = float(w_acc)
+        self.v_soft = float(np.radians(v_soft_deg))      # rad/s
+        self.a_soft = float(np.radians(a_soft_deg))      # rad/s^2
         self.descend_sigma = float(descend_sigma)   # xy gate width of the descend potential (m)
         self.rng = np.random.default_rng(seed)
         if xml is None:
@@ -222,6 +232,9 @@ class PickEnv:
         self.q_meas_lag = torch.zeros(nworld, 6, device=device)               # feedback one cmd tick old
         self.qd_meas_lag = torch.zeros(nworld, 6, device=device)
         self.prev_dq = torch.zeros(nworld, 6, device=device)
+        self.prev_qd = torch.zeros(nworld, 6, device=device)                  # decision-boundary joint velocity, previous decision
+        self.peak_qd = torch.zeros(nworld, device=device)                     # per-episode peak |qd| over joints (rad/s)
+        self.peak_qdd = torch.zeros(nworld, device=device)                    # per-episode peak |qdd| over joints (rad/s^2)
         self.sat_frac = torch.zeros(nworld, device=device)                    # drive-limit hits per decision
         # dynamics curriculum: drive_scale 0 = near-ideal (no dead-time, 5x accel cap), 1 = measured
         self.drive_scale = 1.0
@@ -265,7 +278,7 @@ class PickEnv:
                       "transport", "place", "drop", "chatter", "act",
                       "time", "table_slam", "off_table", "descend",
                       "tilt_pen", "rel_mask", "place_align", "rel_far",
-                      "sat", "smooth"]
+                      "sat", "smooth", "speed"]
         self.ep_comp = torch.zeros(N, len(self.RKEYS), device=device)
         self.max_lift = torch.zeros(N, device=device)
         self.wmode = torch.zeros(N, dtype=torch.long, device=device)
@@ -353,6 +366,9 @@ class PickEnv:
         self.q_meas_lag[idx] = self.qpos[idx, :6]
         self.qd_meas_lag[idx] = 0.0
         self.prev_dq[idx] = 0.0
+        self.prev_qd[idx] = 0.0
+        self.peak_qd[idx] = 0.0
+        self.peak_qdd[idx] = 0.0
         # --- per-world curriculum mode ---------------------------------
         # 0 = pnp (unsealed hover start, must pick), 1 = carry (sealed at
         # table level, far target), 2 = place (sealed mid-carry, near
@@ -466,6 +482,9 @@ class PickEnv:
         self.q_meas_lag[idx] = self.qpos[idx, :6]
         self.qd_meas_lag[idx] = 0.0
         self.prev_dq[idx] = 0.0
+        self.prev_qd[idx] = 0.0
+        self.peak_qd[idx] = 0.0
+        self.peak_qdd[idx] = 0.0
         tcp, _ = self._tcp()
         lift_cap = max(self.lift_req, 0.10)
         self.phi_lift[idx] = self.max_lift[idx].clamp(0, lift_cap) / lift_cap
@@ -797,6 +816,34 @@ class PickEnv:
         return obs
 
     # ---------------- reward ----------------
+    # ---------------- drive-envelope (speed/accel) shaping ----------------
+    def _speed_penalty(self):
+        """Dense penalty for exceeding the Pro 630 drive envelope, evaluated at the
+        decision boundary on the measured-drive twin state (10 Hz).
+
+            -w_speed * sum_j relu(|qd_j| - v_soft) / v_soft
+            -w_acc   * sum_j relu(|qdd_j| - a_soft) / a_soft
+
+        qd is the joint velocity the drive model actually produced; qdd is the
+        finite difference of consecutive DECISION velocities (self.prev_qd).
+        v_soft/a_soft default to 30 deg/s and 400 deg/s^2, i.e. below the hard
+        36 deg/s following-error ceiling and the ~600 deg/s^2 design cap, so the
+        penalty bites before the real drive faults.  Weights default to 0.
+
+        The episode peak trackers are updated unconditionally (peak_qd is logged
+        even when the penalty is off).
+        """
+        qd = self.qvel[:, :6]
+        qdd = (qd - self.prev_qd) * CTRL_HZ
+        self.prev_qd = qd.clone()
+        self.peak_qd = torch.maximum(self.peak_qd, qd.abs().amax(-1))
+        self.peak_qdd = torch.maximum(self.peak_qdd, qdd.abs().amax(-1))
+        if self.w_speed == 0.0 and self.w_acc == 0.0:
+            return torch.zeros(self.nworld, device=self.device)
+        ov_v = (qd.abs() - self.v_soft).clamp(min=0.0).sum(-1) / self.v_soft
+        ov_a = (qdd.abs() - self.a_soft).clamp(min=0.0).sum(-1) / self.a_soft
+        return -(self.w_speed * ov_v + self.w_acc * ov_a)
+
     def reward(self, want, latched_now, released, broke, tcp_before, obj_before, a):
         """Staged, potential-based pick-and-place reward. See RL_SAC_PLAN.md."""
         N = self.nworld
@@ -902,6 +949,8 @@ class PickEnv:
         self.prev_dq = dq_now
         # 10 table slam: cup below table plane proxy
         C["table_slam"] = W["table_slam"] * (tcp[:, 2] < 0.004).float()
+        # 9d drive-envelope: speed/accel above the soft caps (off by default)
+        C["speed"] = self._speed_penalty()
 
         # terminal conditions
         placed = self.ever_sealed & ~self.sealed & over_bin & \
@@ -985,6 +1034,8 @@ class PickEnv:
                     target_h=self.target_h.clone(),
                     max_tilt=self.max_tilt.clone(),
                     release_h=self.release_h.clone(),
+                    peak_qd=self.peak_qd.clone(),
+                    peak_qdd=self.peak_qdd.clone(),
                     wmode=self.wmode.clone())
         return r, done, info
 
