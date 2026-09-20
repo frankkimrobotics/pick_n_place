@@ -328,6 +328,17 @@ the twin. Findings, each from a replay of the stalled policy:
    gentle place-down at the goal, tracker-verified result, always retract+home. `rl/rgb_track.py --mode diff` (Lab
    distance from the table colour) handles grey/light objects the depth and dark-blob modes lost. The Pi's :9999
    broadcaster died silently twice today (command port fine) -> clean stack relaunch each time; cause still unknown.
+21. **Series 2 (2026-09-20 night, random place positions, goal 22 cm)**: 9 runs -> 7 carries (5 placed within 3.5 cm,
+   2 set down ~6 cm off, 1 tipped on release before the guarded settle existed), 2 failures on an open-top cup (no
+   seal possible). The 2 cm thin object sealed 1 of 8 times: below the cup's working range. Controller additions this
+   series: guarded press primitive (vertical 1 cm/s until the contact metric reaches 0.11, max 15 mm below the
+   calibrated top, 1 s dwell); touch height calibration before each run (camera tops were 1-6 cm low on cups);
+   tracker bias measured with the cylinder centred under the cup (+0.7, -16.9 mm) and subtracted; flat "hold"
+   chunks (a held reference built from past targets kept creeping); scripted 8 cm lift right after the attach
+   (the policy's post-attach press is unreliable off its trained height); guarded settle before release (a can
+   tipped from a 4 mm drop); stop 1 s after the object is at the goal; carry-phase action filter (the 5 Hz dither).
+   Camera-based success verdict is unreliable with more than one object in view: judged by eye where it disagreed.
+   Pi :9999 broadcaster died a third time (relaunch).
 8. Planner throughput is the DAgger bottleneck (one server, ~40 % of hover goals rejected near
    the wall keep-out / camera mount → IK fallback). Table slab for the planner must clear the
    robot base (a slab through the base = every plan "no solution").

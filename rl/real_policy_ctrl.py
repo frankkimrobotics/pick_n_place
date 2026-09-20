@@ -561,7 +561,7 @@ def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, ob
         # approach/press: present the object at the trained grasp height (both directions); after the attach the carry
         # uses true heights (a frozen negative shift kept the object low in s2_01f)
         if not attached:
-            z_shift = TRAIN_GRASP_Z - (2 * float(ob.half[2]) + CUP_R)
+            z_shift = max(0.0, TRAIN_GRASP_Z - (2 * float(ob.half[2]) + CUP_R))   # thin objects only; tall ones stall with a negative shift (s2_09)
             z_shift_frozen[0] = z_shift
         else:
             z_shift = max(0.0, z_shift_frozen[0])       # thin objects keep their shift through the carry; tall ones drop it
