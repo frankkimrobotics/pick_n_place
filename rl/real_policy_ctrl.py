@@ -54,7 +54,11 @@ CTRL_DT = 0.10
 CUP_R = 0.008                       # env_warp.CUP_R
 DQ_MAX_DEG = 2.0                    # training clamp (--dq_max)
 ELBOW_DEG = (70.0, 145.0)           # |j2|, |j3| (URDF deg), same box as real_pnp_online.check_box
-STREAM_GAINS = dict(k0=20.0, k1=0.3, vmax=50.0, vel_scale=17.0, vff=1.0, lead=0.0)
+# fix 2 (2026-09-20): lead = drive dead-time so the Pi samples the reference where the arm will be when the
+# command takes effect; with the lag compensated K0 can drop 20 -> 10 (A/B on the robot: velocity ripple rms
+# j3/j4 1.53/1.45 -> 0.94/0.68 deg/s, same-tick position error 1.14/1.62 -> 0.71/0.98 deg). lead with K0=20
+# made the approach aggressive enough to false-trigger the contact guard 4 cm above the object.
+STREAM_GAINS = dict(k0=10.0, k1=0.3, vmax=50.0, vel_scale=17.0, vff=1.0, lead=0.045)
 PERIOD_MS = 10
 VEL_CMD_MAX = 850                   # Pi clamp on vel_cmd AFTER vel_scale (units = 17 per deg/s): 850 = 50 deg/s.
                                     # Run 1 (2026-09-20) used 100 = 5.9 deg/s -> the arm crawled and timed out.
@@ -437,7 +441,7 @@ def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, ob
         # firm contact is only meaningful near the object (contact_detector's ARM gate): the first
         # acceleration from rest gave tau 0.084 on 2026-09-20 and ended a demo at step 1. Hard contact
         # (TAU_HARD) stays armed everywhere as the backstop.
-        near = np.linalg.norm(ob.grasp_point(p_obj) - tcp_now) < 0.06
+        near = np.linalg.norm(ob.grasp_point(p_obj) - tcp_now) < 0.03
         firm = (tau >= TAU_FIRM) and near
         if firm and touch_only:
             reason = f"TOUCH (tau {tau:.3f}) at tip {np.round(tcp_now, 4).tolist()} -- touch-only demo ends here"
@@ -478,6 +482,9 @@ def main():
     ap.add_argument("--lead_max", type=float, default=LEAD_MAX_DEG, help="max lead (deg) of the streamed reference over the measured joint")
     ap.add_argument("--no_contact", action="store_true", help="disable the torque contact guard / attach emulation")
     ap.add_argument("--no_extrap", action="store_true", help="fix-1 off: two-point segments (reference runs dry between chunks)")
+    ap.add_argument("--lead", type=float, default=0.045, help="fix 2: Pi samples the reference this far ahead (s) = drive dead-time; 0 = off")
+    ap.add_argument("--k0", type=float, default=STREAM_GAINS["k0"], help="Pi stream law position gain (1/s)")
+    ap.add_argument("--k1", type=float, default=STREAM_GAINS["k1"], help="Pi stream law velocity-error gain")
     ap.add_argument("--torch", action="store_true", help="use the torch checkpoint instead of the TensorRT engine")
     ap.add_argument("--pi", default="192.168.50.2")
     ap.add_argument("--obj", type=float, nargs=3, default=None, help="object CENTRE in the robot base frame (m)")
@@ -546,6 +553,7 @@ def main():
 
     link = PiLink(a.pi, a.exec)
     link.extrapolate = not a.no_extrap
+    STREAM_GAINS.update(lead=float(a.lead), k0=float(a.k0), k1=float(a.k1))
     t_wait = time.time()
     while not link.ok() and time.time() - t_wait < 6:
         time.sleep(0.1)
