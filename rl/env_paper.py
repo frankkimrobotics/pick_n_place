@@ -39,7 +39,8 @@ from env_warp import PickEnv, TABLE_X, TABLE_Y, CTRL_HZ  # noqa: E402
 
 
 class PaperPickEnv(PickEnv):
-    RKEYS_PAPER = ["reach", "lift", "track_c", "track_f", "reg_act", "reg_vel", "fail", "press", "seal"]
+    RKEYS_PAPER = ["reach", "lift", "track_c", "track_f", "reg_act", "reg_vel", "fail", "press", "seal",
+                   "speed"]
 
     def __init__(self, nworld=1024, device="cuda:0", seed=0, xml=None, dr=False, drive="real",
                  dq_max_deg=None, obs_lag=None, target_max=0.30, start="home",
@@ -149,6 +150,10 @@ class PaperPickEnv(PickEnv):
         lam = float(self.reg_lambda)
         C["reg_act"] = -lam * (a - self.a_prev).pow(2).sum(-1) / CTRL_HZ
         C["reg_vel"] = -lam * self.qvel[:, :6].pow(2).sum(-1) / CTRL_HZ
+        # DRIVE-ENVELOPE penalty (not in the paper): hinge on joint speed/accel above
+        # the soft caps, so the learnt motion stays inside the Pro 630's 36 deg/s
+        # following-error ceiling.  Off unless w_speed/w_acc are set (PickEnv helper).
+        C["speed"] = self._speed_penalty()
         self.a_prev = a.clone()
         off = (op[:, 0] < TABLE_X[0] - 0.08) | (op[:, 0] > TABLE_X[1] + 0.08) | \
               (op[:, 1] < TABLE_Y[0] - 0.10) | (op[:, 1] > TABLE_Y[1] + 0.10)
@@ -167,7 +172,9 @@ class PaperPickEnv(PickEnv):
                     max_lift=self.max_lift.clone(), final_d=d_goal.clone(),
                     final_spd=torch.norm(self.qvel[:, self.vadr_obj:self.vadr_obj + 3], dim=-1),
                     target_h=self.goal[:, 2].clone(), max_tilt=self.max_tilt.clone(),
-                    release_h=self.release_h.clone(), wmode=torch.zeros(N, dtype=torch.long, device=self.device))
+                    release_h=self.release_h.clone(), peak_qd=self.peak_qd.clone(),
+                    peak_qdd=self.peak_qdd.clone(),
+                    wmode=torch.zeros(N, dtype=torch.long, device=self.device))
         return r, done, info
 
     @property
