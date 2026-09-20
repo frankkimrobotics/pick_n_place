@@ -115,6 +115,11 @@ class DiverseEnv(PaperPickEnv):
         self.fric_w = torch.full((nworld,), 1.0, device=device)
         self.rgba_w = torch.zeros(nworld, 4, device=device)
         self.wall_hit_ep = torch.zeros(nworld, dtype=torch.bool, device=device)
+        # the v2 scene (walls + 6 arm collision proxies + the object) overflows
+        # mujoco_warp's default njmax 64 / nconmax 48 ("nefc overflow ... increase njmax
+        # to 112" in dagger_v2); dropped constraints let a carried object tunnel into a
+        # wall and blow the world up.  ~2 MB extra at nworld 256.
+        self.data_kw = dict(njmax=256, nconmax=160)
         # half_extents (0,0,0) => the parent's `float(self.half[2])` terms measure the lift
         # of the body origin, which we pin to the object's bottom face.
         kw.pop("half_extents", None)
@@ -173,6 +178,27 @@ class DiverseEnv(PaperPickEnv):
         self._con_ar = None
         # ---- reachability ---------------------------------------------------
         self._build_reach_grid(cache=reach_cache)
+        # ---- divergence guard -------------------------------------------------
+        # A world whose physics blows up (object dragged into a wall while the episode is
+        # already `off`/done and auto_reset is False) leaves NaN in the SOLVER state, not just
+        # in qpos/qvel.  Clearing qpos/qvel on reset is therefore not enough: the warm start
+        # re-NaNs the world on its very next step, for every later episode (dagger_v2 world
+        # 210).  Keep torch views on everything that has to be zeroed.
+        self._solver_state = []
+        for f in ("qacc_warmstart", "cqacc_warmstart", "qacc", "cqacc", "qacc_smooth",
+                  "cqacc_smooth", "qfrc_applied", "qfrc_constraint", "cqfrc_constraint",
+                  "act", "actuator_velocity", "actuator_force", "cvel", "cacc"):
+            arr = getattr(self.d, f, None)
+            if arr is None:
+                continue
+            try:
+                t = wp.to_torch(arr)
+            except Exception:
+                continue
+            if t.ndim >= 1 and t.shape[0] == nworld and t.is_floating_point():
+                self._solver_state.append(t)
+        self.diverged_ep = torch.zeros(nworld, dtype=torch.bool, device=device)
+        self.n_diverged = 0
         self._v2_ready = True
         self.reset(torch.ones(nworld, dtype=torch.bool, device=device))
 
@@ -466,6 +492,13 @@ class DiverseEnv(PaperPickEnv):
         self.goal[idx_t, :2] = g
         self.goal[idx_t, 2] = torch.as_tensor(gz, device=dev, dtype=torch.float32)
         self.wall_hit_ep[idx_t] = False
+        self.diverged_ep[idx_t] = False
+        # the free-joint quaternion and the whole solver warm start must be sane before the
+        # next forward(), otherwise a world that diverged once stays NaN for ever
+        for t in self._solver_state:
+            t[idx_t] = 0.0
+        self.qpos[idx_t] = torch.nan_to_num(self.qpos[idx_t])
+        self.qvel[idx_t] = 0.0
         E.mjw.forward(self.m, self.d)
         tcp, _ = self._tcp()
         self.phi_approach[idx_t] = -torch.norm(tcp[idx_t] - self._grasp_point()[idx_t], dim=-1)
@@ -476,7 +509,9 @@ class DiverseEnv(PaperPickEnv):
         oh = torch.zeros(self.nworld, 3, device=self.device)
         oh.scatter_(1, self.shape_w[:, None], 1.0)
         desc = torch.cat([self.half_w, oh, self.mass_w[:, None]], -1)
-        return torch.cat([obs, desc], -1)
+        obs = torch.cat([obs, desc], -1)
+        # last line of defence: a single NaN row here NaNs a whole BC fit (dagger_v2).
+        return torch.nan_to_num(obs, nan=0.0, posinf=1e3, neginf=-1e3).clamp(-1e3, 1e3)
 
     # ================= walls =================
     def _wall_contacts(self):
@@ -524,6 +559,37 @@ class DiverseEnv(PaperPickEnv):
         info["shape"] = self.shape_w.clone()
         info["mass"] = self.mass_w.clone()
         return r, done, info
+
+
+    # ================= step (divergence guard) =================
+    DIVERGE_POS = 5.0            # m: no legal object/site position is anywhere near this
+    DIVERGE_VEL = 500.0          # rad/s or m/s
+
+    def _diverged(self):
+        """(N,) bool: this world's physics state is NaN/Inf or absurd."""
+        q, v = self.qpos, self.qvel
+        bad = ~torch.isfinite(q).all(-1) | ~torch.isfinite(v).all(-1)
+        bad |= ~torch.isfinite(self.xpos).flatten(1).all(-1)
+        bad |= self.xpos[:, self.bid_obj].abs().amax(-1) > self.DIVERGE_POS
+        bad |= v.abs().amax(-1) > self.DIVERGE_VEL
+        return bad
+
+    def step(self, action):
+        obs, r, done, info = super().step(torch.nan_to_num(action).clamp(-1, 1))
+        bad = self._diverged()
+        if bool(bad.any()):
+            # such a world is always already terminated (off-table / wall hit) -- bc_curobo
+            # runs with auto_reset=False, so it would otherwise keep integrating garbage and
+            # feed NaN rows into the DAgger set.  Recycle it now and keep it marked failed.
+            self.n_diverged += int(bad.sum())
+            r = torch.nan_to_num(r)
+            self.reset(bad)
+            self.diverged_ep |= bad
+            obs = self.observe()
+        done = done | self.diverged_ep                  # tensor ops: no host sync
+        info["placed"] = info["placed"] & ~self.diverged_ep
+        info["diverged"] = self.diverged_ep.clone()
+        return obs, torch.nan_to_num(r), done, info
 
 
 if __name__ == "__main__":
