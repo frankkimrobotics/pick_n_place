@@ -141,8 +141,11 @@ def load_policy(stem, use_torch=False, obs_dim=40):
 class PiLink:
     """Feedback stream (:9999, ~100 Hz joints_deg) + command socket (:9998)."""
 
-    def __init__(self, host, exec_):
+    def __init__(self, host, exec_, ref_mode="linear"):
         self.host, self.exec = host, exec_
+        self.ref_mode = ref_mode                  # "linear" (sampled chunk) | "spline" (B-spline control points)
+        self.hist = deque(maxlen=8)               # targets already sent, for the spline control polygon
+        self.spline_t0 = None                     # anchor grid: keeps the Pi welding onto one uniform knot base
         self.samples = deque(maxlen=400)          # (t_recv, t_robot, q_rad[6])
         self.lock = threading.Lock()
         self.clock_offset = 0.0
@@ -257,6 +260,8 @@ class PiLink:
         end of the reference (v_ref = 0, velocity command dips once per decision = the 10 Hz ripple).
         The welder drops points at t >= the next anchor, so the extrapolated point is only followed for
         those few ms -- or for at most dt if the desktop stalls, after which the Pi holds."""
+        if self.ref_mode == "spline":
+            return self._send_spline_segment(q_from, q_to, t_start, dt, seq, tag)
         pts = [[round(float(x), 4) for x in rad_to_linuxcnc_deg(q_from)], [round(float(x), 4) for x in rad_to_linuxcnc_deg(q_to)]]
         if self.extrapolate:
             q_ext = np.asarray(q_to, float) + (np.asarray(q_to, float) - np.asarray(q_from, float))
@@ -264,8 +269,45 @@ class PiLink:
         self._send({"chunk": pts, "traj_dt": dt, "t_anchor": t_start - self.clock_offset, "seq": seq, "tag": tag or f"pol:{seq}",
                     "gains": STREAM_GAINS, "period_ms": PERIOD_MS, "vel_cmd_max": VEL_CMD_MAX, "log_stamp": "policy"})
 
+    def _send_spline_segment(self, q_from, q_to, t_start, dt, seq, tag):
+        """fix 3 (2026-09-19): C2 reference. Send the last 4 targets + 1 extrapolated point as the
+        control polygon of a uniform cubic B-spline (Pi: spline_ref.SplineRef); the Pi re-welds the
+        tail every decision, so the curve stays C2 across decision boundaries instead of kinking.
+
+        Phase: the target sent at decision t is the reference value at t + dt (same as the linear
+        segment q_from -> q_to over [t, t+dt]), so the newest target sits at knot t_start + dt and
+        the anchor (first of the 5 points) is t_start - 2*dt. The extrapolated 5th point absorbs the
+        one-knot lag of an approximating B-spline (see spline_ref docstring) and keeps the reference
+        alive until the next chunk lands. Anchors are snapped to a fixed dt grid so the Pi can weld
+        onto the same knot base (exact C2) instead of restarting the spline every decision."""
+        if not self.hist:
+            self.hist.append(np.asarray(q_from, float))
+        self.hist.append(np.asarray(q_to, float))
+        h = list(self.hist)[-4:]
+        while len(h) < 4:                          # first decisions: pad with the current target pose
+            h.insert(0, h[0])
+        q_ext = h[-1] + (h[-1] - h[-2]) if len(h) >= 2 else h[-1]
+        pts = [[round(float(x), 4) for x in rad_to_linuxcnc_deg(p)] for p in (h + [q_ext])]
+        t_anchor = t_start - 2.0 * dt
+        if self.spline_t0 is None:
+            self.spline_t0 = t_anchor
+        else:
+            t_anchor = self.spline_t0 + round((t_anchor - self.spline_t0) / dt) * dt
+        self._send({"spline": pts, "traj_dt": dt, "t_anchor": t_anchor - self.clock_offset, "seq": seq,
+                    "tag": tag or f"pol:{seq}", "gains": STREAM_GAINS, "period_ms": PERIOD_MS,
+                    "vel_cmd_max": VEL_CMD_MAX, "log_stamp": "policy"})
+
     def send_path(self, qs, dt, t_start):
         pts = [[round(float(x), 4) for x in rad_to_linuxcnc_deg(q)] for q in qs]
+        if self.ref_mode == "spline":
+            # keep one reference type per stream (a linear chunk arriving mid spline stream would be
+            # welded as control points anyway); duplicating the first/last point makes the clamped
+            # B-spline start and end exactly on q_from / q_to.
+            pts = [pts[0]] + pts + [pts[-1]]
+            self.hist.clear(); self.spline_t0 = None
+            self._send({"spline": pts, "traj_dt": dt, "t_anchor": t_start - self.clock_offset, "seq": 0, "tag": "path",
+                        "gains": STREAM_GAINS, "period_ms": PERIOD_MS, "vel_cmd_max": VEL_CMD_MAX, "log_stamp": "policy_path"})
+            return
         self._send({"chunk": pts, "traj_dt": dt, "t_anchor": t_start - self.clock_offset, "seq": 0, "tag": "path",
                     "gains": STREAM_GAINS, "period_ms": PERIOD_MS, "vel_cmd_max": VEL_CMD_MAX, "log_stamp": "policy_path"})
 
@@ -482,6 +524,8 @@ def main():
     ap.add_argument("--lead_max", type=float, default=LEAD_MAX_DEG, help="max lead (deg) of the streamed reference over the measured joint")
     ap.add_argument("--no_contact", action="store_true", help="disable the torque contact guard / attach emulation")
     ap.add_argument("--no_extrap", action="store_true", help="fix-1 off: two-point segments (reference runs dry between chunks)")
+    ap.add_argument("--ref", default="spline", choices=["linear", "spline"],
+                    help="fix 3: reference sent to the Pi -- linear (sampled chunk, velocity kinks at every segment joint) or spline (uniform cubic B-spline control points, C2)")
     ap.add_argument("--lead", type=float, default=0.045, help="fix 2: Pi samples the reference this far ahead (s) = drive dead-time; 0 = off")
     ap.add_argument("--k0", type=float, default=STREAM_GAINS["k0"], help="Pi stream law position gain (1/s)")
     ap.add_argument("--k1", type=float, default=STREAM_GAINS["k1"], help="Pi stream law velocity-error gain")
@@ -551,8 +595,9 @@ def main():
               f"policy {1e6 * t_pol / (N * (k + 1)):.0f} us/call  final cmd-vs-meas lag {lag:.2f} deg")
         return
 
-    link = PiLink(a.pi, a.exec)
+    link = PiLink(a.pi, a.exec, ref_mode=a.ref)
     link.extrapolate = not a.no_extrap
+    print(f"[ctrl] reference mode: {a.ref}")
     STREAM_GAINS.update(lead=float(a.lead), k0=float(a.k0), k1=float(a.k1))
     t_wait = time.time()
     while not link.ok() and time.time() - t_wait < 6:
