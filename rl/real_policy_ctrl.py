@@ -108,9 +108,23 @@ def load_policy(stem, use_torch=False, obs_dim=40):
             print(f"[policy] TensorRT engine unusable ({e}); falling back to torch")
     import torch
     from ppo import AC
-    ac = AC(obs_dim=obs_dim, arch="paper")
-    ac.load_state_dict(torch.load(stem + ".pt", map_location="cpu", weights_only=False)["ac"])
+    ck = torch.load(stem + ".pt", map_location="cpu", weights_only=False)
+    ac = AC(obs_dim=obs_dim, arch="paper", critic_extra=(5 if ck.get("critic_priv") else 0))
+    ac.load_state_dict(ck["ac"])
     ac.eval()
+    base_path, bound = ck.get("residual_base"), float(ck.get("residual_bound", 0.3))
+    if base_path:                        # residual checkpoint: fuse base + bounded correction
+        base = AC(obs_dim=obs_dim, arch="paper")
+        ckb = torch.load(base_path, map_location="cpu", weights_only=False)
+        base.load_state_dict(ckb["ac"] if "ac" in ckb else ckb)
+        base.eval()
+        print(f"[policy] torch {stem}.pt (residual on {base_path}, bound {bound})")
+
+        def f(obs):
+            with torch.no_grad():
+                o = torch.as_tensor(obs, dtype=torch.float32)[None]
+                return torch.clamp(torch.tanh(base.pi(o)) + bound * torch.tanh(ac.pi(o)), -1.0, 1.0)[0].numpy()
+        return f
     print(f"[policy] torch {stem}.pt")
 
     def f(obs):
@@ -230,9 +244,19 @@ class PiLink:
             raise RuntimeError("command socket not connected")
         s.sendall((json.dumps(cmd) + "\n").encode())
 
+    extrapolate = True      # fix 1 (2026-09-20): keep reference ahead of the next chunk's arrival
+
     def send_segment(self, q_from, q_to, t_start, dt=CTRL_DT, seq=0, tag=None):
-        """Linear reference from q_from to q_to over dt, anchored at desktop time t_start."""
+        """Linear reference from q_from to q_to over dt, anchored at desktop time t_start.
+        With `extrapolate`, a third point continues the same velocity for one more dt: the next chunk
+        (anchored at t_start + dt) arrives a few ms late and would otherwise leave the welder past the
+        end of the reference (v_ref = 0, velocity command dips once per decision = the 10 Hz ripple).
+        The welder drops points at t >= the next anchor, so the extrapolated point is only followed for
+        those few ms -- or for at most dt if the desktop stalls, after which the Pi holds."""
         pts = [[round(float(x), 4) for x in rad_to_linuxcnc_deg(q_from)], [round(float(x), 4) for x in rad_to_linuxcnc_deg(q_to)]]
+        if self.extrapolate:
+            q_ext = np.asarray(q_to, float) + (np.asarray(q_to, float) - np.asarray(q_from, float))
+            pts.append([round(float(x), 4) for x in rad_to_linuxcnc_deg(q_ext)])
         self._send({"chunk": pts, "traj_dt": dt, "t_anchor": t_start - self.clock_offset, "seq": seq, "tag": tag or f"pol:{seq}",
                     "gains": STREAM_GAINS, "period_ms": PERIOD_MS, "vel_cmd_max": VEL_CMD_MAX, "log_stamp": "policy"})
 
@@ -453,6 +477,7 @@ def main():
     ap.add_argument("--obs_noise", type=float, default=OBS_NOISE, help="Gaussian noise added to the observation (training value; 0 makes the policy stall)")
     ap.add_argument("--lead_max", type=float, default=LEAD_MAX_DEG, help="max lead (deg) of the streamed reference over the measured joint")
     ap.add_argument("--no_contact", action="store_true", help="disable the torque contact guard / attach emulation")
+    ap.add_argument("--no_extrap", action="store_true", help="fix-1 off: two-point segments (reference runs dry between chunks)")
     ap.add_argument("--torch", action="store_true", help="use the torch checkpoint instead of the TensorRT engine")
     ap.add_argument("--pi", default="192.168.50.2")
     ap.add_argument("--obj", type=float, nargs=3, default=None, help="object CENTRE in the robot base frame (m)")
@@ -520,6 +545,7 @@ def main():
         return
 
     link = PiLink(a.pi, a.exec)
+    link.extrapolate = not a.no_extrap
     t_wait = time.time()
     while not link.ok() and time.time() - t_wait < 6:
         time.sleep(0.1)
