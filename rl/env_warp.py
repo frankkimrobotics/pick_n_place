@@ -230,7 +230,10 @@ class PickEnv:
         self.drive_law = "stream"                                             # or "waypoint" (probe only)
         # batched warp model/data
         self.m = mjw.put_model(self.mjm)
-        self.d = mjw.put_data(self.mjm, mjd, nworld=nworld)
+        # data_kw lets a subclass raise njmax / nconmax (env_v2's walls + arm proxies
+        # overflow the mujoco_warp defaults of 64 / 48, and a dropped constraint lets a
+        # suction-held object tunnel into a wall and explode)
+        self.d = mjw.put_data(self.mjm, mjd, nworld=nworld, **getattr(self, "data_kw", {}))
         self.substeps = int(round(1.0 / (CTRL_HZ * self.mjm.opt.timestep)))
         # torch views over warp arrays (zero copy, on device)
         self.qpos = wp.to_torch(self.d.qpos)          # (N, nq)

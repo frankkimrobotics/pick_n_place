@@ -189,7 +189,7 @@ def rollout(env, teacher, policy, noise, EP, beta):
             a = a_exp.clone(); a[:, :6] += torch.randn(N, 6, device=dev) * noise
         else:
             with torch.no_grad():
-                a = torch.tanh(policy(obs))
+                a = torch.nan_to_num(torch.tanh(policy(obs)))
             use_t = torch.rand(N, device=dev) < beta
             a = torch.where(use_t[:, None], a_exp, a)
         O.append(obs.clone()); A.append(a_exp.clone())
@@ -219,6 +219,14 @@ def pre_tanh(a):
 
 
 def fit(ac, X, Y, epochs, dev):
+    # A single non-finite row NaNs every gradient and therefore the whole network, which then
+    # emits NaN actions for ever (dagger_v2 collapsed this way at iter 2).  Drop them.
+    keep = torch.isfinite(X).all(1) & torch.isfinite(Y).all(1)
+    n_drop = int((~keep).sum())
+    if n_drop:
+        print(f"[dagger]   fit: dropped {n_drop} / {X.shape[0]} non-finite rows "
+              f"({100 * n_drop / X.shape[0]:.3f} %)", flush=True)
+        X, Y = X[keep], Y[keep]
     Y = pre_tanh(Y)
     opt = torch.optim.Adam(ac.pi.parameters(), lr=1e-3)
     idx = torch.arange(X.shape[0], device=dev)
@@ -331,6 +339,9 @@ def main():
                 print(f"[dagger]   relabel batch {b} (beta {beta:.1f}): student-driven success {100 * ok.float().mean():.1f} %  sealed {100 * es.float().mean():.0f} %{per_shape(env, ok, es)}", flush=True)
         Xc, Yc = torch.cat(X), torch.cat(Y)
         mse = fit(ac, Xc, Yc, a.epochs, dev)
+        if not math.isfinite(mse):
+            print("[dagger] WARNING: fit returned a non-finite loss", flush=True)
+        nd = getattr(env, "n_diverged", 0)
         with torch.no_grad():
             ac.log_std.fill_(-1.5)
         succ, seal, ret = evaluate(env, ac, EP)
@@ -338,7 +349,7 @@ def main():
         rec = dict(iter=it, dataset=int(Xc.shape[0]), mse=mse, student_success=succ, student_seal=seal, student_return=ret,
                    teacher_success=n_ok / max(1, n_ep), minutes=(time.time() - t0) / 60)
         metrics.append(rec)
-        print(f"[dagger] iter {it}: dataset {Xc.shape[0]} mse {mse:.4f} | student success {100 * succ:.1f} % seal {100 * seal:.0f} % return {ret:.2f}", flush=True)
+        print(f"[dagger] iter {it}: dataset {Xc.shape[0]} mse {mse:.4f} | student success {100 * succ:.1f} % seal {100 * seal:.0f} % return {ret:.2f} | diverged worlds {nd}", flush=True)
         json.dump(metrics, open(os.path.join(a.out, "metrics.json"), "w"), indent=1)
         torch.save({"ac": ac.state_dict(), "step": 0}, os.path.join(a.out, f"bc_iter{it}.pt"))
     torch.save({"ac": ac.state_dict(), "step": 0}, os.path.join(a.out, "bc_init.pt"))
