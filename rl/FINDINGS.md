@@ -305,7 +305,8 @@ the twin. Findings, each from a replay of the stalled policy:
    the DAgger policy brought the cup to 0.3 cm of the grasp point at 10.0 s, firm torque contact at 11.0 s, lead over
    the arm <= 1.1 deg the whole way, then retract / place pose / home (`docs/real_touch_demo_0920.png`). Scene from
    the D435 scan: table z ~ 0 (training height; config.TABLE_Z is stale), object top 0.047 (camera) / 0.058 (FK at
-   contact). Suction is not activated in demos by request.
+   contact). Run 3 at the full training speed (dq_max 2.0): touch at 5.1 s, the simulator's timing, peak joint
+   speed 31 deg/s (`docs/real_touch_half_vs_full_0920.png`). Suction is not activated in demos by request.
 8. Planner throughput is the DAgger bottleneck (one server, ~40 % of hover goals rejected near
    the wall keep-out / camera mount → IK fallback). Table slab for the planner must clear the
    robot base (a slab through the base = every plan "no solution").
