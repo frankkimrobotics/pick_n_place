@@ -410,7 +410,11 @@ def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, ob
             reason = f"HARD contact (tau {tau:.3f} >= {TAU_HARD})"
             link.send_segment(q_send_prev, q, t_dec, seq=k)
             break
-        firm = tau >= TAU_FIRM
+        # firm contact is only meaningful near the object (contact_detector's ARM gate): the first
+        # acceleration from rest gave tau 0.084 on 2026-09-20 and ended a demo at step 1. Hard contact
+        # (TAU_HARD) stays armed everywhere as the backstop.
+        near = np.linalg.norm(ob.grasp_point(p_obj) - tcp_now) < 0.06
+        firm = (tau >= TAU_FIRM) and near
         if firm and touch_only:
             reason = f"TOUCH (tau {tau:.3f}) at tip {np.round(tcp_now, 4).tolist()} -- touch-only demo ends here"
             link.send_segment(q_send_prev, q, t_dec, seq=k)
