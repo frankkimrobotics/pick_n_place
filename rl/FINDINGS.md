@@ -307,6 +307,27 @@ the twin. Findings, each from a replay of the stalled policy:
    the D435 scan: table z ~ 0 (training height; config.TABLE_Z is stale), object top 0.047 (camera) / 0.058 (FK at
    contact). Run 3 at the full training speed (dq_max 2.0): touch at 5.1 s, the simulator's timing, peak joint
    speed 31 deg/s (`docs/real_touch_half_vs_full_0920.png`). Suction is not activated in demos by request.
+19. **Session 2 on the robot (2026-09-20 pm)**: three more touch-only demos, including a 10 cm-tall object
+   (top outside the trained 0.02-0.07 range, touched at 3.9 s) and an object at x = 0.26 near the base (6.1 s):
+   the policy generalises in height and position without retraining. Two infrastructure facts: (a) the Pi's
+   :9999 feedback broadcaster silently stopped while :9998 kept answering -- the controller refused to run
+   (correct); a clean `launch_mpc_stack.sh` relaunch fixed it, cause not found in the log. (b) After that
+   relaunch **joint 6 (wrist yaw, HAL pin `pro600.joint5_*`, 0-based) ignores commands**: 2 deg probe = no
+   motion, status word 0x8637 (was 0x8237), joint 1 0x9637. Touch demos still work (cup symmetric), but treat
+   as the August "deaf drive" signature on one joint: power-cycle, probe joint by joint, then CAN wiring.
+20. **First suction pick-and-place series on the robot (2026-09-20 evening, residual policy, live colour tracker)**:
+   10 runs, objects changed by hand between runs -> **5 full pick-and-place** (demos 3, 4, 5, 9, 10: placed 1.0-5.5 cm
+   from the goal). Failures: 1-2 controller shakedown (press too hard -> hard-stop; tracker estimate walking as the cup
+   entered the blob), 6-7 an object with a sloped top (no seal possible), 8 a 2 cm thin object that pressed fine but never
+   sealed. Controller rules that came out of it (`rl/real_policy_ctrl.py`): soft landing in the last 3 cm; hold the
+   reference at firm contact and never press past the hard level before the attach; attach = 1.0 s of contact with
+   suction on, by torque OR by position (tip at the grasp height) OR lift-after-press, with the press dwell enforced;
+   rolling torque baseline (gravity torque at an extended reach looked like contact); tracking frozen once the cup is
+   within 15 cm vertically (the arm's shadow shifts the blob); online object-height adaptation + a z-shift of the
+   observation for objects lower than the trained 4 cm (the policy descends to the ABSOLUTE trained grasp height);
+   gentle place-down at the goal, tracker-verified result, always retract+home. `rl/rgb_track.py --mode diff` (Lab
+   distance from the table colour) handles grey/light objects the depth and dark-blob modes lost. The Pi's :9999
+   broadcaster died silently twice today (command port fine) -> clean stack relaunch each time; cause still unknown.
 8. Planner throughput is the DAgger bottleneck (one server, ~40 % of hover goals rejected near
    the wall keep-out / camera mount → IK fallback). Table slab for the planner must clear the
    robot base (a slab through the base = every plan "no solution").
