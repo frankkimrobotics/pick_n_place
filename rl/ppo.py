@@ -30,16 +30,19 @@ def mlp_paper(inp, out, hidden=(256, 128, 64)):
 
 
 class AC(nn.Module):
-    def __init__(self, obs_dim=OBS_DIM, arch="default"):
+    def __init__(self, obs_dim=OBS_DIM, arch="default", critic_extra=0):
+        """critic_extra > 0: asymmetric critic -- v() takes obs concatenated with a
+        privileged vector (env.privileged()); the actor still sees obs only."""
         super().__init__()
         self.obs_dim = int(obs_dim)
+        self.critic_extra = int(critic_extra)
         self.arch = arch
         if arch == "paper":
             self.pi = mlp_paper(self.obs_dim, ACT_DIM)
-            self.v = mlp_paper(self.obs_dim, 1)
+            self.v = mlp_paper(self.obs_dim + self.critic_extra, 1)
         else:
             self.pi = mlp(self.obs_dim, ACT_DIM, ln=False)
-            self.v = mlp(self.obs_dim, 1)
+            self.v = mlp(self.obs_dim + self.critic_extra, 1)
         self.log_std = nn.Parameter(torch.full((ACT_DIM,), -0.5))
 
     def load_state_dict(self, sd, strict=True):
@@ -118,6 +121,13 @@ def main():
     ap.add_argument("--reg_ramp", type=float, default=0.4, help="paper env: lambda(t) ramps 0->lambda_max over this fraction of --steps")
     ap.add_argument("--ep_len", type=int, default=100, help="paper env: episode length in decisions (paper: 5 s)")
     ap.add_argument("--start", default="home", choices=["home", "hover"], help="paper env start pose")
+    # ---- residual RL: freeze a BC/DAgger base policy, learn a bounded correction on top ----
+    ap.add_argument("--residual_base", default=None,
+                    help="frozen base policy checkpoint; executed action = clamp(tanh(base.pi(o)) + bound*tanh(r), -1, 1) "
+                         "with r ~ N(pi(o), std) the trainable residual (PPO is run on r)")
+    ap.add_argument("--residual_bound", type=float, default=0.3, help="max |residual| per action dim (action units)")
+    ap.add_argument("--critic_priv", action="store_true",
+                    help="asymmetric critic: append env.privileged() (5 DR dims) to the critic input")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     dev = "cuda:0"
@@ -134,11 +144,30 @@ def main():
         env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode, dr=a.dr, target_max=a.target_max, lift_req=a.lift_req, speed_bonus=a.speed_bonus, release_mask=a.release_mask, mask_h=a.mask_h, tilt_pen_w=a.tilt_pen,
                       drive=a.drive, dq_max_deg=a.dq_max, obs_lag=(None if a.obs_lag < 0 else bool(a.obs_lag)),
                       hover_range=tuple(a.hover), smooth_w=a.smooth_w, transport_w=a.transport_w, descend_sigma=a.descend_sigma)
-    ac = AC(obs_dim=env.observe().shape[-1], arch=a.arch).to(dev)
+    PRIV_DIM = 5
+    obs_dim = env.observe().shape[-1]
+    ac = AC(obs_dim=obs_dim, arch=a.arch, critic_extra=(PRIV_DIM if a.critic_priv else 0)).to(dev)
+    base = None
+    if a.residual_base:
+        base = AC(obs_dim=obs_dim, arch=a.arch).to(dev)
+        ckb = torch.load(a.residual_base, map_location=dev, weights_only=False)
+        base.load_state_dict(ckb["ac"] if "ac" in ckb else ckb)
+        base.requires_grad_(False)
+        base.eval()
+        # zero the residual actor's output layer -> the executed action starts exactly at the base policy
+        last = [m for m in ac.pi.modules() if isinstance(m, nn.Linear)][-1]
+        with torch.no_grad():
+            last.weight.zero_(); last.bias.zero_()
+        if a.init_std is None:
+            a.init_std = -1.0          # bound*tanh(N(0, 0.37)) ~ 0.1 action units of exploration
+        if a.init:
+            print("[ppo] --init ignored: the residual actor must start zeroed", flush=True)
+            a.init = None
+        print(f"[ppo] residual on {a.residual_base} bound={a.residual_bound} (actor output layer zeroed)", flush=True)
     if a.init_std is not None:
         with torch.no_grad():
             ac.log_std.fill_(float(a.init_std))
-    print(f"[ppo] obs_dim {ac.obs_dim} drive={a.drive} dq_max={a.dq_max} deg hover={a.hover} init_std={a.init_std}", flush=True)
+    print(f"[ppo] obs_dim {ac.obs_dim} critic_extra {ac.critic_extra} drive={a.drive} dq_max={a.dq_max} deg hover={a.hover} init_std={a.init_std}", flush=True)
     if a.init:
         ck = torch.load(a.init, map_location=dev, weights_only=False)
         try:
@@ -170,6 +199,10 @@ def main():
     log = open(os.path.join(a.out, "log.jsonl"), "a")
     json.dump(vars(a), open(os.path.join(a.out, "args.json"), "w"), indent=1)
 
+    ck_extra = dict(obs_dim=ac.obs_dim, arch=a.arch, critic_priv=bool(a.critic_priv))
+    if base is not None:
+        ck_extra.update(residual_base=os.path.abspath(a.residual_base), residual_bound=float(a.residual_bound))
+
     N, T = a.nworld, a.rollout
     obs_b = torch.zeros(T, N, ac.obs_dim, device=dev)
     act_b = torch.zeros(T, N, ACT_DIM, device=dev)
@@ -177,6 +210,10 @@ def main():
     rew_b = torch.zeros(T, N, device=dev)
     done_b = torch.zeros(T, N, device=dev)
     val_b = torch.zeros(T + 1, N, device=dev)
+    priv_b = torch.zeros(T, N, PRIV_DIM, device=dev) if a.critic_priv else None
+
+    def vf(o, pv):
+        return ac.v(torch.cat([o, pv], dim=-1) if a.critic_priv else o).squeeze(-1)
 
     obs = env.observe()
     step, n_up, t0 = 0, 0, time.time()
@@ -188,11 +225,17 @@ def main():
             for t in range(T):
                 dist = ac.dist(obs)
                 raw = dist.sample()
-                actn = torch.tanh(raw)
+                if base is None:
+                    actn = torch.tanh(raw)
+                else:                       # residual: PPO acts on raw, the robot gets base + bounded correction
+                    actn = (torch.tanh(base.pi(obs)) + a.residual_bound * torch.tanh(raw)).clamp(-1.0, 1.0)
                 obs_b[t] = obs
                 act_b[t] = raw
                 logp_b[t] = dist.log_prob(raw).sum(-1)
-                val_b[t] = ac.v(obs).squeeze(-1)
+                pv = env.privileged() if a.critic_priv else None
+                if a.critic_priv:
+                    priv_b[t] = pv
+                val_b[t] = vf(obs, pv)
                 obs, r, done, info = env.step(actn)
                 rew_b[t] = r
                 done_b[t] = done.float()
@@ -207,7 +250,7 @@ def main():
                     ep["placed_p"] = ep.get("placed_p", 0) + int(info["placed"][di][pm].sum())
                     ep["sealed"] += int(info["ever_sealed"][di].sum())
                     ep["comp"] += info["ep_comp"][di].sum(0).cpu().numpy()
-            val_b[T] = ac.v(obs).squeeze(-1)
+            val_b[T] = vf(obs, env.privileged() if a.critic_priv else None)
             adv = torch.zeros(T, N, device=dev)
             gae = torch.zeros(N, device=dev)
             for t in reversed(range(T)):
@@ -228,8 +271,9 @@ def main():
         fl = logp_b.reshape(-1)
         fadv = adv.reshape(-1)
         fret = ret.reshape(-1)
+        fpv = priv_b.reshape(-1, PRIV_DIM) if a.critic_priv else None
         idx_all = torch.randperm(fo.shape[0], device=dev)
-        pl = vl = el = bl = 0.0
+        pl = vl = el = bl = rmag = 0.0
         nb = 0
         fv_old = val_b[:T].reshape(-1)
         kl_sum = 0.0
@@ -242,7 +286,7 @@ def main():
                 l1 = ratio * fadv[mb]
                 l2 = ratio.clamp(1 - a.clip, 1 + a.clip) * fadv[mb]
                 lpi = -torch.min(l1, l2).mean()
-                v_pred = ac.v(fo[mb]).squeeze(-1)
+                v_pred = vf(fo[mb], fpv[mb] if a.critic_priv else None)
                 if a.value_clip:
                     v_clip = fv_old[mb] + (v_pred - fv_old[mb]).clamp(-a.clip, a.clip)
                     lv = 0.5 * torch.max((v_pred - fret[mb]).pow(2), (v_clip - fret[mb]).pow(2)).mean()
@@ -267,6 +311,9 @@ def main():
                 with torch.no_grad():
                     kl_sum += float((fl[mb] - lp).mean())
                 pl += float(lpi); vl += float(lv); el += float(-lent); nb += 1
+                if base is not None:
+                    with torch.no_grad():
+                        rmag += float((a.residual_bound * torch.tanh(dist.loc)).abs().mean())
         if a.kl_target is not None and nb > 0:      # adaptive LR (rsl_rl-style schedule)
             kl = kl_sum / nb
             for g in opt.param_groups:
@@ -285,21 +332,23 @@ def main():
                        sps=step / (time.time() - t0), bc_mse=(bl / nb if bcX is not None else None),
                        comp={k: ep["comp"][i] / n_ep
                              for i, k in enumerate(env.RKEYS)},
+                       res_mag=(rmag / nb if base is not None else None),
                        lr=opt.param_groups[0]["lr"], reg_lambda=getattr(env, "reg_lambda", None),
                        drive_scale=getattr(env, "drive_scale", None))
             log.write(json.dumps(rec) + "\n"); log.flush()
             print(f"[ppo] {step:>10,} | succ {rec['success']:.2%} pnp {rec['succ_pnp']:.2%} "
                   f"seal {rec['seal_rate']:.2%} ret {rec['ep_ret']:.2f} "
-                  f"sps {rec['sps']:,.0f}", flush=True)
+                  + (f"res {rec['res_mag']:.4f} " if base is not None else "")
+                  + f"sps {rec['sps']:,.0f}", flush=True)
             ep = dict(n=0, ret=0.0, len=0.0, placed=0, sealed=0,
                       comp=np.zeros(len(env.RKEYS)))
-            torch.save(dict(ac=ac.state_dict(), step=step),
+            torch.save(dict(ac=ac.state_dict(), step=step, **ck_extra),
                        os.path.join(a.out, "ac.pt"))
             if rec["success"] > best_succ:          # keep the peak (runs decay after it)
                 best_succ = rec["success"]
-                torch.save(dict(ac=ac.state_dict(), step=step, success=best_succ),
+                torch.save(dict(ac=ac.state_dict(), step=step, success=best_succ, **ck_extra),
                            os.path.join(a.out, "best.pt"))
-    torch.save(dict(ac=ac.state_dict(), step=step),
+    torch.save(dict(ac=ac.state_dict(), step=step, **ck_extra),
                os.path.join(a.out, "final.pt"))
     print("[ppo] done", flush=True)
 

@@ -34,6 +34,20 @@ class DetPolicy(torch.nn.Module):
         return torch.tanh(self.pi(obs))
 
 
+class ResidualDetPolicy(torch.nn.Module):
+    """Fused residual policy: clamp(tanh(base.pi(o)) + bound*tanh(res.pi(o)), -1, 1).
+    Exported as ONE graph, so the controller sees the same interface as a plain policy."""
+
+    def __init__(self, base_ac, res_ac, bound):
+        super().__init__()
+        self.base = base_ac.pi
+        self.res = res_ac.pi
+        self.bound = float(bound)
+
+    def forward(self, obs):
+        return torch.clamp(torch.tanh(self.base(obs)) + self.bound * torch.tanh(self.res(obs)), -1.0, 1.0)
+
+
 def build_engine(onnx_path, plan_path, fp16=False, workspace_mb=256):
     import tensorrt as trt
     logger = trt.Logger(trt.Logger.WARNING)
@@ -95,13 +109,25 @@ def main():
     ap.add_argument("--arch", default="paper")
     ap.add_argument("--out", default=None, help="output stem (default: ckpt path without .pt)")
     ap.add_argument("--fp16", action="store_true")
+    ap.add_argument("--residual_base", default=None, help="override the checkpoint's residual_base path")
+    ap.add_argument("--residual_bound", type=float, default=None, help="override the checkpoint's residual_bound")
     a = ap.parse_args()
     stem = a.out or os.path.splitext(a.ckpt)[0]
     ck = torch.load(a.ckpt, map_location="cpu", weights_only=False)
-    ac = AC(obs_dim=a.obs_dim, arch=a.arch)
+    ac = AC(obs_dim=a.obs_dim, arch=a.arch, critic_extra=(5 if ck.get("critic_priv") else 0))
     ac.load_state_dict(ck["ac"])
     ac.eval()
-    pol = DetPolicy(ac).eval()
+    base_path = a.residual_base or ck.get("residual_base")
+    if base_path:                       # residual checkpoint -> export the FUSED policy
+        bound = float(a.residual_bound if a.residual_bound is not None else ck.get("residual_bound", 0.3))
+        base = AC(obs_dim=a.obs_dim, arch=a.arch)
+        ckb = torch.load(base_path, map_location="cpu", weights_only=False)
+        base.load_state_dict(ckb["ac"] if "ac" in ckb else ckb)
+        base.eval()
+        pol = ResidualDetPolicy(base, ac, bound).eval()
+        print(f"[export] residual policy: base {base_path} bound {bound}")
+    else:
+        pol = DetPolicy(ac).eval()
     dummy = torch.zeros(1, a.obs_dim)
     onnx_path = stem + ".onnx"
     torch.onnx.export(pol, dummy, onnx_path, input_names=["obs"], output_names=["act"], opset_version=17, dynamo=False)
@@ -121,6 +147,8 @@ def main():
     dt = (time.time() - t0) / len(X)
     print(f"[verify] max|onnx-torch| {np.abs(ort_out - ref).max():.2e}  max|trt-torch| {np.abs(trt_out - ref).max():.2e}  trt latency {1e6 * dt:.0f} us/call")
     meta = dict(ckpt=os.path.abspath(a.ckpt), obs_dim=a.obs_dim, arch=a.arch, step=ck.get("step"), success=ck.get("success"),
+                residual_base=(os.path.abspath(base_path) if base_path else None),
+                residual_bound=(bound if base_path else None),
                 fp16=a.fp16, max_abs_err_trt=float(np.abs(trt_out - ref).max()), trt_us=1e6 * dt,
                 obs_layout="q[6] qd[6] p_obj[3] p_goal[3] a_prev[7] tcp[3] cup_axis[3] grasp_rel[3] (q_target-q)[6]" if a.obs_dim == 40
                 else "q[6] qd[6] p_obj[3] p_goal[3] a_prev[7] tcp[3] cup_axis[3] grasp_rel[3]")

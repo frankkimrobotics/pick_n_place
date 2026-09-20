@@ -754,6 +754,21 @@ class PickEnv:
                 log.append(self.qpos[:, :6].clone())
         self.sat_frac = sat / self.n_cmd
 
+    # ---------------- privileged state (asymmetric critic) ----------------
+    def privileged(self):
+        """(N,5) per-world domain-randomisation state for an asymmetric critic:
+        [sealed, dead_mult, amax_mult, vmax/DRIVE['vmax'], gain_scale]. Zeros when dr=False
+        (the DR tensors are then at their nominal values and carry no information)."""
+        if not self.dr:
+            return torch.zeros(self.nworld, 5, device=self.device)
+        return torch.cat([
+            self.sealed.float()[:, None],
+            self.dead_mult[:, None],
+            self.amax_mult[:, None],
+            self.vmax_w[:, :1] / DRIVE["vmax"],
+            self.gain_scale[:, :1],
+        ], dim=-1)
+
     # ---------------- observation (privileged, 37-D + 6 lag) ----------------
     def observe(self):
         tcp, R = self._tcp()

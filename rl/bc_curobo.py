@@ -198,6 +198,21 @@ def rollout(env, teacher, policy, noise, EP, beta):
     return torch.stack(O, 1), torch.stack(A, 1), ok, env.ever_sealed.clone()
 
 
+def per_shape(env, ok, es):
+    """'box 61% (seal 88%) | cyl ...' for DiverseEnv; '' for the plain paper env."""
+    sw = getattr(env, "shape_w", None)
+    if sw is None:
+        return ""
+    import env_v2
+    out = []
+    for s_i, nm in enumerate(env_v2.SHAPES):
+        m = sw == s_i
+        if not bool(m.any()):
+            continue
+        out.append(f"{nm} {100 * ok[m].float().mean():.0f}% (seal {100 * es[m].float().mean():.0f}%, n={int(m.sum())})")
+    return "  [" + " | ".join(out) + "]"
+
+
 def pre_tanh(a):
     """PPO executes tanh(mu + noise): clone mu = atanh(a) so the deterministic policy reproduces a."""
     return torch.atanh(a.clamp(-0.97, 0.97))
@@ -240,14 +255,25 @@ def main():
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--no_planner", action="store_true", help="IK waypoints for transits too (no cuRobo)")
     ap.add_argument("--out", default=os.path.expanduser("~/pnp_rl/dagger_real"))
-    ap.add_argument("--scene", default=os.path.join(HERE, "scenes", "box_med.xml"))
+    ap.add_argument("--env", default="paper", choices=["paper", "v2"], help="v2 = env_v2.DiverseEnv (diverse objects, big table, walls)")
+    ap.add_argument("--spawn", default=None, help="v2 only: object spawn box 'x0,x1,y0,y1' (default 0,0.5,-0.3,0.3)")
+    ap.add_argument("--variants", default="box,cyl,hex", help="v2 only: object shape classes")
+    ap.add_argument("--scene", default=None, help="MJCF (default: scenes/box_med.xml, or scenes/diverse_v2.xml for --env v2)")
     ap.add_argument("--resume", default=None, help="continue DAgger from this run dir (dataset.pt + last bc_iter*.pt + metrics.json); teacher batches are skipped")
     ap.add_argument("--beta_min", type=float, default=0.0, help="floor of the teacher-mixing schedule 0.5, 0.3, 0.1, ...")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     wp.init()
     import mujoco
-    env = PaperPickEnv(nworld=a.nworld, xml=a.scene, dr=True, drive=a.drive, ep_len=a.ep_len)
+    if a.env == "v2":
+        from env_v2 import DiverseEnv
+        kw = dict(variants=a.variants)
+        if a.spawn:
+            kw["spawn"] = a.spawn
+        env = DiverseEnv(nworld=a.nworld, xml=a.scene, dr=True, drive=a.drive, ep_len=a.ep_len, **kw)
+    else:
+        env = PaperPickEnv(nworld=a.nworld, xml=a.scene or os.path.join(HERE, "scenes", "box_med.xml"),
+                           dr=True, drive=a.drive, ep_len=a.ep_len)
     env.auto_reset = False
     demo = {"__file__": os.path.join(os.path.dirname(HERE), "mjwarp_pick_demo.py")}
     exec(open(demo["__file__"]).read().split("if __name__")[0], demo)
@@ -257,7 +283,16 @@ def main():
     tool_off = np.zeros(3)
     if use_planner:
         # planner world = sim table (top z=0.01) + the server's base cuboids; tool-frame offset from FK
-        print(rpc({"type": "set_world", "cuboids": [{"name": "sim_table", "dims": [0.56, 0.9, 0.02], "pose": [0.42, 0.0, 0.0, 1, 0, 0, 0]}]}), flush=True)
+        if a.env == "v2":
+            import build_scene_v2 as BV
+            cub = [{"name": "sim_table", "dims": [BV.TABLE_X2[1] - BV.TABLE_X2[0], BV.TABLE_Y2[1] - BV.TABLE_Y2[0], 0.02],
+                    "pose": [0.5 * (BV.TABLE_X2[0] + BV.TABLE_X2[1]), 0.0, 0.0, 1, 0, 0, 0]},
+                   {"name": "wall_back", "dims": [0.02, 1.2, 1.0], "pose": [-0.30, 0.0, 0.5, 1, 0, 0, 0]},
+                   {"name": "wall_ym", "dims": [1.1, 0.02, 1.0], "pose": [0.25, -0.50, 0.5, 1, 0, 0, 0]},
+                   {"name": "wall_yp", "dims": [1.1, 0.02, 1.0], "pose": [0.25, 0.50, 0.5, 1, 0, 0, 0]}]
+        else:
+            cub = [{"name": "sim_table", "dims": [0.56, 0.9, 0.02], "pose": [0.42, 0.0, 0.0, 1, 0, 0, 0]}]
+        print(rpc({"type": "set_world", "cuboids": cub}), flush=True)
         env.reset(torch.ones(env.nworld, dtype=torch.bool, device=dev))
         q0 = env.qpos[0, :6].cpu().numpy().tolist(); tcp, R = env._tcp()
         fk = rpc({"type": "fk", "q": q0}); p = np.array(fk["pos"][0]); Rm = R[0].cpu().numpy()
@@ -282,7 +317,8 @@ def main():
         O, Aexp, ok, es = rollout(env, teacher, None, a.noise, EP, 1.0)
         X.append(O.reshape(-1, O.shape[-1])); Y.append(Aexp.reshape(-1, 7))      # DAgger keeps ALL states
         n_ok += int(ok.sum()); n_ep += env.nworld
-        print(f"[dagger] teacher batch {b}: success {100 * ok.float().mean():.1f} %  sealed {100 * es.float().mean():.0f} %  plan fails {teacher.n_plan_fail}  ({(time.time() - t0) / 60:.1f} min)", flush=True)
+        wh = f"  wall_hit {100 * env.wall_hit_ep.float().mean():.0f} %" if hasattr(env, "wall_hit_ep") else ""
+        print(f"[dagger] teacher batch {b}: success {100 * ok.float().mean():.1f} %  sealed {100 * es.float().mean():.0f} %  plan fails {teacher.n_plan_fail}{wh}{per_shape(env, ok, es)}  ({(time.time() - t0) / 60:.1f} min)", flush=True)
     ac = AC(obs_dim=X[0].shape[1], arch="paper").to(dev)
     if a.resume:
         ac.load_state_dict(torch.load(os.path.join(a.resume, f"bc_iter{start - 1}.pt"), map_location=dev, weights_only=False)["ac"])
@@ -292,7 +328,7 @@ def main():
             for b in range(a.dagger_batches):
                 O, Aexp, ok, es = rollout(env, teacher, ac.pi, 0.0, EP, beta)
                 X.append(O.reshape(-1, O.shape[-1])); Y.append(Aexp.reshape(-1, 7))
-                print(f"[dagger]   relabel batch {b} (beta {beta:.1f}): student-driven success {100 * ok.float().mean():.1f} %  sealed {100 * es.float().mean():.0f} %", flush=True)
+                print(f"[dagger]   relabel batch {b} (beta {beta:.1f}): student-driven success {100 * ok.float().mean():.1f} %  sealed {100 * es.float().mean():.0f} %{per_shape(env, ok, es)}", flush=True)
         Xc, Yc = torch.cat(X), torch.cat(Y)
         mse = fit(ac, Xc, Yc, a.epochs, dev)
         with torch.no_grad():
