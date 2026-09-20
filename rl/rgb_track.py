@@ -37,7 +37,8 @@ def main():
     ap.add_argument("--known", type=float, nargs=3, default=None, help="debug: project this base-frame point into the image (magenta)")
     ap.add_argument("--mode", default="diff", choices=["dark", "hue", "diff"], help="dark: V < vmax (grey/black objects); hue: H in [hue_lo, hue_hi] and S > smin (coloured objects); diff: Lab distance from the table's median colour > dthr (anything that is not table)")
     ap.add_argument("--dthr", type=float, default=18.0, help="Lab distance threshold for --mode diff")
-    ap.add_argument("--min_top", type=float, default=0.012, help="reject depth-derived blobs lower than this (paper, shadows)")
+    ap.add_argument("--min_top", type=float, default=0.012, help="reject depth-derived blobs lower than this (shadows); low objects read ~0.017 on sparse depth")
+    ap.add_argument("--max_px", type=int, default=15000, help="reject blobs larger than this (a sheet of paper is ~25k px, objects 2-8k)")
     ap.add_argument("--hue", type=int, nargs=2, default=[15, 40], help="OpenCV hue range (0-179) for --mode hue; yellow ~ 20-35, red ~ 0-8/170-179, blue ~ 100-125")
     ap.add_argument("--smin", type=int, default=80, help="min saturation for --mode hue")
     ap.add_argument("--min_px", type=int, default=300)
@@ -97,7 +98,7 @@ def main():
         cands = []
         for i in range(1, ncc):
             x, y, w, h, area = stats[i]
-            if area < a.min_px or x == 0 or y == 0 or x + w >= 640 or y + h >= 480:
+            if area < a.min_px or area > a.max_px or x == 0 or y == 0 or x + w >= 640 or y + h >= 480:
                 continue
             m = lab == i
             zs = dep[m]; zs = zs[(zs > 0.2) & (zs < 1.5)]
@@ -128,6 +129,7 @@ def main():
             cands.sort(key=lambda c: -c[0])
             det = cands[0][1]
         msg = dict(t=time.time(), **(det or dict(cx=None, cy=None, top=None, n=0)))
+        msg["cands"] = [dict(cx=c[1]["cx"], cy=c[1]["cy"], top=c[1]["top"], n=c[1]["n"]) for c in cands[:4]]   # all blobs, largest first
         sock.sendto(json.dumps(msg).encode(), ("127.0.0.1", PORT))
         n += 1
         if a.debug and (a.once or n % 20 == 0):
