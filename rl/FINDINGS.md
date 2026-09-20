@@ -300,6 +300,12 @@ the twin. Findings, each from a replay of the stalled policy:
    Robot side: 10 Hz chunks into `robot_hal`'s stream welder (K0 20, K1 0.3, vff 1), reference lead
    bounded to 3 deg, torque contact guard (contact_detector thresholds), attach emulation (no object
    tracking), suction via a new `{"suction": 0/1}` robot_hal command.
+18. **On the real Pro 630 (2026-09-20)**: run 1 crawled at 5.9 deg/s (the Pi's `vel_cmd_max` is in post-`vel_scale`
+   units; 850 = 50 deg/s) and timed out 0.2 cm from the grasp point. Run 2 (`--touch_only --dq_max 1.0`, 10 deg/s):
+   the DAgger policy brought the cup to 0.3 cm of the grasp point at 10.0 s, firm torque contact at 11.0 s, lead over
+   the arm <= 1.1 deg the whole way, then retract / place pose / home (`docs/real_touch_demo_0920.png`). Scene from
+   the D435 scan: table z ~ 0 (training height; config.TABLE_Z is stale), object top 0.047 (camera) / 0.058 (FK at
+   contact). Suction is not activated in demos by request.
 8. Planner throughput is the DAgger bottleneck (one server, ~40 % of hover goals rejected near
    the wall keep-out / camera mount → IK fallback). Table slab for the planner must clear the
    robot base (a slab through the base = every plan "no solution").

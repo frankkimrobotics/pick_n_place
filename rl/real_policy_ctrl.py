@@ -583,8 +583,18 @@ def main():
         import mujoco
         demo = {"__file__": os.path.join(ROOT, "mjwarp_pick_demo.py")}
         exec(open(demo["__file__"]).read().split("if __name__")[0], demo)
-        q_up, err = demo["ik"](ob.m, mujoco.MjData(ob.m), "tcp", [float(tip_now[0]), float(tip_now[1]), float(tip_now[2]) + 0.05], demo["R_DOWN"], q_now)
-        for q_to, lab in ((np.array(q_up), "retract 5 cm"), (START_Q, "home")):
+        dik = mujoco.MjData(ob.m)
+        q_up, err = demo["ik"](ob.m, dik, "tcp", [float(tip_now[0]), float(tip_now[1]), float(tip_now[2]) + 0.05], demo["R_DOWN"], q_now)
+        # place pose: cup (empty) over the goal, as if carrying the object there
+        p_place = [float(p_goal[0]), float(p_goal[1]), float(p_goal[2]) + float(ob.half[2]) + CUP_R]
+        q_place, err_p = demo["ik"](ob.m, dik, "tcp", p_place, demo["R_DOWN"], np.array(q_up))
+        legs = [(np.array(q_up), "retract 5 cm")]
+        if err_p < 0.005:
+            legs.append((np.array(q_place), f"to place pose {np.round(p_place, 3).tolist()}"))
+        else:
+            print(f"[ctrl] place pose IK failed (err {err_p:.4f}) -> skipping that leg")
+        legs.append((START_Q, "home"))
+        for q_to, lab in legs:
             q_from, _, _ = link.state()
             T = max(0.5, np.degrees(np.abs(q_to - q_from)).max() / 6.0)
             n = int(T / 0.1) + 1
@@ -593,7 +603,7 @@ def main():
                 print(f"[guard] {lab} path violates limits -> stopping here"); break
             print(f"[ctrl] {lab}: {T:.1f} s{'' if a.exec else ' [dry run]'}")
             link.send_path(qs, 0.1, time.time() + 0.2)
-            time.sleep(T + 0.8)
+            time.sleep(T + 0.8 + (1.0 if lab.startswith("to place") else 0.0))
     if sealed and not a.keep_suction:
         time.sleep(0.5)
         link.suction(False)
