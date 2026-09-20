@@ -56,7 +56,8 @@ DQ_MAX_DEG = 2.0                    # training clamp (--dq_max)
 ELBOW_DEG = (70.0, 145.0)           # |j2|, |j3| (URDF deg), same box as real_pnp_online.check_box
 STREAM_GAINS = dict(k0=20.0, k1=0.3, vmax=50.0, vel_scale=17.0, vff=1.0, lead=0.0)
 PERIOD_MS = 10
-VEL_CMD_MAX = 100
+VEL_CMD_MAX = 850                   # Pi clamp on vel_cmd AFTER vel_scale (units = 17 per deg/s): 850 = 50 deg/s.
+                                    # Run 1 (2026-09-20) used 100 = 5.9 deg/s -> the arm crawled and timed out.
 START_Q = np.array([0.0, -0.349066, 1.396263, 0.174533, -1.570796, 0.0])   # config.START_Q (URDF rad)
 OBJ_TOP_TRAIN = (0.02, 0.07)        # object-top z range seen in training (sim object top = 0.04)
 OBS_NOISE = 0.005                   # training observation noise (env dr): the BC policy STALLS without it
@@ -339,7 +340,7 @@ class Guard:
 
 # ---------------------------------------------------------------- controller loop
 def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, obs_noise=OBS_NOISE, lead_max_deg=LEAD_MAX_DEG,
-                tau_base=None, verbose=True):
+                tau_base=None, verbose=True, touch_only=False):
     """10 Hz policy loop on the real robot.
     q_virtual : the policy's integrated target (what the observation's lag term uses; it may wind up
                 during a press exactly as in training)
@@ -395,10 +396,11 @@ def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, ob
         else:
             rel_count = 0
         if want != sealed_cmd:
-            link.suction(want)
+            if not touch_only:
+                link.suction(want)
             sealed_cmd = want
             if verbose:
-                print(f"[ctrl] step {k}: suction {'ON' if want else 'OFF'}")
+                print(f"[ctrl] step {k}: suction {'ON' if want else 'OFF'}{' (touch-only: not sent)' if touch_only else ''}")
         # contact from the drive torque
         tau = 0.0
         if tau_base is not None:
@@ -409,6 +411,10 @@ def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, ob
             link.send_segment(q_send_prev, q, t_dec, seq=k)
             break
         firm = tau >= TAU_FIRM
+        if firm and touch_only:
+            reason = f"TOUCH (tau {tau:.3f}) at tip {np.round(tcp_now, 4).tolist()} -- touch-only demo ends here"
+            link.send_segment(q_send_prev, q, t_dec, seq=k)
+            break
         if firm and sealed_cmd and not attached:
             t_contact_on = t_contact_on or time.time()
             if time.time() - t_contact_on >= ATTACH_AFTER:
@@ -453,6 +459,7 @@ def main():
     ap.add_argument("--steps", type=int, default=150)
     ap.add_argument("--go_home", action="store_true", help="stream to the training start pose (5 deg/s) before the episode")
     ap.add_argument("--keep_suction", action="store_true", help="leave suction on at the end (object stays on the cup)")
+    ap.add_argument("--touch_only", action="store_true", help="demo mode: never activate suction; end at first firm contact, retract 5 cm and return home")
     ap.add_argument("--exec", action="store_true", help="actually send commands (default: dry run)")
     ap.add_argument("--force", action="store_true", help="skip the object-height / start-pose sanity checks")
     ap.add_argument("--log", default=None, help="write per-step JSON log here")
@@ -566,7 +573,27 @@ def main():
         tau_base = link.torque_baseline(1.0)
         print(f"[contact] torque baseline (1 s median) {np.round(tau_base, 3).tolist()}  firm {TAU_FIRM} hard {TAU_HARD}")
     print(f"[ctrl] {'EXECUTING' if a.exec else 'DRY RUN'}: {a.steps} decisions at {1 / CTRL_DT:.0f} Hz, dq_max {a.dq_max} deg, lead_max {a.lead_max} deg, obs noise {a.obs_noise}, gains {STREAM_GAINS}")
-    rows, sealed = run_episode(link, policy, ob, guard, p_obj, p_goal, a.steps, dq_max, a.log, obs_noise=a.obs_noise, lead_max_deg=a.lead_max, tau_base=tau_base)
+    rows, sealed = run_episode(link, policy, ob, guard, p_obj, p_goal, a.steps, dq_max, a.log, obs_noise=a.obs_noise, lead_max_deg=a.lead_max,
+                               tau_base=tau_base, touch_only=a.touch_only)
+    if a.touch_only:
+        sealed = False
+        link.suction(False)                       # belt and braces: the pin is never set in this mode
+        q_now, _, _ = link.state()
+        tip_now, _ = ob.fk(q_now)
+        import mujoco
+        demo = {"__file__": os.path.join(ROOT, "mjwarp_pick_demo.py")}
+        exec(open(demo["__file__"]).read().split("if __name__")[0], demo)
+        q_up, err = demo["ik"](ob.m, mujoco.MjData(ob.m), "tcp", [float(tip_now[0]), float(tip_now[1]), float(tip_now[2]) + 0.05], demo["R_DOWN"], q_now)
+        for q_to, lab in ((np.array(q_up), "retract 5 cm"), (START_Q, "home")):
+            q_from, _, _ = link.state()
+            T = max(0.5, np.degrees(np.abs(q_to - q_from)).max() / 6.0)
+            n = int(T / 0.1) + 1
+            qs = [q_from + (q_to - q_from) * i / (n - 1) for i in range(n)]
+            if any(guard.check_q(qq) for qq in qs):
+                print(f"[guard] {lab} path violates limits -> stopping here"); break
+            print(f"[ctrl] {lab}: {T:.1f} s{'' if a.exec else ' [dry run]'}")
+            link.send_path(qs, 0.1, time.time() + 0.2)
+            time.sleep(T + 0.8)
     if sealed and not a.keep_suction:
         time.sleep(0.5)
         link.suction(False)

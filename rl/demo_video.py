@@ -32,6 +32,8 @@ def main():
     ap.add_argument("--horizon", type=int, default=45)
     ap.add_argument("--drive", default="real", choices=["real", "ideal"], help="drive model (2026-09-17: real = measured Pro 630)")
     ap.add_argument("--env", default="pick", choices=["pick", "paper"], help="paper = env_paper.PaperPickEnv (reach/lift/hold task)")
+    ap.add_argument("--ep_len", type=int, default=100, help="paper env episode length (150 for the measured drive)")
+    ap.add_argument("--obs_noise", type=float, default=0.0, help="Gaussian obs noise at test time (0.005 = training value; the DAgger clones stall without it)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     wp.init()
@@ -42,7 +44,7 @@ def main():
     N = a.episodes
     if a.env == "paper":
         from env_paper import PaperPickEnv
-        env = PaperPickEnv(nworld=N, xml=a.scene, dr=False, drive=a.drive)
+        env = PaperPickEnv(nworld=N, xml=a.scene, dr=False, drive=a.drive, ep_len=a.ep_len)
     else:
         env = PickEnv(nworld=N, mode=a.mode, xml=a.scene, lift_req=0.35, drive=a.drive)
     ck = torch.load(a.actor, map_location=env.device, weights_only=False)
@@ -80,6 +82,8 @@ def main():
                                 env.place_target[i].detach().cpu().numpy().copy(),
                                 float(env.target_h[i])))
         with torch.no_grad():
+            if a.obs_noise > 0:
+                obs = obs + torch.randn_like(obs) * a.obs_noise
             mu = actor(obs)[0] if a.algo == "ppo" else actor(obs)[0]
             act = torch.tanh(mu)                     # deterministic policy
         obs, r, done, info = env.step(act)
