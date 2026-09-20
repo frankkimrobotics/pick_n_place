@@ -22,7 +22,7 @@ import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from ppo import AC  # noqa: E402
+from ppo import AC, FusedResidual, build_frozen_policy, describe_policy  # noqa: E402
 
 
 class DetPolicy(torch.nn.Module):
@@ -34,18 +34,14 @@ class DetPolicy(torch.nn.Module):
         return torch.tanh(self.pi(obs))
 
 
-class ResidualDetPolicy(torch.nn.Module):
-    """Fused residual policy: clamp(tanh(base.pi(o)) + bound*tanh(res.pi(o)), -1, 1).
-    Exported as ONE graph, so the controller sees the same interface as a plain policy."""
+class ResidualDetPolicy(FusedResidual):
+    """Fused residual policy:  clamp(base_scale*base(obs_b) + bound*tanh(res.pi(obs)), -1, 1),
+    obs_b = obs with the a_prev joint columns divided by base_scale (see ppo.rescale_a_prev).
+    `base` may itself be a fused residual (residual-on-residual), so the whole stack is exported
+    as ONE graph and the controller sees the same interface as a plain policy."""
 
-    def __init__(self, base_ac, res_ac, bound):
-        super().__init__()
-        self.base = base_ac.pi
-        self.res = res_ac.pi
-        self.bound = float(bound)
-
-    def forward(self, obs):
-        return torch.clamp(torch.tanh(self.base(obs)) + self.bound * torch.tanh(self.res(obs)), -1.0, 1.0)
+    def __init__(self, base, res_ac, bound, base_scale=1.0):
+        super().__init__(base, res_ac.pi if hasattr(res_ac, "pi") else res_ac, bound, base_scale)
 
 
 def build_engine(onnx_path, plan_path, fp16=False, workspace_mb=256):
@@ -111,6 +107,7 @@ def main():
     ap.add_argument("--fp16", action="store_true")
     ap.add_argument("--residual_base", default=None, help="override the checkpoint's residual_base path")
     ap.add_argument("--residual_bound", type=float, default=None, help="override the checkpoint's residual_bound")
+    ap.add_argument("--base_scale", type=float, default=None, help="override the checkpoint's base_scale")
     a = ap.parse_args()
     stem = a.out or os.path.splitext(a.ckpt)[0]
     ck = torch.load(a.ckpt, map_location="cpu", weights_only=False)
@@ -118,14 +115,13 @@ def main():
     ac.load_state_dict(ck["ac"])
     ac.eval()
     base_path = a.residual_base or ck.get("residual_base")
+    base_scale = float(a.base_scale if a.base_scale is not None else ck.get("base_scale", 1.0))
     if base_path:                       # residual checkpoint -> export the FUSED policy
         bound = float(a.residual_bound if a.residual_bound is not None else ck.get("residual_bound", 0.3))
-        base = AC(obs_dim=a.obs_dim, arch=a.arch)
-        ckb = torch.load(base_path, map_location="cpu", weights_only=False)
-        base.load_state_dict(ckb["ac"] if "ac" in ckb else ckb)
-        base.eval()
-        pol = ResidualDetPolicy(base, ac, bound).eval()
-        print(f"[export] residual policy: base {base_path} bound {bound}")
+        base = build_frozen_policy(base_path, a.obs_dim, arch=a.arch, device="cpu")
+        pol = ResidualDetPolicy(base, ac, bound, base_scale).eval()
+        print(f"[export] residual policy: base {base_path} bound {bound} base_scale {base_scale} "
+              f"-> {describe_policy(pol, base_path)}")
     else:
         pol = DetPolicy(ac).eval()
     dummy = torch.zeros(1, a.obs_dim)
@@ -149,6 +145,8 @@ def main():
     meta = dict(ckpt=os.path.abspath(a.ckpt), obs_dim=a.obs_dim, arch=a.arch, step=ck.get("step"), success=ck.get("success"),
                 residual_base=(os.path.abspath(base_path) if base_path else None),
                 residual_bound=(bound if base_path else None),
+                base_scale=(base_scale if base_path else None),
+                dq_max_deg=ck.get("dq_max_deg"),
                 fp16=a.fp16, max_abs_err_trt=float(np.abs(trt_out - ref).max()), trt_us=1e6 * dt,
                 obs_layout="q[6] qd[6] p_obj[3] p_goal[3] a_prev[7] tcp[3] cup_axis[3] grasp_rel[3] (q_target-q)[6]" if a.obs_dim == 40
                 else "q[6] qd[6] p_obj[3] p_goal[3] a_prev[7] tcp[3] cup_axis[3] grasp_rel[3]")

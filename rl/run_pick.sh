@@ -22,4 +22,30 @@ while True:
     if math.hypot(g[0]-c[0], g[1]-c[1]) > 0.12 and not (g[1] > 0.18 and g[0] < 0.30): break
 print(g[0], g[1])"); fi
 echo "object $CX $CY top $TOP -> half z $HZ; goal ($GX, $GY)"
+python3 -c "
+import socket, json
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1)
+try:
+    s.sendto(json.dumps({'cmd': 'snap'}).encode(), ('127.0.0.1', 9702))
+    s.recv(4096)
+except Exception:
+    print('[monitor] not running')
+"
 CUDA_VISIBLE_DEVICES=0 timeout 240 ~/miniconda3/envs/mjwarp/bin/python rl/real_policy_ctrl.py --policy rl/weights/resid1_real_best --obj $CX $CY $HZ --half 0.04 0.04 $HZ --goal $GX $GY 0.22 --steps 200 --dq_max 2.0 --track --track_bias $BX $BY --touch_calib --go_home --force --exec --log ~/pnp_rl/real_pick_$N.json 2>&1 | grep "^\[ctrl\] guarded\|^\[calib\]\|^\[ctrl\] step\|^\[ctrl\] episode\|^\[ctrl\] place\|^\[ctrl\] suction\|^\[guard\]\|^\[result\]\|^\[home\]\|^\[warn\]\|no feedback\|abort\|Traceback"
+python3 -c "
+import socket, json
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(8)
+try:
+    s.sendto(json.dumps({'cmd': 'verdict', 'goal': [$GX, $GY], 'obj': [$CX, $CY], 'top': $TOP}).encode(), ('127.0.0.1', 9702))
+    r = json.loads(s.recv(65536))
+    if r.get('ok'):
+        agree = r.get('agree')
+        agree_s = 'n/a' if agree is None else ('yes' if agree else 'no')
+        dg = r.get('d_goal')
+        dg_s = 'n/a' if dg is None else '%.1f' % (100 * dg)
+        print('[monitor] %s (d_goal %s cm; fixed/wrist agree: %s)' % (r['verdict'], dg_s, agree_s))
+    else:
+        print('[monitor] error:', r.get('error'))
+except Exception:
+    print('[monitor] not running')
+"

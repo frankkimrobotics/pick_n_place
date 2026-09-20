@@ -63,6 +63,104 @@ class AC(nn.Module):
         return torch.distributions.Normal(mu, self.log_std.exp())
 
 
+# ---------------------------------------------------------------- residual / base-scale plumbing
+# Observation layout (paper env, measured drive, 40-D):
+#   q 0:6 | qd 6:12 | p_obj 12:15 | goal 15:18 | a_prev 18:25 | tcp 25:28 | cup axis 28:31 |
+#   grasp-relative 31:34 | lag (q_target - q) 34:40
+A_PREV_JOINTS = slice(18, 24)          # the six JOINT columns of a_prev (24 = suction, untouched)
+
+
+def rescale_a_prev(obs, base_scale):
+    """Observation as the frozen base was TRAINED to see it.
+
+    Actions are in units of --dq_max, so raising dq_max 2 -> 3 deg changes the meaning of the
+    a_prev columns.  With ``base_scale = s`` the base contributes s*tanh(pi) of the new unit,
+    i.e. exactly its old action; the a_prev it must read back is therefore the new a_prev
+    divided by s (clamped to the [-1, 1] range an action can take).  Column 24 (the suction
+    logit) is left alone, because `apply_base_scale` does not scale that channel either."""
+    if abs(base_scale - 1.0) < 1e-9:
+        return obs
+    # concatenation rather than an in-place slice assignment: this module is also traced to ONNX
+    return torch.cat([obs[..., :18],
+                      (obs[..., 18:24] / base_scale).clamp(-1.0, 1.0),
+                      obs[..., 24:]], dim=-1)
+
+
+def apply_base_scale(act, base_scale):
+    """Scale the frozen base's JOINT channels only.
+
+    base_scale is a unit conversion: the base was trained at dq_max 2 deg and runs inside a
+    dq_max 3 deg action space, so its six joint deltas must be multiplied by 2/3 to come out as
+    the same physical motion.  The suction channel carries no unit -- it is a logit whose SIGN
+    is the command -- so scaling it would (a) shrink it toward the decision boundary and (b)
+    make the a_prev the base reads back inconsistent with `rescale_a_prev`, which by construction
+    leaves column 24 alone.  Scaling it was measured: identity check 95.9 % -> 1.6 % success."""
+    if abs(base_scale - 1.0) < 1e-9:
+        return act
+    return torch.cat([base_scale * act[..., :6], act[..., 6:]], dim=-1)
+
+
+class BasePolicy(nn.Module):
+    """Deterministic squashed policy: obs -> tanh(pi(obs)) in [-1, 1]^7."""
+
+    def __init__(self, pi):
+        super().__init__()
+        self.pi = pi
+
+    def forward(self, obs):
+        return torch.tanh(self.pi(obs))
+
+
+class FusedResidual(nn.Module):
+    """clamp(base_scale * base(rescale(obs)) + bound * tanh(res(obs)), -1, 1).
+
+    `base` is itself a BasePolicy or a FusedResidual, so a residual trained on top of a
+    residual collapses into ONE module (and one ONNX graph)."""
+
+    def __init__(self, base, res_pi, bound, base_scale=1.0):
+        super().__init__()
+        self.base = base
+        self.res = res_pi
+        self.bound = float(bound)
+        self.base_scale = float(base_scale)
+
+    def forward(self, obs):
+        b = apply_base_scale(self.base(rescale_a_prev(obs, self.base_scale)), self.base_scale)
+        return torch.clamp(b + self.bound * torch.tanh(self.res(obs)), -1.0, 1.0)
+
+
+def build_frozen_policy(path, obs_dim, arch="paper", device="cpu", bound=None, base_scale=None):
+    """Load `path` as a frozen deterministic policy, recursing through residual checkpoints.
+
+    A plain PPO/DAgger checkpoint becomes a BasePolicy; a residual checkpoint (it carries
+    `residual_base`) becomes a FusedResidual over its own base, so `--residual_base <resid1>`
+    starts the new run from the 94.7 % fused policy instead of the 87.9 % DAgger base."""
+    ck = torch.load(path, map_location=device, weights_only=False)
+    ac = AC(obs_dim=obs_dim, arch=ck.get("arch", arch),
+            critic_extra=(5 if ck.get("critic_priv") else 0)).to(device)
+    ac.load_state_dict(ck["ac"] if "ac" in ck else ck)
+    ac.eval()
+    inner = ck.get("residual_base")
+    if inner:
+        sub = build_frozen_policy(inner, obs_dim, arch=arch, device=device)
+        pol = FusedResidual(sub, ac.pi,
+                            ck.get("residual_bound", 0.3) if bound is None else bound,
+                            ck.get("base_scale", 1.0) if base_scale is None else base_scale)
+    else:
+        pol = BasePolicy(ac.pi)
+    pol = pol.to(device)
+    pol.requires_grad_(False)
+    pol.eval()
+    return pol
+
+
+def describe_policy(pol, path, depth=0):
+    if isinstance(pol, FusedResidual):
+        return (f"residual(bound={pol.bound}, base_scale={pol.base_scale}) on "
+                + describe_policy(pol.base, path, depth + 1))
+    return "base MLP"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--nworld", type=int, default=4096)
@@ -126,6 +224,13 @@ def main():
                     help="frozen base policy checkpoint; executed action = clamp(tanh(base.pi(o)) + bound*tanh(r), -1, 1) "
                          "with r ~ N(pi(o), std) the trainable residual (PPO is run on r)")
     ap.add_argument("--residual_bound", type=float, default=0.3, help="max |residual| per action dim (action units)")
+    ap.add_argument("--base_scale", type=float, default=1.0,
+                    help="executed = clamp(base_scale*base(obs_b) + bound*tanh(res(obs)), -1, 1). With --dq_max 3 and "
+                         "base_scale 2/3 the frozen base reproduces its trained 2 deg/decision exactly while the "
+                         "residual may add up to bound*3 deg. obs_b = obs with the a_prev joint columns divided by "
+                         "base_scale (the base reads a_prev in ITS action units).")
+    ap.add_argument("--w_time", type=float, default=0.0,
+                    help="paper env: per-decision time penalty -w/CTRL_HZ while the object is not lifted-and-at-goal")
     # ---- drive-envelope shaping: keep the learnt motion inside the Pro 630 limits ----
     ap.add_argument("--w_speed", type=float, default=0.0,
                     help="weight of the joint-SPEED hinge penalty: -w * sum_j relu(|qd_j| - v_soft)/v_soft per decision (0 = off)")
@@ -146,7 +251,7 @@ def main():
         env = PaperPickEnv(nworld=a.nworld, device=dev, xml=a.scene, dr=a.dr, drive=a.drive, dq_max_deg=a.dq_max,
                            obs_lag=(None if a.obs_lag < 0 else bool(a.obs_lag)), target_max=a.target_max,
                            start=a.start, ep_len=a.ep_len, grasp_shaping=bool(a.grasp_shaping), obs_ee=bool(a.obs_ee), reach_target=a.reach_target, lift_dense=bool(a.lift_dense),
-                           w_track_c=a.w_track_c, w_track_f=a.w_track_f, w_reach=a.w_reach,
+                           w_track_c=a.w_track_c, w_track_f=a.w_track_f, w_reach=a.w_reach, w_time=a.w_time,
                            w_speed=a.w_speed, w_acc=a.w_acc, v_soft_deg=a.v_soft, a_soft_deg=a.a_soft)
     else:
         env = PickEnv(nworld=a.nworld, device=dev, xml=a.scene, mode=a.mode, dr=a.dr, target_max=a.target_max, lift_req=a.lift_req, speed_bonus=a.speed_bonus, release_mask=a.release_mask, mask_h=a.mask_h, tilt_pen_w=a.tilt_pen,
@@ -158,11 +263,9 @@ def main():
     ac = AC(obs_dim=obs_dim, arch=a.arch, critic_extra=(PRIV_DIM if a.critic_priv else 0)).to(dev)
     base = None
     if a.residual_base:
-        base = AC(obs_dim=obs_dim, arch=a.arch).to(dev)
-        ckb = torch.load(a.residual_base, map_location=dev, weights_only=False)
-        base.load_state_dict(ckb["ac"] if "ac" in ckb else ckb)
-        base.requires_grad_(False)
-        base.eval()
+        # recursive: a residual checkpoint as the base collapses into one frozen fused policy
+        base = build_frozen_policy(a.residual_base, obs_dim, arch=a.arch, device=dev)
+        print(f"[ppo] frozen base = {describe_policy(base, a.residual_base)}", flush=True)
         # zero the residual actor's output layer -> the executed action starts exactly at the base policy
         last = [m for m in ac.pi.modules() if isinstance(m, nn.Linear)][-1]
         with torch.no_grad():
@@ -172,7 +275,8 @@ def main():
         if a.init:
             print("[ppo] --init ignored: the residual actor must start zeroed", flush=True)
             a.init = None
-        print(f"[ppo] residual on {a.residual_base} bound={a.residual_bound} (actor output layer zeroed)", flush=True)
+        print(f"[ppo] residual on {a.residual_base} bound={a.residual_bound} base_scale={a.base_scale} "
+              f"(actor output layer zeroed)", flush=True)
     if a.init_std is not None:
         with torch.no_grad():
             ac.log_std.fill_(float(a.init_std))
@@ -209,8 +313,10 @@ def main():
     json.dump(vars(a), open(os.path.join(a.out, "args.json"), "w"), indent=1)
 
     ck_extra = dict(obs_dim=ac.obs_dim, arch=a.arch, critic_priv=bool(a.critic_priv))
+    ck_extra.update(dq_max_deg=float(a.dq_max))
     if base is not None:
-        ck_extra.update(residual_base=os.path.abspath(a.residual_base), residual_bound=float(a.residual_bound))
+        ck_extra.update(residual_base=os.path.abspath(a.residual_base), residual_bound=float(a.residual_bound),
+                        base_scale=float(a.base_scale))
 
     N, T = a.nworld, a.rollout
     obs_b = torch.zeros(T, N, ac.obs_dim, device=dev)
@@ -227,8 +333,11 @@ def main():
     obs = env.observe()
     step, n_up, t0 = 0, 0, time.time()
     best_succ = -1.0
-    ep = dict(n=0, ret=0.0, len=0.0, placed=0, sealed=0, peak_qd=0.0, peak_qd_max=0.0,
-              comp=np.zeros(len(env.RKEYS)))
+    def new_ep():
+        return dict(n=0, ret=0.0, len=0.0, placed=0, sealed=0, peak_qd=0.0, peak_qd_max=0.0,
+                    t_seal=0.0, t_goal=0.0, comp=np.zeros(len(env.RKEYS)))
+
+    ep = new_ep()
     while step < a.steps:
         with torch.no_grad():
             for t in range(T):
@@ -237,7 +346,8 @@ def main():
                 if base is None:
                     actn = torch.tanh(raw)
                 else:                       # residual: PPO acts on raw, the robot gets base + bounded correction
-                    actn = (torch.tanh(base.pi(obs)) + a.residual_bound * torch.tanh(raw)).clamp(-1.0, 1.0)
+                    actn = (apply_base_scale(base(rescale_a_prev(obs, a.base_scale)), a.base_scale)
+                            + a.residual_bound * torch.tanh(raw)).clamp(-1.0, 1.0)
                 obs_b[t] = obs
                 act_b[t] = raw
                 logp_b[t] = dist.log_prob(raw).sum(-1)
@@ -259,6 +369,9 @@ def main():
                     ep["placed_p"] = ep.get("placed_p", 0) + int(info["placed"][di][pm].sum())
                     ep["sealed"] += int(info["ever_sealed"][di].sum())
                     ep["comp"] += info["ep_comp"][di].sum(0).cpu().numpy()
+                    for tk in ("t_seal", "t_goal"):     # decisions to the first seal / to the goal
+                        if tk in info:
+                            ep[tk] += float(info[tk][di].sum())
                     if "peak_qd" in info:          # per-episode peak |qd| over joints (rad/s -> deg/s)
                         pq = np.degrees(info["peak_qd"][di].cpu().numpy())
                         ep["peak_qd"] += float(pq.sum())
@@ -335,7 +448,16 @@ def main():
                 elif kl < 0.5 * a.kl_target and kl > 0.0:
                     g["lr"] = min(a.lr_max, g["lr"] * 1.5)
         n_up += 1
+        # Episodes end in lock-step (all worlds time out together at --ep_len), so a logging
+        # window that happens to contain no episode boundary sees only the handful of worlds
+        # desynced by an early off-table failure.  Such a window used to be logged as a full
+        # record -- and a 3-episode 100 % froze best.pt at a noise peak.  Carry the accumulators
+        # into the next window instead, and record how many episodes each point averages.
+        min_ep = max(1, a.nworld // 4)
         if n_up % 5 == 0:
+            torch.save(dict(ac=ac.state_dict(), step=step, **ck_extra),
+                       os.path.join(a.out, "ac.pt"))
+        if n_up % 5 == 0 and ep["n"] >= min_ep:
             n_ep = max(1, ep["n"])
             rec = dict(step=step, updates=n_up, critic=vl / nb, actor=pl / nb,
                        alpha=0.0, entropy=el / nb, q_mean=float(val_b.mean()),
@@ -348,17 +470,16 @@ def main():
                        res_mag=(rmag / nb if base is not None else None),
                        lr=opt.param_groups[0]["lr"], reg_lambda=getattr(env, "reg_lambda", None),
                        peak_qd=ep["peak_qd"] / n_ep, peak_qd_max=ep["peak_qd_max"],
+                       t_seal=ep["t_seal"] / n_ep, t_goal=ep["t_goal"] / n_ep, n_ep=int(ep["n"]),
                        drive_scale=getattr(env, "drive_scale", None))
             log.write(json.dumps(rec) + "\n"); log.flush()
             print(f"[ppo] {step:>10,} | succ {rec['success']:.2%} pnp {rec['succ_pnp']:.2%} "
                   f"seal {rec['seal_rate']:.2%} ret {rec['ep_ret']:.2f} "
                   + (f"res {rec['res_mag']:.4f} " if base is not None else "")
                   + f"qd {rec['peak_qd']:.0f}/{rec['peak_qd_max']:.0f} "
+                  + f"t_seal {rec['t_seal']:.1f} t_goal {rec['t_goal']:.1f} "
                   + f"sps {rec['sps']:,.0f}", flush=True)
-            ep = dict(n=0, ret=0.0, len=0.0, placed=0, sealed=0, peak_qd=0.0, peak_qd_max=0.0,
-                      comp=np.zeros(len(env.RKEYS)))
-            torch.save(dict(ac=ac.state_dict(), step=step, **ck_extra),
-                       os.path.join(a.out, "ac.pt"))
+            ep = new_ep()
             if rec["success"] > best_succ:          # keep the peak (runs decay after it)
                 best_succ = rec["success"]
                 torch.save(dict(ac=ac.state_dict(), step=step, success=best_succ, **ck_extra),

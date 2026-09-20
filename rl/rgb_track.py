@@ -30,12 +30,39 @@ SERIAL = "043422070101"
 XR, YR = (0.18, 0.60), (-0.32, 0.32)
 
 
+def split_clusters(P, cell=0.02, min_pts=150):
+    """Connected components of the xy occupancy grid (8-neighbour) of the points above the table; a gap of one
+    empty 2 cm cell separates two objects. Returns the point subsets, largest first."""
+    keys = np.floor(P[:, :2] / cell).astype(np.int64)
+    cells = {}
+    for idx, k in enumerate(map(tuple, keys)):
+        cells.setdefault(k, []).append(idx)
+    occ = {k for k, v in cells.items() if len(v) >= 4}
+    seen, comps = set(), []
+    for k in occ:
+        if k in seen:
+            continue
+        st, comp = [k], []
+        while st:
+            c = st.pop()
+            if c in seen or c not in occ:
+                continue
+            seen.add(c)
+            comp.append(c)
+            st += [(c[0] + i, c[1] + j) for i in (-1, 0, 1) for j in (-1, 0, 1)]
+        pts = np.concatenate([cells[c] for c in comp])
+        if len(pts) >= min_pts:
+            comps.append(P[pts])
+    comps.sort(key=lambda c: -len(c))
+    return comps
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--top", type=float, default=0.05, help="object height (m) for the plane fallback")
     ap.add_argument("--vmax", type=int, default=100, help="HSV value threshold: object pixels are darker than this (table V 116-157, grey cylinder 49-86, black base 20-68 on 2026-09-20)")
     ap.add_argument("--known", type=float, nargs=3, default=None, help="debug: project this base-frame point into the image (magenta)")
-    ap.add_argument("--mode", default="diff", choices=["dark", "hue", "diff"], help="dark: V < vmax (grey/black objects); hue: H in [hue_lo, hue_hi] and S > smin (coloured objects); diff: Lab distance from the table's median colour > dthr (anything that is not table)")
+    ap.add_argument("--mode", default="depth", choices=["depth", "dark", "hue", "diff"], help="depth: pixels standing > zmin_obj above the table plane (lighting-independent; default); dark: V < vmax (grey/black objects); hue: H in [hue_lo, hue_hi] and S > smin (coloured objects); diff: Lab distance from the table's median colour > dthr (anything that is not table)")
     ap.add_argument("--dthr", type=float, default=18.0, help="Lab distance threshold for --mode diff")
     ap.add_argument("--min_top", type=float, default=0.012, help="reject depth-derived blobs lower than this (shadows); low objects read ~0.017 on sparse depth")
     ap.add_argument("--max_px", type=int, default=15000, help="reject blobs larger than this (a sheet of paper is ~25k px, objects 2-8k)")
@@ -43,6 +70,7 @@ def main():
     ap.add_argument("--smin", type=int, default=80, help="min saturation for --mode hue")
     ap.add_argument("--min_px", type=int, default=300)
     ap.add_argument("--zmax", type=float, default=0.15, help="reject blobs whose depth height exceeds this (arm)")
+    ap.add_argument("--zmin_obj", type=float, default=0.010, help="depth points below this height are table/shadow and are excluded from the object clusters")
     ap.add_argument("--debug", default=None, help="write an annotated image here (every 20th frame, or once)")
     ap.add_argument("--once", action="store_true")
     a = ap.parse_args()
@@ -76,18 +104,41 @@ def main():
     for _ in range(10):
         pipe.wait_for_frames()
     n, t_last = 0, time.time()
+    dep_hist = []
     print(f"[rgb_track] up, publishing to udp://127.0.0.1:{PORT}; ROI hull {hull.reshape(-1, 2).tolist()}", flush=True)
     while True:
         fs = align.process(pipe.wait_for_frames())
         col = np.asanyarray(fs.get_color_frame().get_data())
         dep = np.asanyarray(fs.get_depth_frame().get_data()).astype(np.float32) * ds
+        if a.mode == "depth":                                   # 3-frame temporal median: single-frame holes on dark objects
+            dep_hist.append(dep)
+            if len(dep_hist) > 3:
+                dep_hist.pop(0)
+            dep = np.median(np.stack(dep_hist), 0)
         hsv = cv2.cvtColor(col, cv2.COLOR_BGR2HSV)
-        if a.mode == "dark":
+        # per-pixel height above the table from depth (2026-09-20): objects are also anything that stands up,
+        # and the table colour reference is taken from TABLE-LEVEL pixels only (the D435's lighting gradient made
+        # half the table fail the colour test once the white balance drifted -> one giant merged blob)
+        zv = (dep > 0.2) & (dep < 1.5) & (roi > 0)
+        hgt = np.full(dep.shape, np.nan, np.float32)
+        if zv.any():
+            vv, uu = np.nonzero(zv); zz = dep[vv, uu]
+            Pz = (np.stack([(uu - cx0) / fx * zz, (vv - cy0) / fy * zz, zz], 1) @ Tbc[:3, :3].T)[:, 2] + Tbc[2, 3]
+            hgt[vv, uu] = Pz
+        # table plane offset: the extrinsics put the table at -5 mm (median over the ROI, objects are a minority)
+        h_table = float(np.nanmedian(hgt[roi > 0])) if zv.any() else 0.0
+        hrel = np.nan_to_num(hgt - h_table, nan=0.0)
+        up = hrel > a.zmin_obj
+        table_px = (np.abs(np.nan_to_num(hgt - h_table, nan=1.0)) < 0.005)
+        if a.mode == "depth":                                   # default since 2026-09-20: colour is lighting-dependent
+            sel = up
+        elif a.mode == "dark":
             sel = hsv[:, :, 2] < a.vmax
         elif a.mode == "diff":
             lab = cv2.cvtColor(col, cv2.COLOR_BGR2LAB).astype(np.float32)
-            med = np.median(lab[roi > 0].reshape(-1, 3), axis=0)
-            sel = np.linalg.norm(lab - med, axis=2) > a.dthr
+            ref = lab[table_px] if table_px.sum() > 2000 else lab[roi > 0]
+            med = np.median(ref.reshape(-1, 3), axis=0)
+            sel = (np.linalg.norm(lab - med, axis=2) > a.dthr) | up
         else:
             h = hsv[:, :, 0]
             sel = (h >= a.hue[0]) & (h <= a.hue[1]) & (hsv[:, :, 1] > a.smin) & (hsv[:, :, 2] > 60)
@@ -98,7 +149,7 @@ def main():
         cands = []
         for i in range(1, ncc):
             x, y, w, h, area = stats[i]
-            if area < a.min_px or area > a.max_px or x == 0 or y == 0 or x + w >= 640 or y + h >= 480:
+            if area < a.min_px or x == 0 or y == 0 or x + w >= 640 or y + h >= 480:
                 continue
             m = lab == i
             zs = dep[m]; zs = zs[(zs > 0.2) & (zs < 1.5)]
@@ -107,13 +158,24 @@ def main():
                 sel = (dep[vs, us] > 0.2) & (dep[vs, us] < 1.5)
                 z = dep[vs[sel], us[sel]]
                 P = np.stack([(us[sel] - cx0) / fx * z, (vs[sel] - cy0) / fy * z, z, np.ones_like(z)], 1) @ Tbc.T
-                P = P[(P[:, 2] > -0.02) & (P[:, 2] < a.zmax + 0.05)]
+                # 2026-09-20 s3_03: a colour blob can be SEVERAL objects plus their shadows (13.7k px merged blob ->
+                # centroid between two cans -> cup landed on an edge). Drop table-level points (shadows) and split
+                # the rest into xy clusters on a 2 cm grid; each cluster becomes its own candidate.
+                P[:, 2] -= h_table
+                P = P[(P[:, 2] > a.zmin_obj) & (P[:, 2] < a.zmax + 0.05)]
                 if len(P) < 30:
                     continue
-                top = float(np.percentile(P[:, 2], 90))
-                T = P[P[:, 2] > top - 0.015]
-                cand = dict(cx=float(T[:, 0].mean()), cy=float(T[:, 1].mean()), top=top, n=int(area), src="depth")
+                for C in split_clusters(P, cell=0.02, min_pts=150):
+                    top = float(np.percentile(C[:, 2], 90))
+                    T = C[C[:, 2] > top - 0.015]
+                    cand = dict(cx=float(T[:, 0].mean()), cy=float(T[:, 1].mean()), top=top, n=int(len(C)), src="depth")
+                    if cand["top"] > a.zmax or not (XR[0] < cand["cx"] < XR[1] and YR[0] < cand["cy"] < YR[1]) or cand["top"] < a.min_top:
+                        continue
+                    cands.append((len(C), cand, i))
+                continue
             else:                                                       # plane fallback at z = top/2 through the centroid ray
+                if area > a.max_px:                                     # colour-only giant region (paper sheet / table shading)
+                    continue
                 u0, v0 = cents[i]
                 r = np.array([(u0 - cx0) / fx, (v0 - cy0) / fy, 1.0])
                 o = Tbc[:3, 3]; d = Tbc[:3, :3] @ r
@@ -129,7 +191,7 @@ def main():
             cands.sort(key=lambda c: -c[0])
             det = cands[0][1]
         msg = dict(t=time.time(), **(det or dict(cx=None, cy=None, top=None, n=0)))
-        msg["cands"] = [dict(cx=c[1]["cx"], cy=c[1]["cy"], top=c[1]["top"], n=c[1]["n"]) for c in cands[:4]]   # all blobs, largest first
+        msg["cands"] = [dict(cx=c[1]["cx"], cy=c[1]["cy"], top=c[1]["top"], n=c[1]["n"]) for c in cands[:8]]   # all blobs, largest first
         sock.sendto(json.dumps(msg).encode(), ("127.0.0.1", PORT))
         n += 1
         if a.debug and (a.once or n % 20 == 0):

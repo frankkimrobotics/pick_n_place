@@ -684,6 +684,7 @@ def sim_stage():
             env.qpos[0, :6] = T(START_Q)
             env.qvel[0, :] = 0.0
             E.mjw.forward(env.m, env.d)
+            env.q_hist[0] = T(START_Q)
             for nm in ("q_target", "q_target_prev", "q_drive", "q_meas_lag"):
                 getattr(env, nm)[0] = T(START_Q)
             for nm in ("v_drive", "v_buf", "qd_meas_lag"):

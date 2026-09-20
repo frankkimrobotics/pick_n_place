@@ -67,7 +67,17 @@ DRIVE = dict(
                                # clamps pos_cmd to +-3 deg of posfb). Without it q_drive integrated 28 deg into a
                                # blocked object and released as a violent jump (probe 2026-09-17).
     cmd_dt=0.010,              # HAL command / feedback period (s)
-    k0=20.0, k1=0.3, vff=1.0,  # deployed streaming law: u = vff*v_ref - k0*(q-q_ref) - k1*(qd-v_ref)
+    k0=10.0, k1=0.3, vff=1.0,  # deployed streaming law: u = vff*v_ref(t+lead) - k0*(q-q_ref(t+lead)) - k1*(qd-v_ref(t+lead))
+                               # K0 dropped 20 -> 10 on 2026-09-20 once the reference lead compensated the dead-time
+                               # (real_policy_ctrl.STREAM_GAINS; A/B on the robot: velocity ripple j3/j4 1.53/1.45 ->
+                               # 0.94/0.68 deg/s, same-tick position error 1.14/1.62 -> 0.71/0.98 deg).
+    lead=0.045,                # the Pi samples the reference at t + lead (= the drive dead-time)
+    ref="spline",              # reference shape: "spline" = uniform cubic B-spline over the last 4 decision targets
+                               # + 1 extrapolated point (mycobot_mpc/spline_ref.py, deployed 2026-09-19);
+                               # "linear" = the old per-decision ramp (kept so pre-0920 runs stay reproducible)
+    lead_max=np.radians(3.0),  # real_policy_ctrl.LEAD_MAX_DEG: the streamed reference may lead the MEASURED joint by
+                               # at most this much (q_send = q + clip(q_virtual - q, +-lead_max)); enable with
+                               # lead_clip=True (the policy's own q_target keeps integrating, as on the robot)
 )
 DRIVE_DR = dict(vmax=(0.9, 1.1), amax=(0.75, 1.15), dead=(0.030, 0.065))
 EP_LEN = 150
@@ -111,7 +121,8 @@ class PickEnv:
                  mask_h=0.05, tilt_pen_w=None, drive="real", dq_max_deg=None,
                  obs_lag=None, hover_range=(0.02, 0.04), smooth_w=None, transport_w=None,
                  descend_sigma=0.07, w_speed=0.0, w_acc=0.0,
-                 v_soft_deg=30.0, a_soft_deg=400.0):
+                 v_soft_deg=30.0, a_soft_deg=400.0,
+                 drive_ref=None, lead_clip=None):
         """mode='attach': staged sub-task -- episodes START with the cup
         hovering 2-4 cm above the (jittered) grasp point; success = seal +
         hold + 2 cm lift within a 40-step episode. mode='full': whole task."""
@@ -129,6 +140,14 @@ class PickEnv:
         # drive="ideal": legacy stiff PD straight to the commanded target
         assert drive in ("real", "ideal")
         self.drive = drive
+        # reference shape of the streamed trajectory (see DRIVE["ref"]).  "spline" mirrors the
+        # deployed Pi (uniform cubic B-spline over the last 4 decision targets + 1 extrapolated
+        # point); "linear" is the pre-2026-09-19 per-decision ramp.
+        self.drive_ref = DRIVE["ref"] if drive_ref is None else str(drive_ref)
+        assert self.drive_ref in ("spline", "linear")
+        # bounded reference lead (real_policy_ctrl.LEAD_MAX_DEG); default: on with the spline reference,
+        # because the deployed controller always applies it.
+        self.lead_clip = (self.drive_ref == "spline") if lead_clip is None else bool(lead_clip)
         self.dq_max = DQ_MAX if dq_max_deg is None else float(np.radians(dq_max_deg))
         self.obs_lag = (drive == "real") if obs_lag is None else bool(obs_lag)
         self.hover_range = tuple(hover_range)   # attach/pnp start height of the cup above the grasp point (m)
@@ -229,6 +248,8 @@ class PickEnv:
         self.vmax_w = torch.full((nworld, 1), DRIVE["vmax"], device=device)
         self.amax_w = torch.full((nworld, 1), DRIVE["amax"], device=device)
         self.q_target_prev = torch.zeros(nworld, 6, device=device)
+        # last 4 STREAMED decision targets (the Pi's spline control polygon, newest last)
+        self.q_hist = torch.zeros(nworld, 4, 6, device=device)
         self.q_meas_lag = torch.zeros(nworld, 6, device=device)               # feedback one cmd tick old
         self.qd_meas_lag = torch.zeros(nworld, 6, device=device)
         self.prev_dq = torch.zeros(nworld, 6, device=device)
@@ -360,6 +381,7 @@ class PickEnv:
             self.apply_drive_scale(idx)
         self.q_target[idx] = self.qpos[idx, :6]
         self.q_target_prev[idx] = self.qpos[idx, :6]
+        self.q_hist[idx] = self.qpos[idx, None, :6]
         self.q_drive[idx] = self.qpos[idx, :6]
         self.v_drive[idx] = 0.0
         self.v_buf[idx] = 0.0
@@ -476,6 +498,7 @@ class PickEnv:
         # carry poses are written above, after the early q_target init)
         self.q_target[idx] = self.qpos[idx, :6]
         self.q_target_prev[idx] = self.qpos[idx, :6]
+        self.q_hist[idx] = self.qpos[idx, None, :6]
         self.q_drive[idx] = self.qpos[idx, :6]
         self.v_drive[idx] = 0.0
         self.v_buf[idx] = 0.0
@@ -719,27 +742,79 @@ class PickEnv:
         self.amax_w[idx] = amax[:, None]
 
     # ---------------- measured drive model ----------------
+    def _spline_ref(self, c):
+        """(q_ref, v_ref) of the deployed uniform cubic B-spline reference at command tick c.
+
+        Mirrors mycobot_mpc/spline_ref.py (`_basis`, `_eval`, `sample`) and
+        real_policy_ctrl.PiLink._send_spline_segment: the control polygon is the last 4
+        streamed decision targets plus one extrapolated point
+        ``q_ext = q_k + (q_k - q_{k-1})``, uniform knots of dt = 1/CTRL_HZ, anchored so the
+        newest target q_k sits at t_dec + dt (i.e. the anchor is t_dec - 2 dt, control point
+        i at t_anchor + i*dt).  The Pi samples at t + LEAD, so
+
+            u = (t_dec + c*cmd_dt + lead - t_anchor)/dt = 2 + c*cmd_dt/dt + lead/dt
+
+        u is the same for every world (only the control points differ), so the basis is a
+        handful of python floats and the evaluation is one weighted sum over (N, 6) tensors.
+        """
+        dt = 1.0 / CTRL_HZ
+        u = 2.0 + c * DRIVE["cmd_dt"] / dt + DRIVE["lead"] / dt
+        i = int(u)
+        i = min(max(i, 0), 3)                      # spline_ref._eval: clamp to [0, n-2], n = 5 points
+        sp = min(max(u - i, 0.0), 1.0)
+        om = 1.0 - sp
+        b = (om * om * om / 6.0,
+             (3.0 * sp ** 3 - 6.0 * sp * sp + 4.0) / 6.0,
+             (-3.0 * sp ** 3 + 3.0 * sp * sp + 3.0 * sp + 1.0) / 6.0,
+             sp ** 3 / 6.0)
+        d = (-0.5 * om * om,
+             (3.0 * sp * sp - 4.0 * sp) * 0.5,
+             (-3.0 * sp * sp + 2.0 * sp + 1.0) * 0.5,
+             0.5 * sp * sp)
+        h = self.q_hist                                     # (N, 4, 6), newest last
+        ext = 2.0 * h[:, 3] - h[:, 2]                       # extrapolated 5th control point
+        pts = [h[:, 0], h[:, 1], h[:, 2], h[:, 3], ext]
+        idx = [min(max(j, 0), 4) for j in (i - 1, i, i + 1, i + 2)]   # spline_ref._p: clamp at the ends
+        q_ref = b[0] * pts[idx[0]] + b[1] * pts[idx[1]] + b[2] * pts[idx[2]] + b[3] * pts[idx[3]]
+        v_ref = (d[0] * pts[idx[0]] + d[1] * pts[idx[1]] + d[2] * pts[idx[2]]
+                 + d[3] * pts[idx[3]]) / dt
+        return q_ref, v_ref
+
     def _step_real_drive(self, log=None):
         """One 10 Hz decision through the measured Pro 630 drive chain.
-        The decision's joint delta becomes a linear reference ramp over the
-        decision period (what the Pi's chunk welder does with a streamed
-        waypoint). Every 10 ms command tick: outer law on ONE-TICK-OLD
-        feedback -> velocity command, clipped to the drive's saturation ->
-        dead-time ring buffer -> acceleration-limited drive velocity ->
-        integrated drive position, which the stiff joint PD (the drive's own
-        position loop) tracks at the 2 ms physics rate."""
+
+        The decision's target is streamed to the Pi, which turns it into a reference:
+        with ``drive_ref="spline"`` (deployed since 2026-09-19) a uniform cubic B-spline over
+        the last 4 targets + 1 extrapolated point, sampled at t + LEAD; with
+        ``drive_ref="linear"`` the old per-decision ramp.  Every 10 ms command tick: outer law
+        on ONE-TICK-OLD feedback -> velocity command, clipped to the drive's saturation ->
+        dead-time ring buffer -> acceleration-limited drive velocity -> integrated drive
+        position, which the stiff joint PD (the drive's own position loop) tracks at the 2 ms
+        physics rate."""
         dt_cmd = DRIVE["cmd_dt"]
         dt_phys = float(self.mjm.opt.timestep)
         sub_per_cmd = max(1, self.substeps // self.n_cmd)
-        v_ref = (self.q_target - self.q_target_prev) * CTRL_HZ          # rad/s over the decision
+        # what the desktop actually streams: the virtual target, bounded to lead_max over the
+        # MEASURED joint (real_policy_ctrl.run_episode: q_send = q + clip(q_virtual - q, +-lead_max)).
+        if self.lead_clip:
+            q_now = self.qpos[:, :6]
+            q_send = q_now + (self.q_target - q_now).clamp(-DRIVE["lead_max"], DRIVE["lead_max"])
+        else:
+            q_send = self.q_target
+        self.q_hist = torch.cat([self.q_hist[:, 1:], q_send[:, None]], dim=1)
+        v_ref_lin = (q_send - self.q_hist[:, 2]) * CTRL_HZ              # rad/s over the decision (linear ref)
         k0, k1, vff = DRIVE["k0"], DRIVE["k1"], DRIVE["vff"]
         ar = torch.arange(self.nworld, device=self.device)
         sat = torch.zeros(self.nworld, device=self.device)
         for c in range(self.n_cmd):
-            s = (c + 1) / self.n_cmd
-            q_ref = self.q_target_prev + s * (self.q_target - self.q_target_prev)
+            if self.drive_ref == "spline":
+                q_ref, v_ref = self._spline_ref(c)
+            else:
+                s = (c + 1) / self.n_cmd
+                q_ref = self.q_hist[:, 2] + s * (q_send - self.q_hist[:, 2])
+                v_ref = v_ref_lin
             if self.drive_law == "waypoint":                             # robot_hal waypoint mode (probe)
-                v_cmd = -6.0 * (self.q_meas_lag - self.q_target)
+                v_cmd = -6.0 * (self.q_meas_lag - q_send)
             else:
                 v_cmd = vff * v_ref - k0 * (self.q_meas_lag - q_ref) - k1 * (self.qd_meas_lag - v_ref)
             v_sat = (v_cmd.abs() >= 0.98 * self.vmax_w).float()

@@ -40,19 +40,21 @@ from env_warp import PickEnv, TABLE_X, TABLE_Y, CTRL_HZ  # noqa: E402
 
 class PaperPickEnv(PickEnv):
     RKEYS_PAPER = ["reach", "lift", "track_c", "track_f", "reg_act", "reg_vel", "fail", "press", "seal",
-                   "speed"]
+                   "speed", "time"]
 
     def __init__(self, nworld=1024, device="cuda:0", seed=0, xml=None, dr=False, drive="real",
                  dq_max_deg=None, obs_lag=None, target_max=0.30, start="home",
                  ep_len=100, w_reach=1.0, w_lift=2.0, w_track_c=2.0, w_track_f=4.0,
                  sigma_reach=0.25, sigma_c=0.10, sigma_f=0.02, h_min=0.02,
                  lambda_max=0.02, goal_z=(0.05, 0.25), succ_tol=0.035, grasp_shaping=True,
-                 w_press=0.5, w_seal=2.0, obs_ee=True, reach_target="grasp", lift_dense=True, **kw):
+                 w_press=0.5, w_seal=2.0, obs_ee=True, reach_target="grasp", lift_dense=True,
+                 w_time=0.0, **kw):
         self.paper = dict(ep_len=int(ep_len), w_reach=w_reach, w_lift=w_lift, w_track_c=w_track_c,
                           w_track_f=w_track_f, sigma_reach=sigma_reach, sigma_c=sigma_c, sigma_f=sigma_f,
                           h_min=h_min, lambda_max=lambda_max, goal_z=tuple(goal_z), succ_tol=succ_tol,
                           start=start, grasp_shaping=bool(grasp_shaping), w_press=w_press, w_seal=w_seal,
-                          obs_ee=bool(obs_ee), reach_target=reach_target, lift_dense=bool(lift_dense))
+                          obs_ee=bool(obs_ee), reach_target=reach_target, lift_dense=bool(lift_dense),
+                          w_time=float(w_time))
         self.reg_lambda = 0.0                     # set by the trainer: lambda(t) curriculum
         self._paper_ready = False
         super().__init__(nworld=nworld, device=device, seed=seed, xml=xml, mode="pnp", dr=dr,
@@ -61,6 +63,10 @@ class PaperPickEnv(PickEnv):
         N = nworld
         self.goal = torch.zeros(N, 3, device=device)
         self.a_prev = torch.zeros(N, 7, device=device)
+        # speed bookkeeping: decision index of the first seal / of first arrival at the goal
+        # (ep_len when it never happens), so the trainer and the evaluators can log task TIME.
+        self.t_seal = torch.full((N,), float(self.paper["ep_len"]), device=device)
+        self.t_goal = torch.full((N,), float(self.paper["ep_len"]), device=device)
         self.ep_comp_p = torch.zeros(N, len(self.RKEYS_PAPER), device=device)
         self._paper_ready = True
         self.reset(torch.ones(N, dtype=torch.bool, device=device))
@@ -81,6 +87,7 @@ class PaperPickEnv(PickEnv):
             E.mjw.forward(self.m, self.d)
             self.q_target[idx] = self.qpos[idx, :6]
             self.q_target_prev[idx] = self.qpos[idx, :6]
+            self.q_hist[idx] = self.qpos[idx, None, :6]
             self.q_drive[idx] = self.qpos[idx, :6]
             self.v_drive[idx] = 0.0
             self.v_buf[idx] = 0.0
@@ -92,6 +99,8 @@ class PaperPickEnv(PickEnv):
         self.goal[idx, 2] = gz + float(self.half[2])   # goal for the object CENTRE
         self.a_prev[idx] = 0.0
         self.ep_comp_p[idx] = 0.0
+        self.t_seal[idx] = float(self.paper["ep_len"])
+        self.t_goal[idx] = float(self.paper["ep_len"])
 
     # ---------------- observation (paper eq. 1) ----------------
     def observe(self):
@@ -154,6 +163,16 @@ class PaperPickEnv(PickEnv):
         # the soft caps, so the learnt motion stays inside the Pro 630's 36 deg/s
         # following-error ceiling.  Off unless w_speed/w_acc are set (PickEnv helper).
         C["speed"] = self._speed_penalty()
+        # TIME penalty (not in the paper): a flat cost per decision until the object is lifted AND
+        # at the goal.  The reward is otherwise a rate (everything is /CTRL_HZ), so a policy that
+        # arrives 1 s earlier only gains the tracking rate it collects for that extra second --
+        # far too weak to trade against the risk of moving faster.  -w/CTRL_HZ per decision makes
+        # *finishing* pay, which is what the real robot's cycle time cares about.
+        at_goal = lifted & (d_goal < P["succ_tol"])
+        C["time"] = -P["w_time"] * (~at_goal).float() / CTRL_HZ
+        tnow = self.t_step.float()
+        self.t_seal = torch.where(latched_now & (self.t_seal >= P["ep_len"]), tnow, self.t_seal)
+        self.t_goal = torch.where(at_goal & (self.t_goal >= P["ep_len"]), tnow, self.t_goal)
         self.a_prev = a.clone()
         off = (op[:, 0] < TABLE_X[0] - 0.08) | (op[:, 0] > TABLE_X[1] + 0.08) | \
               (op[:, 1] < TABLE_Y[0] - 0.10) | (op[:, 1] > TABLE_Y[1] + 0.10)
@@ -173,6 +192,7 @@ class PaperPickEnv(PickEnv):
                     final_spd=torch.norm(self.qvel[:, self.vadr_obj:self.vadr_obj + 3], dim=-1),
                     target_h=self.goal[:, 2].clone(), max_tilt=self.max_tilt.clone(),
                     release_h=self.release_h.clone(), peak_qd=self.peak_qd.clone(),
+                    t_seal=self.t_seal.clone(), t_goal=self.t_goal.clone(),
                     peak_qdd=self.peak_qdd.clone(),
                     wmode=torch.zeros(N, dtype=torch.long, device=self.device))
         return r, done, info

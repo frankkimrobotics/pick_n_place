@@ -43,7 +43,10 @@ def main():
     ap.add_argument("--scene", default=os.path.join(HERE, "scenes", "box_med_ped.xml"))
     a = ap.parse_args()
     wp.init()
-    env = E.PickEnv(nworld=1, xml=a.scene, mode="attach", dr=False, drive=a.drive)
+    # the 2026-09-17 hardware calibration this probe compares against predates the B-spline
+    # reference and the policy controller's bounded lead: probe the bare drive chain.
+    env = E.PickEnv(nworld=1, xml=a.scene, mode="attach", dr=False, drive=a.drive,
+                    drive_ref="linear", lead_clip=False)
     env.auto_reset = False
     j = 0
     # ---------------- 10 deg waypoint step (robot_hal waypoint law) ----------------
