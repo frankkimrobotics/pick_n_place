@@ -28,7 +28,7 @@ while True:
     if math.hypot(g[0]-c[0], g[1]-c[1]) > 0.12 and not (g[1] > 0.18 and g[0] < 0.30): break
 print(g[0], g[1])")
 echo "chosen object $CX $CY top $TOP (of $NC candidates) -> half z $HZ; goal ($GX, $GY)"
-CUDA_VISIBLE_DEVICES=0 timeout 240 ~/miniconda3/envs/mjwarp/bin/python rl/real_policy_ctrl.py --policy rl/weights/resid1_real_best --obj $CX $CY $HZ --half 0.04 0.04 $HZ --goal $GX $GY 0.22 --steps 200 --dq_max 2.0 --track --track_bias $BX $BY --touch_calib --go_home --force --exec --log ~/pnp_rl/real_pick_$N.json 2>&1 | grep "^\[ctrl\] guarded\|^\[calib\]\|^\[ctrl\] step\|^\[ctrl\] episode\|^\[ctrl\] place\|^\[ctrl\] suction\|^\[guard\]\|^\[result\]\|^\[home\]\|^\[warn\]\|no feedback\|abort\|Traceback"
+CUDA_VISIBLE_DEVICES=0 timeout 240 ~/miniconda3/envs/mjwarp/bin/python rl/real_policy_ctrl.py --policy rl/weights/resid3_fast_best --obj $CX $CY $HZ --half 0.04 0.04 $HZ --goal $GX $GY 0.22 --steps 200 --dq_max 3.0 --track --track_bias $BX $BY --touch_calib --go_home --force --exec --log ~/pnp_rl/real_pick_$N.json 2>&1 | grep "^\[ctrl\] guarded\|^\[calib\]\|^\[ctrl\] step\|^\[ctrl\] episode\|^\[ctrl\] place\|^\[ctrl\] suction\|^\[guard\]\|^\[result\]\|^\[home\]\|^\[timeline\]\|^\[ctrl\] .*: [0-9.]* s\|^\[warn\]\|no feedback\|abort\|Traceback"
 python3 -c "
 import socket,json
 s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(10); s.sendto(json.dumps({'cmd':'verdict','goal':[$GX,$GY],'obj':[$CX,$CY],'top':max(0.02,$TOP)}).encode(),('127.0.0.1',9702)); r=json.loads(s.recv(65536))

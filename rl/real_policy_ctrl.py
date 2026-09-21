@@ -72,7 +72,7 @@ TAU_FIRM, TAU_HARD, W_J3 = 0.08, 0.13, 0.5   # contact_detector thresholds on th
 TAU_PRESS = 0.11                    # press force target for the seal (between firm 0.08 and hard 0.13)
 TAU_ABORT = 0.25                    # pick mode: >= TAU_HARD holds position (vacuum builds), only this aborts
 TAU_ABORT_ATTACHED = 0.40           # after the attach the arm lifts and carries: posture torque rises, only a real collision aborts
-ATTACH_AFTER = 0.5                  # s of contact with suction on before the object is assumed attached (vacuum build-up).
+ATTACH_AFTER = 1.0                  # s of contact with suction on before the object is assumed attached (vacuum build-up).
                                     # 1.0 s in series 2; halved 2026-09-20 (speed-up pass) -- the press primitive now
                                     # reaches TAU_PRESS before the dwell starts, so the dwell is pure vacuum time.
 SCRIPT_VMAX_DEG = 25.0              # default peak joint speed of the scripted (non-policy) legs, --script_vmax.
@@ -763,7 +763,11 @@ def run_episode(link, policy, ob, guard, p_obj, p_goal, n_steps, dq_max, log, ob
                 press_xy[0] = gp_now[:2].copy(); press_z[0] = float(tcp_now[2])
             if tau < TAU_PRESS and press_z[0] > press_floor[0]:
                 press_z[0] -= 0.002
-                qp, ep = ik_fn(ob.m, ik_data, "tcp", [float(press_xy[0][0]), float(press_xy[0][1]), press_z[0]], R_DOWN, q)
+                # lateral re-centring is rate-limited to 3 mm per decision (s4_02 Pi log: a 1-2 cm jump in one
+                # decision kicked j4 to 50 deg/s at contact)
+                lat_t = press_xy[0] - tcp_now[:2]; lat_n = float(np.hypot(*lat_t))
+                xy_cmd = tcp_now[:2] + (lat_t if lat_n <= 0.003 else lat_t * (0.003 / lat_n))
+                qp, ep = ik_fn(ob.m, ik_data, "tcp", [float(xy_cmd[0]), float(xy_cmd[1]), press_z[0]], R_DOWN, q)
                 q_send = np.array(qp) if (ep < 0.005 and not guard.check_q(np.array(qp))) else q
                 press_reached[0] = False
             else:

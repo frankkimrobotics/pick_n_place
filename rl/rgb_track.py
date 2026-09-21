@@ -71,6 +71,7 @@ def main():
     ap.add_argument("--min_px", type=int, default=300)
     ap.add_argument("--zmax", type=float, default=0.15, help="reject blobs whose depth height exceeds this (arm)")
     ap.add_argument("--zmin_obj", type=float, default=0.010, help="depth points below this height are table/shadow and are excluded from the object clusters")
+    ap.add_argument("--affine", default=os.path.expanduser("~/pnp_rl/tracker_affine.json"), help="optional xy correction fitted against the wrist camera (rl/wrist_centre.py): [x y 1] @ A -> corrected xy; applied to every candidate")
     ap.add_argument("--debug", default=None, help="write an annotated image here (every 20th frame, or once)")
     ap.add_argument("--once", action="store_true")
     a = ap.parse_args()
@@ -101,6 +102,10 @@ def main():
     roi = np.zeros((480, 640), np.uint8); cv2.fillConvexPoly(roi, hull, 255)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    A_aff = None
+    if a.affine and os.path.exists(a.affine):
+        A_aff = np.array(json.load(open(a.affine))["A"], float)          # (3, 2): [x, y, 1] @ A = corrected [x, y]
+        print(f"[rgb_track] xy affine correction from {a.affine}: A = {np.round(A_aff, 4).tolist()}", flush=True)
     for _ in range(10):
         pipe.wait_for_frames()
     n, t_last = 0, time.time()
@@ -187,6 +192,9 @@ def main():
             if cand["src"] == "depth" and cand["top"] < a.min_top:
                 continue
             cands.append((area, cand, i))
+        if A_aff is not None:
+            for _, c, _ in cands:
+                c["cx"], c["cy"] = (float(v) for v in np.array([c["cx"], c["cy"], 1.0]) @ A_aff)
         if cands:
             cands.sort(key=lambda c: -c[0])
             det = cands[0][1]

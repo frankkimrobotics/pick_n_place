@@ -186,3 +186,62 @@ live D435 tracker (`rl/rgb_track.py --mode diff`, UDP :9701), subtracts the meas
 picks a goal and calls `real_policy_ctrl.py --track --touch_calib --go_home --exec`. Pipeline
 overview, curriculum and the robot results are in the top-level
 [`README.md`](../README.md#training-procedure-rl-2026-09).
+
+## ZED tracker (USB 3 ZED 2 / 2i / Mini) — drop-in for the D435 tracker
+
+`rl/zed_track.py` replaces `rl/rgb_track.py --mode depth`. It publishes the **same** UDP message on the
+**same** port (`127.0.0.1:9701`, `{"t","cx","cy","top","n","src","cands":[…x8]}`, base-frame metres,
+largest cluster first), so `real_policy_ctrl.py --track`, `run_pick.sh`, `run_pick_rand.sh` and
+`success_monitor.py` need no change. Only **one** tracker may run at a time — start `zed_track.py`
+*instead of* `rgb_track.py`. As before the tracker publishes **raw** coordinates; the consumers subtract
+`~/pnp_rl/tracker_bias.json`.
+
+**1. Host prerequisites** (both are needed, the SDK reports only `CAMERA NOT DETECTED` otherwise)
+
+    lsusb -t | grep 2b03          # must say 5000M — the ZED will NOT work on a 480M (USB 2.0) port
+    sudo modprobe uvcvideo        # /etc/modprobe.d/blacklist-uvcvideo.conf blacklists it for librealsense
+    ls /dev/video*                # the ZED SDK is V4L2-only; these nodes must exist
+
+`uvcvideo` is blacklisted on this box so that librealsense's RSUSB (usbfs) backend owns the RealSense
+cameras. Loading it by hand does not disturb RealSense devices that are already open; if a freshly
+replugged RealSense misbehaves afterwards, `sudo rmmod uvcvideo` after unplugging the ZED.
+
+**2. Python API** — `pyzed` 4.2 is already installed for the system `python3` (matching SDK 4.2.5 at
+`/usr/local/zed`). To reinstall: `python3 /usr/local/zed/get_python_api.py`.
+
+**3. Calibrate** — put the ChArUco board (5x7 squares, 35 mm square / 26 mm marker, `DICT_4X4_50`) flat
+and face up on the table, geometric centre at base **(0.4, 0, 0)**, axes aligned to the base axes
+(X = 5-square direction, Y = 7-square direction), fully in the ZED's view:
+
+    python3 rl/calib_zed_board.py                 # -> outputs/extrinsics_zed.json + outputs/overlay_zed.png
+
+Same method as `calib_fixed_static.py`: ChArUco → solvePnP with the ZED's **rectified left** intrinsics
+→ `T_base_camzed = T_base_board @ inv(T_cam_board)`. `T_base_board` is reused from
+`outputs/extrinsics_d435.json` (yaw 180, zflip) so the ZED lands in exactly the same base frame as the
+RealSense cameras; `--search` re-derives it from geometry, `--yaw/--zflip` force it. The script prints the
+reprojection error (expect < 1 px), the camera position in the base frame and a sanity verdict (above the
+table, a few tens of cm away, looking down). Check `outputs/overlay_zed.png`: the red/green/blue axes
+drawn at (0.4, 0, 0) must be base X/Y/Z.
+
+Stopgap without the board: `python3 rl/calib_zed_board.py --provisional` fits the table plane
+(RANSAC) to get the camera height and tilt exactly, and **guesses** yaw and xy (optical axis assumed to
+point along base -X; the objects' centroid pinned to `--centre`, default (0.39, 0)). It writes
+`"provisional": true` and `zed_track.py` warns while it is loaded — the xy/yaw are not trustworthy.
+
+**4. Run**
+
+    python3 rl/zed_track.py                                  # HD720 / NEURAL / 30 fps, publishes on :9701
+    python3 rl/zed_track.py --once --debug /tmp/zed.png      # single frame + annotated image
+    python3 rl/zed_track.py --resolution HD1080 --depth NEURAL_PLUS --fps 15
+
+Frames: the ZED is opened with `COORDINATE_SYSTEM.IMAGE` + `UNIT.METER`, i.e. the optical convention
+(+X right, +Y down, +Z forward) that the RealSense extrinsics files already use, and `sl.MEASURE.XYZ`
+gives metric points in the **left rectified** camera frame, already registered to the left image — so
+there is no colour/depth alignment step (unlike rgb_track, which composes the RealSense colour←depth
+extrinsics). Detection is identical to rgb_track's depth mode: work-area ROI (x 0.18–0.60, y ±0.32)
+projected into the image, table height = median over the ROI, points 1 cm above it, 2 cm-grid xy
+clusters of ≥ 150 points, top = 90th percentile, centre = mean xy within 1.5 cm of the top, clusters
+above 0.15 m or outside the work area rejected.
+
+**5. Switch the run scripts** — nothing to edit. Stop `rgb_track.py`, start `zed_track.py`, then use
+`rl/run_pick.sh` / `rl/run_pick_rand.sh` exactly as before.
