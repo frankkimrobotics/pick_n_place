@@ -454,6 +454,8 @@ class DiverseEnv(PaperPickEnv):
         self.top_h[idx] = 2 * hzt
         self.shape_w[idx] = t(shape, torch.long)
         self.mass_w[idx] = t(mass)
+        self.obj_mass_w[idx] = t(mass)          # PickEnv._c_suction: stable explicit damper
+        self.obj_inertia_w[idx] = t(np.mean(Idiag, axis=-1))   # PickEnv righting-torque cap
         self.fric_w[idx] = t(fric)
         self.rgba_w[idx] = t(rgba)
 

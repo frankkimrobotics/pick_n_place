@@ -472,9 +472,24 @@ def diag(env, ok, es):
     if not hasattr(env, "obst_hit_ep"):
         return ""
     f = lambda t: 100 * float(t.float().mean())                     # noqa: E731
+    inf = getattr(env, "_last_info", None)
+    short = es & ~ok & ~env.obst_hit_ep & ~env.wall_hit_ep
+    tail = ""
+    if inf is not None and "final_d" in inf and bool(short.any()):
+        d = inf["final_d"][short]
+        lift = inf["max_lift"][short]
+        still = env.sealed[short].float().mean()
+        tg = env.t_goal[short]
+        tail = (f" short: |obj-goal| med {float(d.median()) * 100:.1f} cm p90 "
+                f"{float(torch.quantile(d, 0.9)) * 100:.1f} cm, max_lift med "
+                f"{float(lift.median()) * 100:.1f} cm, still sealed {100 * float(still):.0f} %, "
+                f"reached goal once {100 * float((tg < env.paper['ep_len']).float().mean()):.0f} %")
+    tgo = env.t_goal
+    reached = tgo < env.paper["ep_len"]
     return (f"  [obst_hit {f(env.obst_hit_ep):.0f} % wall_hit {f(env.wall_hit_ep):.0f} % "
             f"no-seal {100 - f(es):.0f} % sealed-but-short {f(es & ~ok):.0f} % | "
-            f"t_seal {float(env.t_seal.mean()) / 10:.1f} s t_goal {float(env.t_goal.mean()) / 10:.1f} s]")
+            f"t_seal {float(env.t_seal.mean()) / 10:.1f} s t_goal(reached {100 * float(reached.float().mean()):.0f} %) "
+            f"{float(tgo[reached].mean()) / 10 if bool(reached.any()) else float('nan'):.1f} s]{tail}")
 
 
 def rollout(env, teacher, policy, noise, EP, beta):
@@ -497,6 +512,7 @@ def rollout(env, teacher, policy, noise, EP, beta):
         O.append(obs.clone()); A.append(a_exp.clone())
         _, r, done, info = env.step(a.clamp(-1, 1))
     ok = info["placed"]
+    env._last_info = info
     return torch.stack(O, 1), torch.stack(A, 1), ok, env.ever_sealed.clone()
 
 
@@ -628,17 +644,6 @@ def main():
                    {"name": "wall_back", "dims": [0.02, 1.2, 1.0], "pose": [-0.30, 0.0, 0.5, 1, 0, 0, 0]},
                    {"name": "wall_ym", "dims": [1.1, 0.02, 1.0], "pose": [0.25, -0.50, 0.5, 1, 0, 0, 0]},
                    {"name": "wall_yp", "dims": [1.1, 0.02, 1.0], "pose": [0.25, 0.50, 0.5, 1, 0, 0, 0]}]
-        if not cam_mount:
-            # The server keeps a 0.30 x 0.30 x 1.0 `camera_mount_d435` cuboid at (0.64, -0.05)
-            # in its BASE world, i.e. it blocks x >= 0.49, -0.20 <= y <= 0.10 up to z = 0.9.
-            # The v3 spawn box reaches x = 0.56, so that keep-out swallows a slice of the
-            # workspace the MuJoCo twin has no collision geom for -- measured cost: approach
-            # plans 17/24 -> 23/24 and carry plans 15/24 -> 23/24 once it is removed.
-            # set_world overrides a base cuboid BY NAME, so park it instead of shrinking it.
-            # SIM-TO-REAL: the real cell does have that mount.  Any deployment of a policy
-            # trained this way must either restore the cuboid or keep the object off x > 0.49.
-            self.base_cub.append({"name": "camera_mount_d435", "dims": [0.02, 0.02, 0.02],
-                                  "pose": [3.0, 3.0, 3.0, 1, 0, 0, 0]})
         else:
             cub = [{"name": "sim_table", "dims": [0.56, 0.9, 0.02], "pose": [0.42, 0.0, 0.0, 1, 0, 0, 0]}]
         print(rpc({"type": "set_world", "cuboids": cub}), flush=True)

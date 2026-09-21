@@ -25,6 +25,18 @@ sys.path.insert(0, HERE)
 from ppo import AC, FusedResidual, build_frozen_policy, describe_policy  # noqa: E402
 
 
+PAPER40 = "q[6] qd[6] p_obj[3] p_goal[3] a_prev[7] tcp[3] cup_axis[3] grasp_rel[3] (q_target-q)[6]"
+OBS_LAYOUT = {
+    34: "q[6] qd[6] p_obj[3] p_goal[3] a_prev[7] tcp[3] cup_axis[3] grasp_rel[3]",
+    40: PAPER40,
+    # env_v2.DiverseEnv: + object descriptor
+    47: PAPER40 + " obj_half[3] obj_shape_onehot[3] obj_mass[1]",
+    # env_v3.ObstacleEnv: + nearest distractor relative to the tcp
+    54: PAPER40 + " obj_half[3] obj_shape_onehot[3] obj_mass[1] "
+                  "dist_rel_tcp[3] dist_half[3] n_dist_over_3[1]",
+}
+
+
 class DetPolicy(torch.nn.Module):
     def __init__(self, ac):
         super().__init__()
@@ -148,8 +160,7 @@ def main():
                 base_scale=(base_scale if base_path else None),
                 dq_max_deg=ck.get("dq_max_deg"),
                 fp16=a.fp16, max_abs_err_trt=float(np.abs(trt_out - ref).max()), trt_us=1e6 * dt,
-                obs_layout="q[6] qd[6] p_obj[3] p_goal[3] a_prev[7] tcp[3] cup_axis[3] grasp_rel[3] (q_target-q)[6]" if a.obs_dim == 40
-                else "q[6] qd[6] p_obj[3] p_goal[3] a_prev[7] tcp[3] cup_axis[3] grasp_rel[3]")
+                obs_layout=OBS_LAYOUT.get(a.obs_dim, OBS_LAYOUT[34]))
     json.dump(meta, open(stem + ".json", "w"), indent=1)
     print("[meta]", json.dumps(meta))
 

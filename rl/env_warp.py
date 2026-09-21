@@ -178,6 +178,7 @@ class PickEnv:
         self.jadr_obj = M.jnt_qposadr[M.body_jntadr[self.bid_obj]]
         self.vadr_obj = M.jnt_dofadr[M.body_jntadr[self.bid_obj]]
         self.obj_mass = float(M.body_mass[self.bid_obj])
+        self._dt_phys = float(M.opt.timestep)
         import config as C
         self.q_home = np.asarray(C.START_Q, float)
         # canonical hover for attach mode (CPU IK once)
@@ -288,6 +289,10 @@ class PickEnv:
         self.ever_sealed = torch.zeros(N, dtype=torch.bool, device=device)
         self.q_target = torch.zeros(N, 6, device=device)
         self.prev_obj_vel = torch.zeros(N, 3, device=device)
+        # per-world payload mass (env_v2/v3 resample it per episode; see _c_suction)
+        self.obj_mass_w = torch.full((N,), self.obj_mass, device=device)
+        self.obj_inertia_w = torch.full((N,), float(np.mean(self.mjm.body_inertia[self.bid_obj])),
+                                        device=device)
         self.anchor = torch.zeros(N, 3, device=device)
         self.anchor_R = torch.eye(3, device=device).expand(N, 3, 3).clone()
         self.sat_count = torch.zeros(N, dtype=torch.long, device=device)
@@ -547,6 +552,17 @@ class PickEnv:
     K_SUCTION = 1500.0        # N/m  (~1.3 mm sag under a 2 N payload)
     C_SUCTION = 30.0          # N s/m
     BREAK_STEPS = 20          # substeps of saturation before break
+    # EXPLICIT-DAMPER STABILITY (found 2026-09-21 on env_v3, but it is an env_warp defect).
+    # xfrc_applied is integrated EXPLICITLY (opt.integrator = Euler, dt = 2 ms), so the
+    # velocity term -C*v of the suction spring-damper is stable only while C*dt/m < 2.  The
+    # paper scene's object is 0.05 kg -> C*dt/m = 1.2, comfortably inside; env_v2's mass
+    # range starts at 0.03 kg -> 2.0, exactly ON the boundary.  Measured on a v3 teacher
+    # batch (128 worlds, 120 decisions): seal breaks per world 0.69 at 30-60 g, 0.31 at
+    # 60-100 g, 0.05 at 100-150 g, every one of them by FORCE saturation with the object
+    # travelling at 1.0-2.7 m/s while the arm moved at 0.1 m/s -- a ringing damper, not a
+    # physical peel.  Capping C at DAMP_DT_RATIO*m/dt leaves every object of 0.05 kg or
+    # more BIT-IDENTICAL (1.2*0.05/0.002 = 30 = C_SUCTION) and only tames the light ones.
+    DAMP_DT_RATIO = 1.2
 
     def _try_latch(self, want):
         tcp, R = self._tcp()
@@ -602,6 +618,26 @@ class PickEnv:
 
     K_ROT = 20.0              # N*m/rad orientation stiffness (cap still TAU_CUP)
     C_ROT = 0.05              # N*m*s/rad
+    # SEALED-OBJECT SPIN CAP (found 2026-09-21, env_v3 teacher diagnosis).  The righting
+    # spring saturates at TAU_CUP = 0.4 N*m after 1.1 deg of error, and that torque on a
+    # small diverse object (I ~ 2e-5 kg m^2) is 15 000 rad/s^2 -- 30 rad/s of angular
+    # velocity INJECTED PER 2 ms SUBSTEP.  With the 0.55 per-substep angular damping the
+    # steady state is ~40 rad/s, and because env_v2 moved the object's body origin to its
+    # BOTTOM FACE (hz below the centroid) that spin shows up in qvel[0:3] as a 1-3 m/s
+    # "linear" velocity; the linear damper -C*v then saturates F_MAX and BREAKS THE SEAL
+    # 20 substeps later.  Measured: 36 breaks / 128 worlds in 12 s of teacher rollout, all
+    # by force saturation, |omega| 35-230 rad/s, object speed 1.0-3.1 m/s while the arm
+    # moved at 0.1 m/s.  A suction cup cannot spin a payload at 2 000 deg/s, so clamp it.
+    W_SEAL_MAX = 6.0          # rad/s (~340 deg/s) ceiling on a SEALED object's spin
+    # ... and the injection itself: the righting torque may not add more than W_INJ_MAX of
+    # angular velocity in ONE substep, i.e. Ts <= I * W_INJ_MAX / dt.  For the diverse
+    # objects that cap is still 5-7x the gravity peel torque they have to hold, so the cup
+    # keeps its authority; it only stops a saturated spring from ringing the body.
+    W_INJ_MAX = 3.0           # rad/s per substep
+    # PNP_LEGACY_SUCTION=1 restores the pre-2026-09-21 suction numerics exactly (no damper
+    # cap, no spin ceiling, no inertia-scaled righting torque) for A/B and for reproducing
+    # results recorded before the fix.
+    LEGACY = bool(int(os.environ.get("PNP_LEGACY_SUCTION", "0")))
 
     def _apply_suction_force(self):
         """Called each physics substep: spring-damper pulling the object's
@@ -613,7 +649,7 @@ class PickEnv:
         target = tcp + torch.einsum("nij,nj->ni", R, self.anchor)
         op = self._obj_pos()
         ov = self.qvel[:, self.vadr_obj:self.vadr_obj + 3]
-        F = self.K_SUCTION * (target - op) - self.C_SUCTION * ov
+        F = self.K_SUCTION * (target - op) - self._c_suction()[:, None] * ov
         Fmag = torch.norm(F, dim=-1, keepdim=True)
         scale = (F_MAX / Fmag.clamp(min=1e-6)).clamp(max=1.0)
         F = F * scale
@@ -644,13 +680,20 @@ class PickEnv:
         def _cap(v, lim):
             mag = torch.norm(v, dim=-1, keepdim=True)
             return v * (lim / mag.clamp(min=1e-6)).clamp(max=1.0)
-        Ts = _cap(self.K_ROT * e_perp, TAU_CUP) + \
-            _cap(self.K_ROT * e_par, TAU_TORSION)
+
+        f = torch.ones(self.nworld, 1, device=self.device) if self.LEGACY else \
+            torch.clamp(self.obj_inertia_w * self.W_INJ_MAX / (self._dt_phys * TAU_CUP),
+                        max=1.0)[:, None]
+        Ts = _cap(self.K_ROT * e_perp, TAU_CUP * f) + \
+            _cap(self.K_ROT * e_par, TAU_TORSION * f)
         self.xfrc[:, self.bid_obj, 3:] = Ts * m
         va = self.vadr_obj
+        w_b = self.qvel[:, va + 3:va + 6] * 0.55
+        if not self.LEGACY:
+            wn = w_b.norm(dim=-1, keepdim=True)
+            w_b = w_b * (self.W_SEAL_MAX / wn.clamp(min=1e-9)).clamp(max=1.0)
         self.qvel[:, va + 3:va + 6] = torch.where(
-            self.sealed[:, None], self.qvel[:, va + 3:va + 6] * 0.55,
-            self.qvel[:, va + 3:va + 6])
+            self.sealed[:, None], w_b, self.qvel[:, va + 3:va + 6])
         # peel = object actually hanging far off the cup axis (the capped
         # righting spring can no longer recover it), NOT mere cap saturation
         cosang = (objz * cupz).sum(-1)
@@ -659,6 +702,13 @@ class PickEnv:
                              | sat_t)
         self.sat_count = torch.where(sat, self.sat_count + 1,
                                      torch.zeros_like(self.sat_count))
+
+    def _c_suction(self):
+        """(N,) suction damping coefficient, capped for stability (see DAMP_DT_RATIO)."""
+        if self.LEGACY:
+            return torch.full_like(self.obj_mass_w, self.C_SUCTION)
+        return torch.clamp(self.DAMP_DT_RATIO * self.obj_mass_w / self._dt_phys,
+                           max=self.C_SUCTION)
 
     def _check_break(self):
         broke = self.sealed & (self.sat_count >= self.BREAK_STEPS)
