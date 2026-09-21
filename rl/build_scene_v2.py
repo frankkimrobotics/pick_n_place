@@ -46,6 +46,7 @@ SCENES = os.path.join(HERE, "scenes")
 CUROBO_PY = "/home/lisc-frank/miniconda3/envs/curobo2/bin/python"
 
 OUT_XML = os.path.join(SCENES, "diverse_v2.xml")
+OUT_XML_V3 = os.path.join(SCENES, "obstacle_v3.xml")
 TEMPLATE = os.path.join(SCENES, "box_med.xml")
 
 # ---- scene geometry (robot base frame, table top at z = 0) -------------------
@@ -75,6 +76,27 @@ STUB = 0.001                     # stub half-size for the box / cylinder geoms
 # collision masks
 MASK_PROXY_TYPE, MASK_PROXY_AFF = 4, 0
 MASK_WALL_TYPE, MASK_WALL_AFF = 0, 5
+# DISTRACTORS (v3).  contype 1 / conaffinity 5 makes them collide with
+#   the table plane, the target object and the cup tip   (1 & 1)
+#   the arm collision proxies (contype 4, conaffinity 0)  (4 & 5)
+#   the walls (contype 0, conaffinity 5)                  (1 & 5)
+# and with each other -- i.e. with everything that matters and nothing that does not.
+MASK_DIST_TYPE, MASK_DIST_AFF = 1, 5
+N_DIST = 3                       # bodies present in the v3 scene (1-3 active per world)
+DIST_PARK = (2.0, 2.0)           # xy where an inactive distractor is parked (outside the walls)
+DIST_BOX_HW = (0.020, 0.050)     # half width of a normal distractor
+DIST_BOX_HH = (0.015, 0.060)     # half height of a normal distractor
+POST_HW = (0.018, 0.035)         # half width / radius of a TALL POST
+POST_HH = (0.050, 0.125)         # half height of a tall post (0.10 - 0.25 m tall)
+DIST_MASS = (0.15, 0.60)
+
+
+def dist_geom_names(k):
+    return (f"d{k}_box", f"d{k}_cyl")
+
+
+def dist_body_name(k):
+    return f"dist{k}"
 
 # massless capsule proxies: body name -> (fromto, radius)
 ARM_PROXIES = {
@@ -123,7 +145,7 @@ def _ensure_template(path):
     return path
 
 
-def build(out_path=OUT_XML, template=TEMPLATE):
+def build(out_path=OUT_XML, template=TEMPLATE, n_dist=0):
     template = _ensure_template(template)
     tree = ET.parse(template)
     root = tree.getroot()
@@ -201,6 +223,27 @@ def build(out_path=OUT_XML, template=TEMPLATE):
     ET.SubElement(obj, "geom", {"name": "g_hex", "type": "mesh", "mesh": "hex_stub",
                                 "pos": _f([0, 0, hz0]), "material": "o0", "mass": "0"})
 
+    # ---- distractor bodies (v3): free, 2 geoms (box | upright cylinder) -------
+    # Same trick as the target object: ONE body per distractor carrying both primitive
+    # geoms; the inactive one is shrunk to a 1 mm stub parked at the active geom's
+    # centroid (geom_TYPE is not batchable in mujoco_warp).  The body origin is the
+    # BOTTOM CENTRE, so body_pos.z is the distractor's lift for any size, which is what
+    # the "displaced > 1 cm" test and the obstacle cuboids sent to cuRobo both want.
+    for k in range(n_dist):
+        nb, (gb, gc) = dist_body_name(k), dist_geom_names(k)
+        hz0 = 0.03
+        b = ET.SubElement(wb, "body", {"name": nb,
+                                       "pos": _f([DIST_PARK[0] + 0.15 * k, DIST_PARK[1], 0.0]),
+                                       "quat": "1 0 0 0"})
+        ET.SubElement(b, "freejoint", {"name": f"{nb}_free"})
+        ET.SubElement(b, "inertial", {"pos": _f([0, 0, hz0]), "mass": "0.3",
+                                      "diaginertia": _f([1e-4, 1e-4, 1e-4])})
+        for nm, typ, size in ((gb, "box", [0.03, 0.03, hz0]), (gc, "cylinder", [STUB, STUB])):
+            ET.SubElement(b, "geom", {
+                "name": nm, "type": typ, "size": _f(size), "pos": _f([0, 0, hz0]),
+                "rgba": "0.35 0.35 0.40 1", "mass": "0",
+                "contype": str(MASK_DIST_TYPE), "conaffinity": str(MASK_DIST_AFF)})
+
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     ET.indent(tree, space="  ")
     tree.write(out_path, encoding="unicode")
@@ -209,10 +252,12 @@ def build(out_path=OUT_XML, template=TEMPLATE):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default=OUT_XML)
+    ap.add_argument("--out", default=None)
     ap.add_argument("--template", default=TEMPLATE)
+    ap.add_argument("--n_dist", type=int, default=0, help="distractor bodies (v3 scene: 3)")
     a = ap.parse_args()
-    p = build(a.out, a.template)
+    out = a.out or (OUT_XML_V3 if a.n_dist else OUT_XML)
+    p = build(out, a.template, n_dist=a.n_dist)
     try:
         import mujoco
         m = mujoco.MjModel.from_xml_path(p)

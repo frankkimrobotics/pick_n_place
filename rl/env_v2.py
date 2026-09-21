@@ -119,7 +119,7 @@ class DiverseEnv(PaperPickEnv):
         # mujoco_warp's default njmax 64 / nconmax 48 ("nefc overflow ... increase njmax
         # to 112" in dagger_v2); dropped constraints let a carried object tunnel into a
         # wall and blow the world up.  ~2 MB extra at nworld 256.
-        self.data_kw = dict(njmax=256, nconmax=160)
+        self.data_kw = dict(njmax=int(kw.pop("njmax", 256)), nconmax=int(kw.pop("nconmax", 160)))
         # half_extents (0,0,0) => the parent's `float(self.half[2])` terms measure the lift
         # of the body origin, which we pin to the object's bottom face.
         kw.pop("half_extents", None)
@@ -292,15 +292,19 @@ class DiverseEnv(PaperPickEnv):
               f"top-down cup over the 4-12 cm grasp band -> {100 * self.spawn_frac:.0f} % usable "
               f"(fallback cells {len(self.fallback_xy)})", flush=True)
 
-    def _static_ok(self, x, y, rad):
-        """Table / base / bin clearance for an object of circumradius `rad` at (x, y)."""
+    def _static_ok(self, x, y, rad, in_box=True):
+        """Table / base / bin clearance for an object of circumradius `rad` at (x, y).
+        `in_box=False` drops the spawn-box test (env_v3 places distractors anywhere on
+        the table, not only inside the TARGET spawn box)."""
         on_table = ((x - rad >= B.TABLE_X2[0] + TABLE_MARGIN) & (x + rad <= B.TABLE_X2[1] - TABLE_MARGIN)
                     & (np.abs(y) + rad <= B.TABLE_Y2[1] - TABLE_MARGIN))
         base_ok = np.hypot(x, y) >= BASE_R + BASE_CLEAR + rad
         b = BIN_HALF + BIN_CLEAR
         bin_ok = ~((np.abs(x - BIN_XY[0]) < b + rad) & (np.abs(y - BIN_XY[1]) < b + rad))
-        in_box = (x >= self.spawn[0]) & (x <= self.spawn[1]) & (y >= self.spawn[2]) & (y <= self.spawn[3])
-        return on_table & base_ok & bin_ok & in_box
+        if not in_box:
+            return on_table & base_ok & bin_ok
+        box = (x >= self.spawn[0]) & (x <= self.spawn[1]) & (y >= self.spawn[2]) & (y <= self.spawn[3])
+        return on_table & base_ok & bin_ok & box
 
     def _sample_spawn(self, rad, z_lo, z_hi, n, tries=48):
         """Rejection-sample (n, 2) object centres that are on the table, clear of the base and

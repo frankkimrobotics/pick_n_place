@@ -194,7 +194,12 @@ def main():
     ap.add_argument("--transport_w", type=float, default=None, help="weight of the carry-toward-target potential (default W['transport']=6)")
     ap.add_argument("--descend_sigma", type=float, default=0.07, help="xy gate width (m) of the descend-to-surface potential; 0.15 keeps it alive when the object drifts off target")
     # ---- paper setup (Arafat et al., QPAIN 2026): env + PPO details ----
-    ap.add_argument("--env", default="pick", choices=["pick", "paper"], help="paper = env_paper.PaperPickEnv (reach/lift/track staged dense reward, no release)")
+    ap.add_argument("--env", default="pick", choices=["pick", "paper", "v2", "v3"],
+                    help="paper = env_paper.PaperPickEnv (reach/lift/track staged dense reward, no release); "
+                         "v2 = env_v2.DiverseEnv; v3 = env_v3.ObstacleEnv (distractors + enlarged workspace)")
+    ap.add_argument("--obstacles", type=int, default=1, help="--env v3: distractors on/off")
+    ap.add_argument("--variants", default="box,cyl,hex", help="--env v2/v3: object shape classes")
+    ap.add_argument("--spawn", default=None, help="--env v2/v3: object spawn box 'x0,x1,y0,y1'")
     ap.add_argument("--arch", default="default", choices=["default", "paper"], help="paper = [256,128,64] ELU actor/critic")
     ap.add_argument("--kl_target", type=float, default=None, help="adaptive LR on KL (paper 0.01): lr/1.5 if kl>2*target, lr*1.5 if kl<target/2")
     ap.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -246,9 +251,23 @@ def main():
     torch.manual_seed(0)
     wp.init()
     from env_warp import PickEnv
-    if a.env == "paper":
+    if a.env in ("paper", "v2", "v3"):
         from env_paper import PaperPickEnv
-        env = PaperPickEnv(nworld=a.nworld, device=dev, xml=a.scene, dr=a.dr, drive=a.drive, dq_max_deg=a.dq_max,
+        mk = PaperPickEnv
+        extra = {}
+        if a.env in ("v2", "v3"):
+            extra["variants"] = a.variants
+            if a.spawn:
+                extra["spawn"] = a.spawn
+            if a.env == "v2":
+                from env_v2 import DiverseEnv as mk
+            else:
+                from env_v3 import ObstacleEnv as mk
+                extra["obstacles"] = bool(a.obstacles)
+            if a.scene is None or a.scene.endswith("box_med.xml"):
+                a.scene = None                      # the v2/v3 classes pick their own scene
+        env = mk(nworld=a.nworld, device=dev, xml=a.scene, dr=a.dr, drive=a.drive, dq_max_deg=a.dq_max,
+                           **extra,
                            obs_lag=(None if a.obs_lag < 0 else bool(a.obs_lag)), target_max=a.target_max,
                            start=a.start, ep_len=a.ep_len, grasp_shaping=bool(a.grasp_shaping), obs_ee=bool(a.obs_ee), reach_target=a.reach_target, lift_dense=bool(a.lift_dense),
                            w_track_c=a.w_track_c, w_track_f=a.w_track_f, w_reach=a.w_reach, w_time=a.w_time,
@@ -368,6 +387,9 @@ def main():
                     ep["n_p"] = ep.get("n_p", 0) + int(pm.sum())
                     ep["placed_p"] = ep.get("placed_p", 0) + int(info["placed"][di][pm].sum())
                     ep["sealed"] += int(info["ever_sealed"][di].sum())
+                    for fk in ("obst_hit", "wall_hit"):
+                        if fk in info:
+                            ep[fk] = ep.get(fk, 0) + int(info[fk][di].sum())
                     ep["comp"] += info["ep_comp"][di].sum(0).cpu().numpy()
                     for tk in ("t_seal", "t_goal"):     # decisions to the first seal / to the goal
                         if tk in info:
@@ -389,7 +411,7 @@ def main():
         if a.drive_ramp > 0 and a.drive == "real":
             env.drive_scale = min(1.0, step / max(1.0, a.drive_ramp * a.steps))
             env.apply_drive_scale()
-        if a.env == "paper":          # lambda(t): regularisation curriculum (paper sec. III-C-2)
+        if a.env in ("paper", "v2", "v3"):   # lambda(t): regularisation curriculum (paper sec. III-C-2)
             env.reg_lambda = env.paper["lambda_max"] * min(1.0, step / max(1.0, a.reg_ramp * a.steps))
 
         fo = obs_b.reshape(-1, ac.obs_dim)
@@ -471,6 +493,7 @@ def main():
                        lr=opt.param_groups[0]["lr"], reg_lambda=getattr(env, "reg_lambda", None),
                        peak_qd=ep["peak_qd"] / n_ep, peak_qd_max=ep["peak_qd_max"],
                        t_seal=ep["t_seal"] / n_ep, t_goal=ep["t_goal"] / n_ep, n_ep=int(ep["n"]),
+                       obst_hit=ep.get("obst_hit", 0) / n_ep, wall_hit=ep.get("wall_hit", 0) / n_ep,
                        drive_scale=getattr(env, "drive_scale", None))
             log.write(json.dumps(rec) + "\n"); log.flush()
             print(f"[ppo] {step:>10,} | succ {rec['success']:.2%} pnp {rec['succ_pnp']:.2%} "
@@ -478,6 +501,7 @@ def main():
                   + (f"res {rec['res_mag']:.4f} " if base is not None else "")
                   + f"qd {rec['peak_qd']:.0f}/{rec['peak_qd_max']:.0f} "
                   + f"t_seal {rec['t_seal']:.1f} t_goal {rec['t_goal']:.1f} "
+                  + (f"obst {rec['obst_hit']:.1%} wall {rec['wall_hit']:.1%} " if rec['obst_hit'] or rec['wall_hit'] else "")
                   + f"sps {rec['sps']:,.0f}", flush=True)
             ep = new_ep()
             if rec["success"] > best_succ:          # keep the peak (runs decay after it)
