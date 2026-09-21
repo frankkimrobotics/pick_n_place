@@ -841,7 +841,7 @@ raising the weight.
     residual recipe: **match the exploration std to the base's robustness, not to the recipe.**  A useful proxy
     is the very first training window: if its success is more than ~10 pp below the base's deterministic score,
     the residual is being trained at the wrong operating point and will not transfer back.
-    Shipped: `rl/weights/resid_v3_best.{pt,json,onnx}` (+ `.plan` built on GPU 0, untracked): obs_dim 54,
+    Shipped: `rl/weights/resid_v3_best.{pt,json,onnx}` (+ `.plan` built on GPU 0): obs_dim 54,
     max|trt-torch| 3.75e-05, 148 us/call on the A5000.  **Deploying it needs
     `rl/real_policy_ctrl.py DQ_MAX_DEG = 3.0` and an observation builder extended to the 54-D layout, plus the
     camera-mount caveat above.**
