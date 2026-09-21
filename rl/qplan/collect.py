@@ -35,7 +35,7 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from common import (ACT_DIM, DATA_ROOT, H, OBS_DIM, R_DIST_W, R_SUCC_W, R_TIME_W,  # noqa: E402
-                    load_pi, make_env, seed_env)
+                    V_SOFT_DEG, load_pi, make_env, seed_env, speed_excess)
 import proposals as PR                                                             # noqa: E402
 
 
@@ -152,12 +152,17 @@ def rollout_traj(env, actor, ep_len, device, seed, time_ref="at_goal"):
     OBS = torch.zeros(ep_len + 1, N, OBS_DIM, dtype=torch.float16, device=device)
     ACT = torch.zeros(ep_len, N, ACT_DIM, dtype=torch.float16, device=device)
     ATG = torch.zeros(ep_len, N, dtype=torch.bool, device=device)
+    QEX = torch.zeros(ep_len, N, dtype=torch.float16, device=device)
     info = {}
     for t in range(ep_len):
         OBS[t] = obs.half()
         a = actor(obs, t).clamp(-1, 1)
         ACT[t] = a.half()
         obs, _r, _d, info = env.step(a)
+        # per-decision joint-speed excess, the speed head's reward (negated).  Measured on the
+        # post-step drive state, i.e. the velocity the chunk executed at this decision actually
+        # produced -- the same quantity and the same instant as env_warp._speed_penalty.
+        QEX[t] = speed_excess(env.qvel[:, :6]).half()
         # what stops the time head's clock.  "placed" = the scripted place-down finished and the
         # object is resting within tolerance (the robot's real end of cycle); "at_goal" = the
         # object is merely held at the goal (the pre-place-phase definition, kept for comparison).
@@ -168,6 +173,7 @@ def rollout_traj(env, actor, ep_len, device, seed, time_ref="at_goal"):
         obs=OBS.transpose(0, 1).contiguous().cpu(),        # (E, T+1, 40)
         act=ACT.transpose(0, 1).contiguous().cpu(),        # (E, T, 7)
         at_goal=ATG.transpose(0, 1).contiguous().cpu(),    # (E, T)
+        qd_ex=QEX.transpose(0, 1).contiguous().cpu(),      # (E, T)  speed excess per decision
         placed=info["placed"].float().cpu(),
         final_d=info["final_d"].float().cpu(),
         t_seal=info["t_seal"].float().cpu(),
@@ -193,6 +199,8 @@ def shard_meta(out, ep_len, extra=None):
              t_placed=float(out["t_placed"].mean()) if "t_placed" in out else None,
              place_err_med=float(out["place_err"].median()) if "place_err" in out else None,
              r_term=float(out["r_term"].mean()),
+             qd_ex_mean=float(out["qd_ex"].float().mean()) if "qd_ex" in out else None,
+             v_soft_deg=V_SOFT_DEG,
              r_time_w=R_TIME_W, r_succ_w=R_SUCC_W, r_dist_w=R_DIST_W)
     if extra:
         m.update(extra)

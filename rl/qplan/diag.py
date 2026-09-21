@@ -80,10 +80,12 @@ def main():
     fams = sorted(set(lab))
     fidx = {f: torch.tensor([i for i, l in enumerate(lab) if l == f], device=dev) for f in fams}
 
-    acc = {ph: {f: dict(qs=0.0, qt=0.0, alive=0.0, w=0.0, n=0) for f in fams}
+    has_sp = "speed" in q.head_names
+    acc = {ph: {f: dict(qs=0.0, qt=0.0, qv=0.0, alive=0.0, w=0.0, n=0) for f in fams}
            for ph in ("pre", "post")}
     lad = {ph: dict(qs=np.zeros(len(a.ladder)), qt=np.zeros(len(a.ladder)),
-                    alive=np.zeros(len(a.ladder)), n=0) for ph in ("pre", "post")}
+                    qv=np.zeros(len(a.ladder)), alive=np.zeros(len(a.ladder)), n=0)
+           for ph in ("pre", "post")}
     seed_env(env, a.seed, dev)
     for t in range(a.ep_len):
         obs = env.observe()
@@ -91,6 +93,7 @@ def main():
         cand = PR.propose(a_pi, n_cand=32, gen=g)
         qq = q.score(obs, cand)
         s, tq = qq["succ"], qq["time"]
+        vq = qq["speed"] if has_sp else torch.zeros_like(tq)
         smax = s.max(1, keepdim=True).values
         alive = s >= smax - (1 - a.succ_frac) * smax.abs() - 1e-6
         w = torch.softmax(torch.where(alive, tq / 0.05, torch.full_like(tq, -1e9)), 1)
@@ -98,6 +101,7 @@ def main():
         lc = ladder_chunks(a_pi, a.ladder)
         lq = q.score(obs, lc)
         ls, lt = lq["succ"], lq["time"]
+        lv = lq["speed"] if has_sp else torch.zeros_like(lt)
         lalive = ls >= ls.max(1, keepdim=True).values - (1 - a.succ_frac) * ls.max(1, keepdim=True).values.abs() - 1e-6
         for ph, m in (("pre", ~post), ("post", post)):
             if not m.any():
@@ -107,12 +111,14 @@ def main():
                 d = acc[ph][f]
                 d["qs"] += float(s[m][:, i].mean()) * int(m.sum())
                 d["qt"] += float(tq[m][:, i].mean()) * int(m.sum())
+                d["qv"] += float(vq[m][:, i].mean()) * int(m.sum())
                 d["alive"] += float(alive[m][:, i].float().mean()) * int(m.sum())
                 d["w"] += float(w[m][:, i].sum(1).mean()) * int(m.sum())
                 d["n"] += int(m.sum())
             L = lad[ph]
             L["qs"] += ls[m].mean(0).cpu().numpy() * int(m.sum())
             L["qt"] += lt[m].mean(0).cpu().numpy() * int(m.sum())
+            L["qv"] += lv[m].mean(0).cpu().numpy() * int(m.sum())
             L["alive"] += lalive[m].float().mean(0).cpu().numpy() * int(m.sum())
             L["n"] += int(m.sum())
         env.step(a_pi)
@@ -120,23 +126,26 @@ def main():
     out = {}
     for ph in ("pre", "post"):
         print(f"\n=== {ph}-seal ===")
-        print(f"{'family':<10} {'Q_succ':>8} {'Q_time':>8} {'survive':>8} {'weight':>8}")
+        print(f"{'family':<10} {'Q_succ':>8} {'Q_time':>8} {'Q_speed':>8} {'survive':>8} {'weight':>8}")
         out[ph] = {}
         for f in fams:
             d = acc[ph][f]
             n = max(1, d["n"])
-            r = dict(q_succ=d["qs"] / n, q_time=d["qt"] / n, survive=d["alive"] / n, weight=d["w"] / n)
+            r = dict(q_succ=d["qs"] / n, q_time=d["qt"] / n, q_speed=d["qv"] / n,
+                     survive=d["alive"] / n, weight=d["w"] / n)
             out[ph][f] = r
-            print(f"{f:<10} {r['q_succ']:>8.4f} {r['q_time']:>8.4f} {r['survive']:>8.1%} {r['weight']:>8.1%}")
+            print(f"{f:<10} {r['q_succ']:>8.4f} {r['q_time']:>8.4f} {r['q_speed']:>8.4f} "
+                  f"{r['survive']:>8.1%} {r['weight']:>8.1%}")
         L = lad[ph]
         n = max(1, L["n"])
-        print(f"  scale ladder: {'s':>6} {'Q_succ':>9} {'Q_time':>9} {'survive':>8}")
+        print(f"  scale ladder: {'s':>6} {'Q_succ':>9} {'Q_time':>9} {'Q_speed':>9} {'survive':>8}")
         out[ph]["ladder"] = []
         for i, s_ in enumerate(a.ladder):
             row = dict(scale=s_, q_succ=float(L["qs"][i] / n), q_time=float(L["qt"][i] / n),
-                       survive=float(L["alive"][i] / n))
+                       q_speed=float(L["qv"][i] / n), survive=float(L["alive"][i] / n))
             out[ph]["ladder"].append(row)
-            print(f"                {s_:>6.2f} {row['q_succ']:>9.4f} {row['q_time']:>9.4f} {row['survive']:>8.1%}")
+            print(f"                {s_:>6.2f} {row['q_succ']:>9.4f} {row['q_time']:>9.4f} "
+                  f"{row['q_speed']:>9.4f} {row['survive']:>8.1%}")
     with open(a.out, "w") as f:
         json.dump(out, f, indent=1)
     print(f"\n[diag] -> {a.out}")

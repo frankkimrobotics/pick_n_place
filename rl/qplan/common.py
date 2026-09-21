@@ -34,11 +34,21 @@ R_SUCC_W = 1.0              # +1 for `placed` at the terminal decision
 R_DIST_W = 0.02             # -0.02 per cm of final object-goal distance (graded)
 R_TIME_W = 0.1              # -0.1 per decision until the object is lifted AND at the goal
 
+# Joint-speed-excess reward (the THIRD head, 2026-09-21).  The Q analogue of
+# `env_warp._speed_penalty` / `--w_speed`: nothing else in Q prices joint speed, so the planner's
+# weighted MIXTURE of chunks was free to be jerkier than pi's own output (README "M1 gate").
+#   r_speed(t) = -sum_j relu(|qd_j| - v_soft) / v_soft      evaluated on the DECISION-boundary qd
+# v_soft = 32 deg/s sits just under pi's own peak |qd| p90 (43.6) and over its median decision
+# speed, so the hinge is active on the fast part of the motion only.
+V_SOFT_DEG = 32.0
+V_SOFT = float(np.radians(V_SOFT_DEG))
+
 # HL-Gauss support.  succ: terminal reward in [-0.6, 1]; discounted it never leaves [-0.7, 1.05].
 # time: -0.1 * sum_{k<150} gamma^k = -7.77 at worst, 0 once at the goal.
-V_RANGE = dict(succ=(-1.0, 1.2), time=(-8.0, 0.5))
+# speed: measured on the M0 buffer (see README) -- the discounted excess sum is in [-9, 0].
+V_RANGE = dict(succ=(-1.0, 1.2), time=(-8.0, 0.5), speed=(-9.0, 0.5))
 # ep_len 180 (the scripted place phase needs the headroom): -0.1 * sum_{k<180} 0.99^k = -8.33
-V_RANGE_PLACE = dict(succ=(-1.0, 1.2), time=(-9.0, 0.5))
+V_RANGE_PLACE = dict(succ=(-1.0, 1.2), time=(-9.0, 0.5), speed=(-10.0, 0.5))
 N_BINS = 51
 HLG_SIGMA_BINS = 0.75       # Gaussian kernel sigma in units of the bin width
 
@@ -93,6 +103,15 @@ def flat(c):
 
 def unflat(c):
     return c.reshape(c.shape[0], H, ACT_DIM) if c.dim() == 2 else c
+
+
+def speed_excess(qd, v_soft=V_SOFT):
+    """(N, 6) joint velocities in rad/s -> (N,) sum_j relu(|qd_j| - v_soft) / v_soft.
+
+    The speed head regresses the NEGATIVE of this, summed over the chunk with gamma.  It is
+    evaluated at the decision boundary on the measured-drive twin state, exactly where
+    `env_warp._speed_penalty` evaluates its own hinge, so the two agree by construction."""
+    return (qd.abs() - v_soft).clamp(min=0.0).sum(-1) / v_soft
 
 
 def chunks_from_traj(act, t, hor=H):

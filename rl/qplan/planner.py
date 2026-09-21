@@ -39,8 +39,27 @@ class QPlanner:
 
     def __init__(self, pol, q, n_cand=32, lam=0.05, succ_frac=0.9, sigma_shared=0.15,
                  sigma_step=0.05, rule="weighted", open_loop=False, gen=None, vel_margin=None,
-                 vel_mode="cap"):
-        """vel_margin / vel_mode: cap on the commanded joint speed relative to pi's own.
+                 vel_mode="cap", w_speed=0.0, speed_margin=None, ema=None, noise=None,
+                 fine=False, hash_tab=None):
+        """w_speed / speed_margin / ema: the SPEED head (2026-09-21), three separate levers.
+
+        w_speed    score the softmax on Q_time + w_speed * Q_speed instead of Q_time alone.  This
+                   is the shape of fix the README's M1 gate asks for: the planner pays for joint
+                   speed in the same currency it pays for time, so it can still pick a faster
+                   chunk where the drive can absorb it and must not where it cannot.
+        speed_margin  a SOFT gate instead (score on Q_time alone): drop candidates whose Q_speed
+                   is more than `margin` below the pi chunk's own Q_speed.  Unlike the hard
+                   VELOCITY mask (`vel_mode="mask"`, which biases the survivors slow because
+                   clamped candidates equal pi exactly where pi saturates), this gate is on the
+                   critic's PREDICTED excess, so it drops a fast candidate only where Q believes
+                   the drive will actually overshoot.
+        ema        after mixing, execute alpha * a_mix + (1 - alpha) * a_prev on the JOINT
+                   channels (the suction logit is left alone -- its sign is the command and a
+                   blend would latch a decision late).  a_prev is read from the observation
+                   (columns 18:24), so the rule is stateless and exports as part of the graph.
+        noise      fixed gaussian-family table (proposals.noise_table) -> deterministic planner.
+
+        vel_margin / vel_mode: cap on the commanded joint speed relative to pi's own.
 
         The commanded delta IS the commanded joint speed (|a| x dq_max x CTRL_HZ = |a| x 30 deg/s),
         so `v_pi = max_{h,j} |c_pi[h,j]|` is pi's own peak for this chunk and the planner is not
@@ -61,28 +80,54 @@ class QPlanner:
         self.rule, self.open_loop, self.gen = rule, bool(open_loop), gen
         self.vel_margin = None if vel_margin is None else float(vel_margin)
         self.vel_mode = str(vel_mode)
+        self.w_speed = float(w_speed)
+        self.speed_margin = None if speed_margin is None else float(speed_margin)
+        self.ema = None if ema is None else float(ema)
+        self.noise = noise
+        self.hash_tab = hash_tab
+        self.kw["fine"] = bool(fine)
+        self.has_speed = "speed" in getattr(q, "head_names", ("succ", "time"))
+        if (self.w_speed or self.speed_margin is not None) and not self.has_speed:
+            raise ValueError("this critic has no speed head (retrain with qplan/critic.py)")
         vm = "" if self.vel_margin is None else f",vel{vel_mode}<={self.vel_margin}"
-        self.name = f"qplan[{rule},N={n_cand},lam={lam}{vm}{',open' if open_loop else ''}]"
+        sp = (",fine" if fine else "") + (",hash" if hash_tab is not None else "") + \
+             (f",wsp={self.w_speed}" if self.w_speed else "") + \
+             (f",spgate={self.speed_margin}" if self.speed_margin is not None else "") + \
+             (f",ema={self.ema}" if self.ema is not None else "")
+        self.name = f"qplan[{rule},N={n_cand},lam={lam}{vm}{sp}{',open' if open_loop else ''}]"
         self.diag = {}
 
     def reset(self, n, device):
         self.buf = torch.zeros(n, H, ACT_DIM, device=device)
         self.left = torch.zeros(n, dtype=torch.long, device=device)
         self.diag = dict(n_alive=0.0, w_pi=0.0, w_max=0.0, not_pi=0.0, dq=0.0,
-                         vel_drop=0.0, forced_pi=0.0, calls=0)
+                         vel_drop=0.0, forced_pi=0.0, sp_drop=0.0, calls=0)
 
     # ------------------------------------------------------------------ plan
     @torch.no_grad()
     def plan(self, obs):
         a_pi = self.pol(obs)
-        cand = PR.propose(a_pi, n_cand=self.n_cand, gen=self.gen, **self.kw)   # (N, C, H, 7)
+        noise = self.noise
+        if self.hash_tab is not None:                 # deterministic, observation-hashed noise
+            z = (obs - self.q.obs_mean) / self.q.obs_std
+            noise = PR.hash_noise(z, self.hash_tab, self.kw["sigma_shared"], self.kw["sigma_step"])
+        cand = PR.propose(a_pi, n_cand=self.n_cand, gen=self.gen, noise=noise,
+                          **self.kw)                                           # (N, C, H, 7)
         if self.rule == "pi":
             return cand[:, 0], None
         qs = self.q.score(obs, cand)
         s, tq = qs["succ"], qs["time"]
+        vq = qs["speed"] if self.has_speed else None
         smax = s.max(dim=1, keepdim=True).values
         thr = smax - (1.0 - self.succ_frac) * smax.abs()
         alive = s >= thr - 1e-6
+        if self.speed_margin is not None:
+            # soft speed gate, referenced to the PI CHUNK (candidate 0), not to the best
+            # candidate: the planner is allowed to be as rough as pi is, never rougher by more
+            # than `margin` of predicted discounted excess.
+            sp_ok = vq >= vq[:, :1] - self.speed_margin
+            self.diag["sp_drop"] += float((~sp_ok).float().mean())
+            alive = alive & sp_ok
         vdrop = 0.0
         if self.vel_margin is not None and self.vel_mode == "mask":
             vpi = cand[:, 0, :, :6].abs().amax(dim=(1, 2))               # (N,)
@@ -97,12 +142,13 @@ class QPlanner:
             alive[none_alive, 0] = True
         self.diag["forced_pi"] += float(none_alive.float().mean())
         self.diag["vel_drop"] += vdrop
+        sc = tq if not self.w_speed else tq + self.w_speed * vq
         if self.rule == "best":
-            lg = torch.where(alive, tq, torch.full_like(tq, NEG))
-            w = torch.zeros_like(tq)
+            lg = torch.where(alive, sc, torch.full_like(sc, NEG))
+            w = torch.zeros_like(sc)
             w.scatter_(1, lg.argmax(1, keepdim=True), 1.0)
         else:
-            lg = torch.where(alive, tq / self.lam, torch.full_like(tq, NEG))
+            lg = torch.where(alive, sc / self.lam, torch.full_like(sc, NEG))
             w = torch.softmax(lg, dim=1)
         chunk = (w[:, :, None, None] * cand).sum(1)
         if self.vel_margin is not None and self.vel_mode == "cap":
@@ -121,10 +167,18 @@ class QPlanner:
         return chunk, w
 
     # ------------------------------------------------------------------ act
+    def _ema(self, a, obs):
+        """alpha * a + (1 - alpha) * a_prev on the joint channels; a_prev = obs[:, 18:24]."""
+        if self.ema is None:
+            return a
+        ap = obs[:, 18:24]
+        j = self.ema * a[:, :6] + (1.0 - self.ema) * ap
+        return torch.cat([j.clamp(-1, 1), a[:, 6:]], -1)
+
     def __call__(self, obs, t=0):
         if not self.open_loop:
             chunk, _ = self.plan(obs)
-            return chunk[:, 0]
+            return self._ema(chunk[:, 0], obs)
         need = self.left == 0
         if need.any():
             chunk, _ = self.plan(obs)
@@ -200,7 +254,13 @@ def fmt(name, r, hz=10.0):
 
 def load_q(path, device="cuda:0"):
     ck = torch.load(path, map_location=device, weights_only=False)
-    q = QChunk(v_range=ck.get("v_range")).to(device)
+    sep = ck.get("sep_speed", any(k.startswith("trunk_v.") for k in ck["q"]))
+    # the head SET comes from the checkpoint, never from the current default: critics saved
+    # before the speed head existed have two heads (and some have no `v_range` at all, so read
+    # the supports straight off the stored bin edges).
+    vr = ck.get("v_range") or {k.split(".")[1]: (float(v[0]), float(v[-1]))
+                               for k, v in ck["q"].items() if k.endswith(".edges")}
+    q = QChunk(v_range=vr, sep_speed=sep).to(device)
     q.load_state_dict(ck["q"])
     q.eval()
     for p in q.parameters():
@@ -212,13 +272,62 @@ SWEEP = [(32, 0.05, 0.95), (32, 0.05, 0.97), (32, 0.02, 0.95), (32, 0.20, 0.97),
          (16, 0.05, 0.90), (32, 0.05, 0.80)]
 
 
-def build_variants(pol, q, dev, seed=0, which="full", vel_margin=None):
+def build_variants(pol, q, dev, seed=0, which="full", vel_margin=None, a=None):
     def gen():
         g = torch.Generator(device=dev)
         g.manual_seed(seed + 31337)
         return g
     V = [("pi alone", PiActor(pol))]
     if which == "none":
+        return V
+    # ---- speed-head groups (2026-09-21) ---------------------------------
+    if which in ("speed", "spgate", "smooth", "final", "combo"):
+        n, lam, sf = a.n_cand, a.lam, a.succ_frac
+        nz = PR.noise_table(n, gen=gen(), device=dev) if a.fixed_noise else None
+        ht = None
+        if a.hash_tab:                       # the EXACT tables baked into an exported graph
+            ht = {k: (v.to(dev) if torch.is_tensor(v) else v)
+                  for k, v in torch.load(a.hash_tab, map_location=dev, weights_only=False).items()}
+        elif a.hash:
+            ht = PR.hash_tables(n, gen=gen(), device=dev, gain=a.hash_gain)
+        mk = lambda **kw: QPlanner(pol, q, n, lam, succ_frac=sf, gen=gen(), noise=nz,  # noqa: E731
+                                   fine=bool(a.fine), hash_tab=ht,
+                                   sigma_shared=a.sigma_shared,
+                                   sigma_step=a.sigma_step, **kw)
+        if which == "speed":
+            V.append((f"planner N={n} lam={lam} (no speed term)", mk()))
+            for w in a.w_speed:
+                V.append((f"planner w_speed={w}", mk(w_speed=w)))
+        elif which == "combo":
+            # cross the two speed levers with the EMA: w_speed = 0 means "no speed term",
+            # sp_margin < 0 means "no speed gate"
+            for w in a.w_speed:
+                for m in a.sp_margin:
+                    V.append((f"w_speed={w} gate={m} ema={a.ema}",
+                              mk(w_speed=w, speed_margin=(None if m < 0 else m),
+                                 ema=(a.ema or None))))
+        elif which == "spgate":
+            V.append((f"planner N={n} lam={lam} (no speed term)", mk()))
+            for m in a.sp_margin:
+                V.append((f"planner Q_time, speed gate margin={m}", mk(speed_margin=m)))
+        elif which == "smooth":
+            kw = {}
+            if a.w_speed_pick:
+                kw["w_speed"] = a.w_speed_pick
+            if a.sp_margin_pick is not None:
+                kw["speed_margin"] = a.sp_margin_pick
+            V.append(("(a) weighted mixture", mk(**kw)))
+            V.append(("(b) best candidate after the gates", mk(rule="best", **kw)))
+            V.append((f"(c) weighted + EMA alpha={a.ema}", mk(ema=a.ema, **kw)))
+        else:                                    # final: the chosen setting, both rules
+            kw = {}
+            if a.w_speed_pick:
+                kw["w_speed"] = a.w_speed_pick
+            if a.sp_margin_pick is not None:
+                kw["speed_margin"] = a.sp_margin_pick
+            if a.ema:
+                kw["ema"] = a.ema
+            V.append(("qplan_v1 (chosen)", mk(**kw)))
         return V
     if which == "best":
         V.append(("planner N=16 lam=0.1", QPlanner(pol, q, 16, 0.1, gen=gen(), vel_margin=vel_margin)))
@@ -284,7 +393,32 @@ def main():
     ap.add_argument("--vel_margin", type=float, default=None,
                     help="hard velocity mask: drop chunks whose peak commanded joint delta "
                          "exceeds this multiple of pi's own (e.g. 1.2)")
-    ap.add_argument("--which", default="full", choices=["full", "core", "none", "sweep", "confirm", "pareto", "velcap", "best"])
+    ap.add_argument("--which", default="full",
+                    choices=["full", "core", "none", "sweep", "confirm", "pareto", "velcap",
+                             "best", "speed", "spgate", "smooth", "final", "combo"])
+    ap.add_argument("--n_cand", type=int, default=16)
+    ap.add_argument("--lam", type=float, default=0.1)
+    ap.add_argument("--succ_frac", type=float, default=0.9)
+    ap.add_argument("--w_speed", type=float, nargs="+", default=[0.5, 1.0, 2.0, 4.0])
+    ap.add_argument("--sp_margin", type=float, nargs="+", default=[0.05, 0.15, 0.4])
+    ap.add_argument("--w_speed_pick", type=float, default=0.0)
+    ap.add_argument("--sp_margin_pick", type=float, default=None)
+    ap.add_argument("--ema", type=float, default=0.7)
+    ap.add_argument("--hash", type=int, default=0,
+                    help="1 = gaussian family from sin(W.obs) instead of an RNG (deterministic, "
+                         "and what the exported graph computes)")
+    ap.add_argument("--hash_gain", type=float, default=5.0)
+    ap.add_argument("--hash_tab", default=None,
+                    help="path to <stem>_hash.pt written by qplan/export.py (evaluate exactly "
+                         "the planner that was exported)")
+    ap.add_argument("--sigma_shared", type=float, default=0.15)
+    ap.add_argument("--sigma_step", type=float, default=0.05)
+    ap.add_argument("--fine", type=int, default=0,
+                    help="1 = replace the gaussian family with extra ladder scales (a fully "
+                         "DETERMINISTIC proposal set -- what the exported graph builds)")
+    ap.add_argument("--fixed_noise", type=int, default=0,
+                    help="1 = one FIXED gaussian-noise table for the whole run (what the exported "
+                         "TensorRT graph bakes in)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
@@ -300,7 +434,7 @@ def main():
           f"ep_len {a.ep_len} dq_max {a.dq_max} dr={not a.no_dr} obj_err={bool(a.obj_err)}", flush=True)
     rows = {}
     for name, actor in build_variants(pol, q, dev, seed=a.seed, which=a.which,
-                                      vel_margin=a.vel_margin):
+                                      vel_margin=a.vel_margin, a=a):
         t0 = time.time()
         r = rollout(env, actor, a.ep_len, dev, seed=a.seed)
         r["seconds"] = round(time.time() - t0, 1)
@@ -313,7 +447,20 @@ def main():
             print(f"       survivors {d['n_alive']:.1f}/{actor.n_cand}  w(pi) {d['w_pi']:.3f}  "
                   f"w_max {d['w_max']:.3f}  argmax!=pi {d['not_pi']:.1%}  "
                   f"|dchunk| {d['dq']:.4f}  vel_drop {d['vel_drop']:.1%}  "
+                  f"sp_drop {d.get('sp_drop', 0.0):.1%}  "
                   f"forced_pi {d['forced_pi']:.1%}", flush=True)
+    base = rows.get("pi alone")
+    if base is not None and a.which in ("speed", "spgate", "smooth", "final", "combo", "pareto"):
+        print(f"\n[front] {'variant':<42} {'success':>8} {'t_goal':>8} {'qd p90':>7} "
+              f"{'d_succ':>7} {'d_time':>7} {'gate':>5}")
+        for nm, r in rows.items():
+            if nm.startswith("_"):
+                continue
+            g = gate_m1(base, r)
+            print(f"[front] {nm:<42} {r['success']:>7.2%} {r['t_goal'] / 10:>7.2f}s "
+                  f"{r['qd_p90']:>7.1f} {g['d_success_pp']:>+6.2f} {g['d_t_goal_s']:>+6.2f} "
+                  f"{'PASS' if g['passed'] else 'fail':>5}", flush=True)
+            rows[nm]["gate"] = g
     if "planner weighted N=32 lam=0.05" in rows:
         g = gate_m1(rows["pi alone"], rows["planner weighted N=32 lam=0.05"])
         print(f"[gate M1] d_success {g['d_success_pp']:+.2f} pp (need >= +1.0)  "
