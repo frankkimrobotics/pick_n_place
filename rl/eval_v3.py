@@ -112,11 +112,12 @@ def main():
                           grasp_shaping=True, obs_ee=True, reach_target="grasp", lift_dense=True,
                           w_reach=0.5, w_track_c=4, w_track_f=8)
         obs_dim = env.observe().shape[-1]
+        dq_env = float(np.degrees(env.dq_max))      # never leak one policy's clamp into the next
         print(f"[eval_v3] obstacles={obst} obs_dim {obs_dim} nworld {a.nworld} ep_len {a.ep_len} "
               f"dr={not a.no_dr} drive={a.drive}", flush=True)
         for path in a.ckpt:
             pol, dq, lab = load_policy(path, obs_dim, a.arch, dev, dq_default=a.dq_max)
-            dq = a.dq_max if a.dq_max is not None else dq
+            dq = a.dq_max if a.dq_max is not None else (dq if dq else dq_env)
             r = rollout(env, pol, a.ep_len, seed=a.seed, dq_max_deg=dq)
             tag = f"{os.path.basename(os.path.dirname(path))}/{os.path.basename(path)}"
             name = f"{tag} obst={int(obst)} dq={dq}"

@@ -82,7 +82,8 @@ def part_a(env):
     off = np.abs(w[:, :, 0] * (-u[:, None, 1]) + w[:, :, 1] * u[:, None, 0])
     on_corr = act & (off <= V3.CORRIDOR_OFF) & (t > 0) & (t < 1)
     print(f"  worlds with a distractor ON the corridor (offset <= {V3.CORRIDOR_OFF} m): "
-          f"{100 * on_corr.any(1).mean():.1f} %  (target {100 * env.p_corridor:.0f} %)")
+          f"{100 * on_corr.any(1).mean():.1f} %  (spec 70 %; p_corridor INTENT "
+          f"{100 * env.p_corridor:.0f} %, ~12 % of those have no feasible spot)")
     print(f"  ... of which the corridor body is a post: "
           f"{100 * (on_corr & post).any(1).mean():.1f} % of all worlds")
     # obstacle observation block
