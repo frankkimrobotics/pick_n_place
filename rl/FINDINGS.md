@@ -660,3 +660,188 @@ raising the weight.
         CUDA_VISIBLE_DEVICES=0 $PY rl/qplan/collect.py --nworld 4096 --batches 2 --ep_len 180 --place_phase 1 --mode pi --tag p0 --seed 0 --out ~/pnp_rl/qplan/data_place
         CUDA_VISIBLE_DEVICES=0 $PY rl/qplan/steps_curve.py --data ~/pnp_rl/qplan/data_place --steps 10000 20000 40000 --nworld 1024 --ep_len 180 --place_phase 1
         CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/plot_final.py                                        # -> ~/pnp_rl/qplan/iterations.png
+
+26. **v3: obstacles, an enlarged workspace and the suction bug that was capping env_v2 (2026-09-21, `rl/env_v3.py`,
+    branch `v3-obstacles`)**.  `rl/env_v3.ObstacleEnv(env_v2.DiverseEnv)` adds, all default-off or explicit:
+    spawn **x 0.20-0.56, y +-0.35** (v2: 0-0.5 / +-0.3), v3 goals (x 0.18-0.52, |y| <= 0.33, so >= 0.10 m from
+    every wall, and a MINIMUM carry distance of 0.20 m so a corridor obstacle can clear both ends),
+    **1-3 distractor bodies** per world (box or upright cylinder; one of them a **0.10-0.25 m tall post** with
+    p = 0.5; measured 52.9 %), and obstacle failure `info["obst_hit"]` = any arm-proxy / cup-tip / held-object contact with a
+    distractor OR a distractor's CENTRE displaced > 1 cm, charged exactly like `wall_hit`.  Observation
+    **47 + 7 = 54**: the nearest active distractor's centre relative to the tcp, its half extents, and
+    `n_active / 3`, zero-padded when there is none.
+    *Scene* (`rl/build_scene_v2.py --n_dist 3` -> `rl/scenes/obstacle_v3.xml`): three FREE bodies, two geoms each
+    (the env_v2 stub trick selects the shape per world through the batched `geom_size`), bottom-centre origin,
+    `contype 1 / conaffinity 5` so they collide with the table plane, the object, the cup tip, the arm proxies and
+    the walls and with nothing else; an inactive slot is parked at (2.0 + 0.15k, 2.0), outside the cell.
+    nq 34, nv 30.  **njmax 256 / nconmax 160 (env_v2's values) are enough**: the measured max `nefc` over 200
+    random-action steps at 512 worlds is 92, and 320/208 costs 22 % throughput for nothing.
+    *Placement* is rejection sampling: on the table, clear of the base and the bin, >= 4 cm between distractors,
+    and >= **max(6 cm, r_distractor + r_object + 3 cm)** from the target and from the goal xy.  The literal 6 cm
+    of the spec is NOT enough once the bodies have size -- a 5 cm-radius distractor 6 cm from the goal leaves the
+    CARRIED object overlapping it and cuRobo then rejects every carry plan.  That size-aware clearance in turn
+    pushes a naive U(0.3, 0.7) corridor sample inside an end keep-out almost every time (corridor occupancy
+    collapsed to **17 %**), so the fraction along the segment is clipped per world to the band that can still
+    satisfy the end clearance, the carry distance is 0.20-0.32 m, and `p_corridor` defaults to **0.80** because
+    about 12 % of worlds have no feasible corridor spot at all.  Measured at 1024 worlds: 1/2/3 distractors
+    34.3/33.0/32.7 %, posts 52.9 %, **corridor occupancy 68.7 %** (0.70 gives 61.3 %), post-on-corridor 38.1 %,
+    min |distractor - target| 9.8 cm, min |distractor - goal| 9.1 cm, carry 0.201-0.319 m.
+    *THE SUCTION BUG (this is the real result of the milestone).*  The first cuRobo teacher on v3 scored only
+    55-61 %, with 30-36 % of episodes "sealed but short of the goal".  Instrumenting the break: **36 seal breaks
+    per 128 worlds in 12 s of rollout, every one by FORCE saturation**, the object travelling at 1.0-3.1 m/s and
+    spinning at 35-230 rad/s while the arm moved at 0.1 m/s, and the rate scaling hard with mass -- **0.69 breaks
+    per world at 30-60 g, 0.31 at 60-100 g, 0.05 at 100-150 g**.  Mechanism: the righting spring
+    (`_apply_suction_force`) saturates at `TAU_CUP` = 0.4 N*m after 1.1 deg of orientation error, and 0.4 N*m on
+    a small diverse object (I ~ 2e-5 kg m^2) injects **30 rad/s of angular velocity per 2 ms substep**; with the
+    0.55 per-substep angular damping the steady state is ~40 rad/s, and because env_v2 moved the object's body
+    origin to its BOTTOM FACE that spin appears in `qvel[0:3]` as a 1-3 m/s *linear* velocity, so the linear
+    damper `-C*v` saturates `F_MAX` and `BREAK_STEPS` later the cup lets go.  Three scoped fixes in
+    `rl/env_warp.py` (all reversible with `PNP_LEGACY_SUCTION=1`):
+      * righting torque capped at `I * W_INJ_MAX / dt`, `W_INJ_MAX = 3 rad/s` -- still 5-7x the gravity peel
+        torque these objects have to hold, so the cup keeps its authority;
+      * `W_SEAL_MAX = 6 rad/s` ceiling on a SEALED object's spin;
+      * linear damper capped at `DAMP_DT_RATIO * m / dt` (explicit-Euler stability, `C*dt/m < 2`); a no-op at and
+        above the paper object's 0.05 kg.
+    Result: **seal breaks 36 -> 1 per 128 worlds** (the survivor is a genuine 24 mm spring overload), and the v3
+    teacher **60.9 / 55.5 % -> 88.3 / 83.6 %**.  A/B on the DEPLOYED policy (`resid3_fast_best` on box_med, 512
+    paired episodes, legacy vs fixed): base 95.70 / 95.90 %, residual 96.48 / 95.90 %, seal 96.29 / 97.07 % in
+    both, t_seal 5.19 s in both -- **inside the +-1.9 pp run-to-run noise, so nothing published on the paper env
+    moves.**  This is almost certainly what capped `dagger_v2c` at a 50.6 % teacher / 46 % student (item 25's
+    unexplained v2 plateau): env_v2's 0.03-0.15 kg mass range is exactly the band where the artefact bites.
+    *Teacher* (`rl/bc_curobo.py --env v3`, class `TeacherV3`): per world and per leg the active distractors, the
+    walls and the table go to the cuRobo server as cuboids (`set_world`) and cuRobo plans the leg; on the CARRY
+    leg every distractor cuboid is inflated by the held object's circumradius and by its overhang below the tcp
+    (`CUP_R + object height`), so a tcp-only plan keeps the OBJECT clear too.  The trajectory is retimed with
+    planner_sweep's parameters (vlim 36 deg/s, alim 300 deg/s^2, applied as the uniform time dilation that
+    `retime` ends with; at dq_max 2 the BINDING limit is the per-decision action clamp, 0.95*dq_max*10 Hz =
+    19 deg/s).  Two shortcuts keep the ~1.7 s/plan server off the critical path: `--planner_mode corridor`
+    (default) skips the RPC when the straight tcp line is already clear of every inflated obstacle, and a failed
+    plan falls back to a geometric OVER-THE-TOP IK path (lift above the tallest obstacle in the way, translate,
+    descend).  After the plan runs out the carry target is re-IK'd from the LIVE `tcp - object` offset every 5
+    decisions (`--carry_refine`), because the offset measured once at lift-off leaves the object short.
+    Three bugs found on the way, each worth a line:
+      * every `set_world` was raising `TypeError: Object of type float32 is not JSON serializable`, which the
+        leg's `except Exception` turned into "no plan" -- **0/21 plans** until it was caught.  RPC errors are now
+        printed once and counted separately.
+      * the server's BASE world keeps a 0.30 x 0.30 x 1.0 `camera_mount_d435` cuboid at (0.64, -0.05), i.e. it
+        blocks x >= 0.49 up to z = 0.9 -- a slice of the v3 spawn box the MuJoCo twin has no collision geom for.
+        `set_world` overrides a base cuboid BY NAME, so `TeacherV3` parks it (`--cam_mount 1` restores it):
+        approach plans **17/24 -> 23/24**, carry plans **15/24 -> 23/24**.  SIM-TO-REAL: the real cell does have
+        that mount; a deployment must restore the cuboid or keep the object off x > 0.49.
+      * `ep_len` 150 is too short for the enlarged workspace: teacher success 34 % at 150 vs 59 % at 200 on the
+        same seed (t_seal alone is 8.2-8.7 s).  **v3 runs at ep_len 200.**
+    *Milestone 1 paired eval* (`rl/eval_v3.py ~/pnp_rl/dagger_v2c/bc_iter16.pt --nworld 1024 --ep_len 200 --both
+    --dq_max 2`, DR on, deterministic, same seed; the 47-D env_v2 student is zero-padded into the 54-D actor, so
+    it simply ignores the obstacle block -- which is exactly the baseline "what do the obstacles cost a policy
+    that cannot see them"):
+
+    | env_v3 | success | seal | obst_hit | wall_hit | off | t_seal | t_goal | peak abs qd med/p90/max |
+    |---|---|---|---|---|---|---|---|---|
+    | obstacles OFF (enlarged workspace only) | **56.25 %** | 72.56 % | - | 2.25 % | 1.07 % | 10.38 s | 13.98 s | 39.2/46.8/61.4 |
+    | obstacles ON | **32.03 %** | 72.56 % | **31.74 %** | 2.25 % | 1.07 % | 10.43 s | 14.04 s | 39.2/47.4/61.4 |
+
+    The enlarged workspace alone costs nothing (the same checkpoint scored 45.7 % on env_v2 with the OLD suction
+    numerics); the obstacles cost **24.2 pp**, and success is flat in the NUMBER of distractors
+    (1/2/3 -> 30.8/34.7/30.4 %) -- it is the corridor one that matters, not how many there are.
+    *Acceptance test* `rl/test_env_v3.py` (512 worlds): obs 54, 300 random steps with no NaN in obs / reward /
+    qpos / qvel at 282 env-steps/s, 0 diverged worlds, idle distractors drift <= 0.2 mm (no spurious failure),
+    and the collision probe -- a 0.25 m post planted under the tcp and the arm driven straight down onto it --
+    fires `obst_hit` on 8/8 probe worlds and 0/504 controls, charges the -1 `fail` component once and clears
+    `placed`.  All three parts PASS.
+    *Teacher result* (8 batches x 128 worlds, ep_len 200, `--press_depth 0.02 --press_rate 0.6`): success
+    83.6 / 76.6 / 78.9 / 73.4 / 81.2 / 76.6 / 76.6 / 75.0 % = **77.7 % mean** (target was 60 %), seal 88-95 %,
+    obst_hit 7-12 %, wall_hit 0-3 %, t_seal 8.5-9.2 s, t_goal 11-13 s for the 80-92 % that reach the goal.
+    cuRobo is called on the legs whose straight tcp line is blocked and solves **43/52 approach** and
+    **377/673 carry** legs; the other 1547 legs are the geometric over-the-top fallback.  ~4-5 min per batch of
+    128 worlds, planner-bound.
+    *DAgger* (`--teacher_batches 8 --dagger_iters 4 --dagger_batches 3`, beta 0.5 / 0.3 / 0.1 / 0, warm-started
+    from the env_v2 student with `--init`, 40 epochs per fit, dataset 205k -> 512k steps):
+
+    | round | beta | dataset | student success (128 w, in-run) | 512-world deterministic re-eval | seal | obst_hit |
+    |---|---|---|---|---|---|---|
+    | 0 (one-shot BC) | - | 204 800 | 41.4 % | 38.87 % | 67.2 % | 23.1 % |
+    | 1 | 0.5 | 281 600 | 42.2 % | 48.83 % | 70.1 % | 16.6 % |
+    | **2** | **0.3** | **358 400** | **49.2 %** | **59.18 %** | **78.7 %** | **13.9 %** |
+    | 3 | 0.1 | 435 200 | 18.8 % | (collapsed: seal 28 %) | - | - |
+    | 4 | 0 | 512 000 | 36.7 % | 47.66 % | 73.8 % | 14.1 % |
+
+    Same shape as FINDINGS 15: **the rounds are noisy and one of them collapses** -- keep the best by a paired
+    eval, never the last.  Round 2 is `~/pnp_rl/dagger_v3/best.pt`.  Note the one-shot BC is 38.9 % rather than
+    FINDINGS 5's 0 %, because `--init` warm-starts from the env_v2 student; the DAgger rounds still buy
+    +20 pp and cut obstacle hits from 23 % to 14 %.
+    *Commands* (GPU 0; the cuRobo server is `curobo_planner_server_v2.py --ground-z -0.1` on :9997; nothing here
+    ever touches the robot):
+
+        PY=~/miniconda3/envs/mjwarp/bin/python
+        $PY rl/build_scene_v2.py --n_dist 3                       # -> rl/scenes/obstacle_v3.xml
+        CUDA_VISIBLE_DEVICES=0 $PY rl/test_env_v3.py              # acceptance: (a) (b) (c)
+        CUDA_VISIBLE_DEVICES=0 $PY rl/eval_v3.py ~/pnp_rl/dagger_v2c/bc_iter16.pt --nworld 1024 --ep_len 200 \
+            --both --dq_max 2 --out ~/pnp_rl/v3_m1_eval.json      # milestone 1 paired eval
+        CUDA_VISIBLE_DEVICES=0 $PY rl/bc_curobo.py --env v3 --drive real --nworld 128 --teacher_batches 8 \
+            --dagger_iters 4 --dagger_batches 3 --press_depth 0.02 --ep_len 200 --epochs 40 \
+            --init ~/pnp_rl/dagger_v2c/bc_iter16.pt --out ~/pnp_rl/dagger_v3
+        CUDA_VISIBLE_DEVICES=0 $PY rl/eval_v3.py ~/pnp_rl/dagger_v3/bc_iter{0,1,2,4}.pt --nworld 512 \
+            --ep_len 200 --dq_max 2                               # pick the round; 2 wins -> best.pt
+        CUDA_VISIBLE_DEVICES=0 $PY rl/ppo.py --nworld 4096 --steps 8000000 --rollout 24 --epochs 3 \
+            --minibatch 24576 --gamma 0.98 --lam 0.95 --clip 0.1 --ent 0.0015 --lr 5e-5 --mode pnp --dr \
+            --target_max 0.32 --out ~/pnp_rl/resid_v3 --drive real --dq_max 3.0 --obs_lag -1 \
+            --hover 0.02 0.04 --init_std -1.0 --descend_sigma 0.07 --env v3 --arch paper --max_grad_norm 1.0 \
+            --critic_warmup 8 --lr_max 1e-3 --grasp_shaping 1 --obs_ee 1 --reach_target grasp --lift_dense 1 \
+            --w_track_c 4 --w_track_f 8 --w_reach 0.5 --vf_coef 0.5 --reg_ramp 0.4 --ep_len 200 --start home \
+            --residual_base ~/pnp_rl/dagger_v3/best.pt --residual_bound 0.3 --base_scale 0.6667 \
+            --w_time 0.5 --w_speed 1.0 --v_soft 32 --critic_priv
+        # the run that WORKS: same command with --init_std -2.0 --ent 0.0005 --steps 4500000
+        #                      --out ~/pnp_rl/resid_v3b
+        CUDA_VISIBLE_DEVICES=0 $PY rl/eval_v3.py ~/pnp_rl/dagger_v3/best.pt ~/pnp_rl/resid_v3b/best.pt \
+            ~/pnp_rl/resid_v3b/final.pt --nworld 1024 --ep_len 200 --out ~/pnp_rl/v3_m3b_eval.json
+        CUDA_VISIBLE_DEVICES=0 $PY rl/export_trt.py rl/weights/resid_v3_best.pt --obs_dim 54 --arch paper \
+            --out rl/weights/resid_v3_best
+    *Milestone 3: residual PPO (resid1/resid3 recipe) FAILS on a 58 % base.*  `~/pnp_rl/resid_v3`, frozen
+    student as the base, bound 0.3, `--base_scale 0.6667 --dq_max 3`, privileged critic, `--w_time 0.5
+    --w_speed 1.0 --v_soft 32`, 8 M steps at 4096 worlds (3.2 h, 694 env-steps/s).  Training success (STOCHASTIC
+    rollouts) climbed 24.6 -> 36.2 % and `res_mag` 0.0008 -> 0.036, i.e. PPO was optimising its own objective
+    fine.  The paired deterministic eval (1024 episodes, DR on, same seed, ep_len 200) says otherwise:
+
+    | policy | dq_max | success | seal | obst_hit | wall_hit | off | t_seal | t_goal | peak abs qd med/p90/max |
+    |---|---|---|---|---|---|---|---|---|---|
+    | **student** `dagger_v3/best.pt` | 2 deg | **57.62 %** | **79.79 %** | 15.14 % | 2.05 % | 3.61 % | **10.14 s** | **14.93 s** | 36.5 / 41.1 / 148.7 |
+    | residual best (7.37 M) | 3 deg | 32.71 % | 48.93 % | **14.75 %** | **1.17 %** | **0.49 %** | 14.07 s | 17.52 s | 38.0 / 43.9 / 80.8 |
+    | residual final (8.06 M) | 3 deg | 41.11 % | 63.57 % | 18.95 % | 0.88 % | 0.29 % | 12.15 s | 16.65 s | 37.9 / 43.8 / 71.4 |
+
+    **The plumbing is not the problem.**  Zeroing the trained residual's output layer and re-evaluating the fused
+    stack at dq_max 3 / base_scale 0.6667 reproduces the base exactly -- 58.79 % vs 59.18 %, seal 78.91 vs
+    78.71 %, t_seal 10.14 vs 10.16 s, t_goal 14.99 vs 14.96 s, peak |qd| 37.0/41.2/81.7 vs 37.0/41.2/81.1 over
+    512 paired episodes.  So the 54-D observation, the a_prev rescaling and the joint-only base scaling are all
+    exact, and PPO really did make the policy worse.
+    **Why**: the residual is trained on STOCHASTIC rollouts, and on this base the exploration noise costs far
+    more than it did on the paper env.  `init_std -1.0` with bound 0.3 perturbs the executed action by only
+    ~+-0.3 deg/decision, but it drops the SEAL rate from 79.8 % (deterministic) to 48 % (the first training
+    window, before the actor had moved) -- the 20 mm press needs sub-millimetre precision over ~15 consecutive
+    decisions and the v3 base has no margin left after the DR.  PPO therefore spent 8 M steps improving a
+    ~25-36 % operating point, and what it learned there (a residual that is worth +12 pp under noise) is a
+    *worse* policy without it.  The paper-env residuals did not hit this because their base was 88-95 % and its
+    seal was 96 %, so the noisy and the deterministic operating points were 7 pp apart, not 25 pp.
+    Note what the residual DOES buy, consistently on both checkpoints: **off-table failures 3.61 % -> 0.3-0.5 %,
+    wall hits 2.05 % -> 0.9-1.2 %, and the base's 148.7 deg/s peak-speed outlier is gone (80.8)** -- the speed
+    and safety terms work; it is the seal that it trades away.
+    *The fix, confirmed* (`~/pnp_rl/resid_v3b`: `--init_std -2.0 --ent 0.0005`, everything else identical,
+    4.5 M steps, 1.8 h).  Shrinking the exploration std from 0.37 to 0.135 moved the FIRST training window from
+    24.6 % / seal 48 % to **46.1 % / seal 66 %** -- i.e. the noisy operating point is now within 12 pp of the
+    deterministic one instead of 33 pp -- and training then peaked at 50.7 % stochastic.  Paired deterministic
+    eval, 1024 episodes, DR on, same seed:
+
+    | policy | dq_max | success | seal | obst_hit | wall_hit | off | t_seal | t_goal | peak abs qd med/p90/max |
+    |---|---|---|---|---|---|---|---|---|---|
+    | student `dagger_v3/best.pt` | 2 deg | 57.62 % | 79.88 % | 15.43 % | 2.05 % | 3.32 % | 10.14 s | 14.91 s | 36.5 / 41.1 / 144.3 |
+    | **resid_v3b best (1.97 M)** | 3 deg | **58.89 %** | 79.69 % | 15.53 % | **1.76 %** | 3.32 % | **10.11 s** | **14.82 s** | 36.7 / 41.4 / 154.9 |
+    | resid_v3b final (4.5 M) | 3 deg | 48.54 % | 68.65 % | 16.99 % | 1.46 % | 1.95 % | 11.54 s | 15.64 s | 37.0 / 42.4 / 140.7 |
+
+    **+1.27 pp over its own base** -- the same order as resid3's +1.1 pp on the paper env -- and the run still
+    DECAYS after its peak (58.89 -> 48.54 %), so `best.pt` is what ships.  The rule this session adds to the
+    residual recipe: **match the exploration std to the base's robustness, not to the recipe.**  A useful proxy
+    is the very first training window: if its success is more than ~10 pp below the base's deterministic score,
+    the residual is being trained at the wrong operating point and will not transfer back.
+    Shipped: `rl/weights/resid_v3_best.{pt,json,onnx}` (+ `.plan` built on GPU 0, untracked): obs_dim 54,
+    max|trt-torch| 3.75e-05, 148 us/call on the A5000.  **Deploying it needs
+    `rl/real_policy_ctrl.py DQ_MAX_DEG = 3.0` and an observation builder extended to the 54-D layout, plus the
+    camera-mount caveat above.**
