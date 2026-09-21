@@ -48,13 +48,22 @@ class PaperPickEnv(PickEnv):
                  sigma_reach=0.25, sigma_c=0.10, sigma_f=0.02, h_min=0.02,
                  lambda_max=0.02, goal_z=(0.05, 0.25), succ_tol=0.035, grasp_shaping=True,
                  w_press=0.5, w_seal=2.0, obs_ee=True, reach_target="grasp", lift_dense=True,
-                 w_time=0.0, **kw):
+                 w_time=0.0, obs_obj_err=False, obj_err_xy=0.015, obj_err_jit=0.005,
+                 obj_err_top=(-0.06, 0.02), obj_err_p=1.0,
+                 place_phase=False, place_dwell=5, place_rate=0.015, place_dq_deg=1.2,
+                 place_floor=0.004, place_settle=5, place_tol=0.035, **kw):
         self.paper = dict(ep_len=int(ep_len), w_reach=w_reach, w_lift=w_lift, w_track_c=w_track_c,
                           w_track_f=w_track_f, sigma_reach=sigma_reach, sigma_c=sigma_c, sigma_f=sigma_f,
                           h_min=h_min, lambda_max=lambda_max, goal_z=tuple(goal_z), succ_tol=succ_tol,
                           start=start, grasp_shaping=bool(grasp_shaping), w_press=w_press, w_seal=w_seal,
                           obs_ee=bool(obs_ee), reach_target=reach_target, lift_dense=bool(lift_dense),
-                          w_time=float(w_time))
+                          w_time=float(w_time), obs_obj_err=bool(obs_obj_err),
+                          obj_err_xy=float(obj_err_xy), obj_err_jit=float(obj_err_jit),
+                          obj_err_top=tuple(obj_err_top), obj_err_p=float(obj_err_p),
+                          place_phase=bool(place_phase), place_dwell=int(place_dwell),
+                          place_rate=float(place_rate), place_dq=float(np.radians(place_dq_deg)),
+                          place_floor=float(place_floor), place_settle=int(place_settle),
+                          place_tol=float(place_tol))
         self.reg_lambda = 0.0                     # set by the trainer: lambda(t) curriculum
         self._paper_ready = False
         super().__init__(nworld=nworld, device=device, seed=seed, xml=xml, mode="pnp", dr=dr,
@@ -68,6 +77,27 @@ class PaperPickEnv(PickEnv):
         self.t_seal = torch.full((N,), float(self.paper["ep_len"]), device=device)
         self.t_goal = torch.full((N,), float(self.paper["ep_len"]), device=device)
         self.ep_comp_p = torch.zeros(N, len(self.RKEYS_PAPER), device=device)
+        # TRACKER-ERROR DR (off by default; PLAN_QPLANNING "NEW tracker error DR").
+        # Per-episode 3-D error of the OBSERVED object position only -- the physics, the seal
+        # test and the success metric all keep using the true pose.  Real numbers it stands in
+        # for: the colour/depth tracker's +-16 mm xy bias (FINDINGS 21) and camera tops that
+        # read 1-6 cm low (FINDINGS 20/23).
+        self.obj_err = torch.zeros(N, 3, device=device)
+        self.noise_gen = None       # optional torch.Generator for obs noise / jitter (see qplan)
+        # SCRIPTED PLACE PHASE (off by default).  Mirrors what rl/real_policy_ctrl.py does on the
+        # robot once the policy has the object at the goal: dwell, straight-down descent at the
+        # CURRENT tcp xy (the arm places where the object actually is, not where the goal is),
+        # release on contact with the table, settle.  With it on, "success" is the object RESTING
+        # on the table within place_tol of the goal xy after the cup let go -- so the arrival
+        # height and the lateral error cost real decisions and the critic's time head has
+        # something to optimise.  pstate: 0 policy, 1 descending, 2 settling, 3 done.
+        self.pstate = torch.zeros(N, dtype=torch.long, device=device)
+        self.goal_run = torch.zeros(N, dtype=torch.long, device=device)
+        self.settle_run = torch.zeros(N, dtype=torch.long, device=device)
+        self.desc_run = torch.zeros(N, dtype=torch.long, device=device)
+        self.t_placed = torch.full((N,), float(self.paper["ep_len"]), device=device)
+        self.placed_ok = torch.zeros(N, dtype=torch.bool, device=device)
+        self.place_err = torch.zeros(N, device=device)
         self._paper_ready = True
         self.reset(torch.ones(N, dtype=torch.bool, device=device))
 
@@ -101,21 +131,162 @@ class PaperPickEnv(PickEnv):
         self.ep_comp_p[idx] = 0.0
         self.t_seal[idx] = float(self.paper["ep_len"])
         self.t_goal[idx] = float(self.paper["ep_len"])
+        self.pstate[idx] = 0
+        self.goal_run[idx] = 0
+        self.settle_run[idx] = 0
+        self.desc_run[idx] = 0
+        self.t_placed[idx] = float(self.paper["ep_len"])
+        self.placed_ok[idx] = False
+        self.place_err[idx] = 0.0
+        if self.paper["obs_obj_err"]:
+            P = self.paper
+            b = self.rng.uniform(-P["obj_err_xy"], P["obj_err_xy"], size=(n, 2))
+            tz = self.rng.uniform(P["obj_err_top"][0], P["obj_err_top"][1], size=(n, 1))
+            on = (self.rng.random((n, 1)) < P["obj_err_p"]).astype(np.float32)
+            self.obj_err[idx] = torch.tensor(np.concatenate([b, tz], axis=1) * on,
+                                             device=self.device, dtype=torch.float32)
+        else:
+            self.obj_err[idx] = 0.0
+
+    # ---------------- tracker-error DR helper ----------------
+    def _randn(self, shape):
+        g = getattr(self, "noise_gen", None)
+        if g is None:
+            return torch.randn(shape, device=self.device)
+        return torch.randn(shape, device=self.device, generator=g)
+
+    def _obj_err_now(self):
+        """Per-episode bias + per-step jitter of the OBSERVED object position (m)."""
+        j = self.paper["obj_err_jit"]
+        e = self.obj_err
+        if j > 0:
+            e = e + self._randn(e.shape) * j
+        return e
+
+    # ---------------- scripted place phase ----------------
+    def _site_jac(self, eps=1e-3):
+        """Finite-difference FULL (position + orientation) Jacobian of the tcp site, (N, 6, 6).
+
+        mujoco_warp exposes no jacobian array and a CPU IK per world is out of the question at
+        4096 worlds, so the six columns are read off six extra `mjw.forward` calls on perturbed
+        qpos (forward is kinematics only -- ~200x cheaper than a decision's physics) and the
+        state is restored with a final forward before anything else touches `d`.
+
+        The ORIENTATION rows matter: with position alone the null space rotates the wrist during
+        the place descent and the object -- welded a cup radius + half a box below the tcp --
+        swings sideways (measured: 4.4 cm median placement error, 38 % placed).  Holding the cup
+        orientation fixed is also what the deployed controller does (it streams a fixed R_DOWN).
+        """
+        q0 = self.qpos[:, :6].clone()
+        p0 = self.site_xpos[:, self.sid_tcp].clone()
+        R0 = self.xmat_site[:, self.sid_tcp].clone()
+        cols = []
+        for j in range(6):
+            self.qpos[:, j] = q0[:, j] + eps
+            E.mjw.forward(self.m, self.d)
+            dp = (self.site_xpos[:, self.sid_tcp] - p0) / eps
+            dR = torch.einsum("nij,nkj->nik", self.xmat_site[:, self.sid_tcp], R0)
+            w = torch.stack([dR[:, 2, 1] - dR[:, 1, 2],
+                             dR[:, 0, 2] - dR[:, 2, 0],
+                             dR[:, 1, 0] - dR[:, 0, 1]], -1) / (2 * eps)
+            cols.append(torch.cat([dp, w], -1))
+            self.qpos[:, j] = q0[:, j]
+        E.mjw.forward(self.m, self.d)                      # restore
+        return torch.stack(cols, dim=-1)                   # (N, 6, 6)
+
+    def _place_action(self, a):
+        """Override the policy action on worlds that are in the scripted place phase."""
+        P = self.paper
+        N = self.nworld
+        op = self._obj_pos()
+        tcp, _R = self._tcp()
+        d_goal_xy = torch.norm(op[:, :2] - self.goal[:, :2], dim=-1)
+        lift_h = op[:, 2] - float(self.half[2])
+        at_goal = (lift_h > P["h_min"]) & (torch.norm(op - self.goal, dim=-1) < P["succ_tol"])
+        self.goal_run = torch.where(at_goal, self.goal_run + 1, torch.zeros_like(self.goal_run))
+        start = (self.pstate == 0) & self.sealed & (self.goal_run >= P["place_dwell"])
+        self.pstate = torch.where(start, torch.ones_like(self.pstate), self.pstate)
+        desc = self.pstate == 1
+        if not bool((self.pstate > 0).any()):
+            return a
+        out = a.clone()
+        if desc.any():
+            # damped least squares for a pure -z tcp motion at the CURRENT xy
+            J = self._site_jac()
+            # weight the orientation rows so "keep the cup pointing where it points" is enforced
+            # as hard as the descent itself (0.05 m of position error ~ 1 rad of tilt)
+            wgt = torch.tensor([1.0, 1.0, 1.0, 0.05, 0.05, 0.05], device=self.device)
+            J = J * wgt[None, :, None]
+            v = torch.zeros(N, 6, device=self.device)
+            v[:, 2] = -P["place_rate"]
+            A = torch.einsum("nij,nkj->nik", J, J) + 1e-4 * torch.eye(6, device=self.device)
+            dq = torch.einsum("nji,njk->nik", J, torch.linalg.solve(A, v[..., None]))[..., 0]
+            # UNIFORM scaling, never a per-joint clamp: clamping each joint separately rotates
+            # the Cartesian direction, and a place-down that drifts sideways lands the object
+            # off the goal (measured: median placement error 3.0 cm with a per-joint clamp,
+            # 61 % placed; see also FINDINGS "per-joint clamp direction chatter").
+            sc = (P["place_dq"] / dq.abs().amax(-1, keepdim=True).clamp_min(1e-9)).clamp(max=1.0)
+            dq = dq * sc
+            out = torch.where(desc[:, None],
+                              torch.cat([(dq / self.dq_max).clamp(-1, 1),
+                                         torch.ones(N, 1, device=self.device)], -1), out)
+            # release: object bottom on the table, or it stopped descending while pressed down
+            self.desc_run = torch.where(desc, self.desc_run + 1, self.desc_run)
+            bottom = op[:, 2] - float(self.half[2])
+            # contact proxy: the object stopped descending although the cup is still being
+            # driven down (only after 3 decisions, so the drive dead-time cannot fake it)
+            stalled = (self.desc_run > 3) & (self.qvel[:, self.vadr_obj + 2].abs() < 0.005)
+            rel = desc & ((bottom <= P["place_floor"]) | stalled)
+            self.pstate = torch.where(rel, torch.full_like(self.pstate, 2), self.pstate)
+        set_ = self.pstate == 2
+        if set_.any():
+            self.settle_run = torch.where(set_, self.settle_run + 1, self.settle_run)
+            hold = torch.cat([torch.zeros(N, 6, device=self.device),
+                              -torch.ones(N, 1, device=self.device)], -1)
+            out = torch.where(set_[:, None], hold, out)
+            done_now = set_ & (self.settle_run >= P["place_settle"])
+            if done_now.any():
+                spd = torch.norm(self.qvel[:, self.vadr_obj:self.vadr_obj + 3], dim=-1)
+                ok = done_now & (~self.sealed) & (spd < 0.02) & (d_goal_xy < P["place_tol"]) & \
+                     ((op[:, 2] - float(self.half[2])) < 0.02)
+                self.placed_ok = self.placed_ok | ok
+                self.place_err = torch.where(done_now, d_goal_xy, self.place_err)
+                self.t_placed = torch.where(ok & (self.t_placed >= P["ep_len"]),
+                                            self.t_step.float(), self.t_placed)
+                self.pstate = torch.where(done_now, torch.full_like(self.pstate, 3), self.pstate)
+        fin = self.pstate == 3
+        if fin.any():
+            hold = torch.cat([torch.zeros(N, 6, device=self.device),
+                              -torch.ones(N, 1, device=self.device)], -1)
+            out = torch.where(fin[:, None], hold, out)
+        return out
+
+    def step(self, action):
+        if self.paper["place_phase"]:
+            action = self._place_action(action.clamp(-1, 1))
+        return super().step(action)
 
     # ---------------- observation (paper eq. 1) ----------------
     def observe(self):
-        parts = [self.qpos[:, :6], self.qvel[:, :6], self._obj_pos(), self.goal, self.a_prev]
+        # tracker-error DR: the same 3-D error shifts the observed object centre AND the observed
+        # grasp point (a camera that reads the top 5 cm low puts the whole object 5 cm low).
+        # The goal is COMMANDED, not perceived, so it is left alone.
+        e = self._obj_err_now() if (self.paper["obs_obj_err"] and self._paper_ready) else None
+        op = self._obj_pos()
+        parts = [self.qpos[:, :6], self.qvel[:, :6], op if e is None else op + e,
+                 self.goal, self.a_prev]
         if self.paper["obs_ee"]:
             # OBSERVATION EXTENSION (not in the paper): end-effector position, cup axis and the
             # object-relative vector. The paper's 5-DoF SO-101 policy learns FK implicitly; with
             # [q, p_obj] alone our 6-DoF policies plateaued ~10 cm from the object (paper2_*).
             tcp, R = self._tcp()
-            parts += [tcp, R[:, :, 2], self._grasp_point() - tcp]
+            gp = self._grasp_point()
+            parts += [tcp, R[:, :, 2], (gp if e is None else gp + e) - tcp]
         if self.obs_lag:
             parts.append(self.q_target - self.qpos[:, :6])
         obs = torch.cat(parts, dim=-1)
         if self.dr:
-            obs = obs + torch.randn_like(obs) * 0.005
+            obs = obs + self._randn(obs.shape) * 0.005
         return obs
 
     # ---------------- reward (paper eq. 3-7) + termination ----------------
@@ -181,6 +352,16 @@ class PaperPickEnv(PickEnv):
         done = timeout | off
         # success METRIC (paper: final object-goal distance): lifted and within tolerance at episode end
         placed = timeout & lifted & (d_goal < P["succ_tol"])
+        if P["place_phase"]:
+            # the object must be RESTING on the table within place_tol of the goal xy, with the
+            # cup released; worlds still mid-descent at the timeout are judged on the same test.
+            d_goal_xy = torch.norm(op[:, :2] - self.goal[:, :2], dim=-1)
+            spd_o = torch.norm(self.qvel[:, self.vadr_obj:self.vadr_obj + 3], dim=-1)
+            at_timeout = timeout & (~self.sealed) & (spd_o < 0.02) & (d_goal_xy < P["place_tol"]) \
+                & (lift_h < 0.02)
+            placed = self.placed_ok | at_timeout
+            self.place_err = torch.where(timeout & (self.pstate < 3), d_goal_xy, self.place_err)
+            d_goal = d_goal_xy
         comp = torch.stack([C[k] for k in self.RKEYS_PAPER], dim=-1)
         self.ep_comp_p += comp
         r = comp.sum(-1)
@@ -193,8 +374,12 @@ class PaperPickEnv(PickEnv):
                     target_h=self.goal[:, 2].clone(), max_tilt=self.max_tilt.clone(),
                     release_h=self.release_h.clone(), peak_qd=self.peak_qd.clone(),
                     t_seal=self.t_seal.clone(), t_goal=self.t_goal.clone(),
-                    peak_qdd=self.peak_qdd.clone(),
+                    peak_qdd=self.peak_qdd.clone(), at_goal=at_goal.clone(),
+                    lifted=lifted.clone(), obj_err=self.obj_err.clone(),
                     wmode=torch.zeros(N, dtype=torch.long, device=self.device))
+        if P["place_phase"]:
+            info.update(t_placed=self.t_placed.clone(), placed_now=self.placed_ok.clone(),
+                        place_err=self.place_err.clone(), pstate=self.pstate.clone())
         return r, done, info
 
     @property

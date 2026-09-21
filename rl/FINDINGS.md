@@ -541,3 +541,122 @@ raising the weight.
     before/after change detection, udp :9702) correctly flagged the two "nothing moved" runs the D435 verdict had called
     "pushed"; its fixed-cam 3-D localisation still needs the depth-first treatment with many objects. Pi :9999 broadcaster
     died a 4th time (relaunched). README on GitHub main documents the pipeline + curriculum (73e48bc).
+
+25. **Q-Planning on the twin (2026-09-21, `rl/qplan/`, M0-M2 of `policy/PLAN_QPLANNING.md`)**: frozen
+    `resid3_fast_best` + an off-policy Q over 5-decision action chunks (HL-Gauss, 51 bins, two heads,
+    EMA target tau 0.005, H-step bootstrap, gamma 0.99), N chunk proposals re-ranked at 10 Hz. Full
+    numbers, tables and commands in `rl/qplan/README.md`; the load-bearing findings:
+    * **M0 throughput** 3 251 chunked transitions/s at 4096 worlds on the 2080 Ti = **200 k in 62 s**
+      (target was 10 min). Episodes are stored as TRAJECTORIES (14.6 kB each in fp16); a 4096-world
+      batch is 59 MB and carries 614 400 overlapping chunked transitions.
+    * **Q_time became a copy of Q_succ** when the buffer was pi + open-loop proposals only: every
+      deviation in that buffer is a deviation that FAILS (18 % success), so "chunk deviates" and
+      "episode is slow" are the same feature, Q_time ranked pi's own chunk fastest everywhere, and
+      the planner moved `t_goal` by **0.00 s**. Fixed by a new collector mode (`--mode scale`: a
+      blanket joint scale in [0.6, 1.6] held for an episode or a 10-15 decision segment, 42 %
+      success) -- episodes that still mostly succeed but finish at measurably different times. The
+      scale ladder then has a real interior optimum, **1.15 x pi before the seal and 1.30 x after**,
+      and post-seal Q_succ is monotone increasing in the scale up to 1.7.
+    * **The proposal set must keep the speed axis clean.** The plan scales "the 16's first four"
+      gaussian candidates by 0.7/1.2/1.4, which entangles speed with noise; replacing those twelve
+      slots with a PURE ladder of pi's own chunk (0.7/0.85/1.15/1.3/1.5/1.7) moved `t_goal`
+      **-0.76 s** the same day. `N = 16` beats `N = 32` for the same reason (at 16 the structured
+      slots ARE the ladder). Best planner: **N=16, lambda=0.1, succ_frac=0.9 -> 99.02 % vs pi's
+      97.17 % (+1.85 pp), t_goal 7.14 s vs 7.73 s (-0.59 s)**, reproduced on a second seed.
+      Tightening the success band HURTS (0.97 -> 95.2 %): with 2-3 survivors the softmax is forced
+      to trust Q_succ differences below the critic's own error.
+    * **Planning quality is an inverted U in the number of TD steps while calibration rises
+      monotonically.** Same fixed buffer, 2.5k/5k/10k/20k/40k/60k steps -> 26.8/90.0/95.1/**98.8**/
+      97.6/95.3 % success, while the held-out Q_succ correlation goes 0.810 -> 0.835 throughout.
+      This is the whole M2 story: the plan's loop warm-starts and adds 10 k steps per iteration, so
+      iteration 10 is 120 k steps, and success decayed 98.4 -> 96.6 % and `t_goal` 7.59 -> 8.84 s
+      across ten iterations **while the critic's calibration bias went to zero**. The useful signal
+      for RANKING chunks is an early-training artefact of the value function, not its fixed point;
+      select the critic by the paired eval (`rl/qplan/steps_curve.py`), never by TD loss.
+    * **M2 plateaus at iteration 0 and the gate fails.** Three loops all peak at or below the offline
+      critic (best iteration, success vs its own paired pi / t_goal vs pi / peak qd p90):
+      **iteration 0** 98.83 % (+1.76 pp) / 7.20 s (-0.58 s) / 48.1; **v1** (plan recipe, 10 k warm
+      steps per iteration) iter 2, 98.73 % (+1.76) / 7.76 s (-0.03) / 51.6, then a monotone decay to
+      96.58 % / 8.84 s by iteration 10; **v3** (2.5 k steps at lr 1e-4, >=35 % fixed-pool batches,
+      velocity cap, early stop) iter 4, 96.97 % (+0.20) / 8.35 s (+0.57 WORSE) / 47.9; **v5**
+      (retrain from scratch, 20 k steps per iteration) iter 3, 98.73 % (+2.15) / 7.93 s (-0.14) /
+      52.2, sequence 97.66/98.54/**98.73**/98.05/98.05/98.14 %. Retraining from scratch removes the
+      decay but not the flatness: 20 k from scratch on M0 alone gives +1.76 pp, on M0 + four planner
+      deployments +1.56 pp -- **the online episodes carry no new information**. Cause, with evidence:
+      every non-placed episode of pi is a non-SEALED one (seal 97.3 %, success 96.9 %), and a seal the
+      drive DR makes geometrically impossible is not recoverable by re-weighting chunks of the same
+      policy. The paper's own stated limit, proposal support, is what binds -- every proposal is a
+      scaled or jittered pi chunk, so the reachable set is a tube around pi.
+    * **The peak-speed criterion and the cycle-time criterion are mutually exclusive here.** Two
+      independent knobs trace the same front: lambda 0.05 -> 1.0 gives `t_goal` 7.14 -> 7.75 s and
+      peak |qd| p90 48.5 -> 46.9, and capping the executed chunk's peak commanded speed at
+      1.05/1.15/1.30 x pi's gives 8.13/7.65/7.40 s at 43.9/46.2/47.7 deg/s. p90 never goes below
+      ~47 even when the planner is SLOWER than pi, because the executed chunk is a weighted MIXTURE
+      that changes more between decisions than pi's own smooth output and the accel-capped drive
+      turns that into peak speed. Nothing in Q prices joint speed -- the fix is a THIRD HL-Gauss head
+      on a per-decision speed-excess reward (the Q analogue of `--w_speed`), not tuning. A hard
+      velocity MASK on candidates is the wrong shape of fix: candidates are clamped to [-1,1], so
+      where pi saturates the fast ladder entries equal pi and survive while where pi is slow they are
+      dropped -- the survivor set is biased slow and `t_goal` got WORSE than pi (8.39 s). Cap the
+      executed chunk after the mixing instead.
+    * **Twin peak |qd| over-reads the robot by ~25 %** (FINDINGS 22: 43.6 deg/s p90 here, 22-34 on
+      the arm), so the twin-side speed criterion is relative (planner <= pi p90 + 2 deg/s), reported
+      alongside the absolute 36 deg/s firmware ceiling.
+    * **NEW tracker-error DR** (`env_paper.PaperPickEnv(obs_obj_err=True)`, OFF by default): +-15 mm
+      xy bias, +-5 mm jitter, -6..+2 cm top error on the OBSERVED object only. At the plan's
+      magnitudes it is a different task, not a perturbation: pi 96.7 % -> **18.8 %** (xy only 62.3 %,
+      top only 29.5 %, half magnitudes 52.0 %). The twin's seal test needs the cup tip within 12 mm
+      (DR'd 9.6-14.4) of the object-top centre, so a +-15 mm bias makes a seal geometrically
+      impossible on a large share of episodes, so it is not part of the gated protocol. **Training
+      the critic on tracker-DR data is worse than useless**: the bias is unobservable from o_t, so
+      the same observation carries wildly different outcomes, the head absorbs the variance
+      (predicted success at t=0 **-40 %** against a realised 12.9 %) and the planner it drives falls
+      BELOW pi (17.3 % -> 10.2 %). The CLEAN critic `q0b`, which scores the observed state as if it
+      were true, still helps: pi 16.7 % -> planner 19.8 % (+3.1 pp) -> best-of-N 22.7 % (+6.0 pp),
+      aggressive selection paying here because pi's approach is what is failing. So Q-planning is
+      not helpless under an unobservable state error -- but the data containing the error is poison
+      for the critic, and the factor really needs an observable cue (multi-frame tracker
+      disagreement, force feedback, a probing motion).
+    * **Scripted PLACE phase in the twin** (`place_phase=True`, OFF by default, ep_len 180): after
+      `at_goal` holds 5 decisions the env descends the tcp straight down at the CURRENT xy
+      (damped-least-squares on a finite-difference site Jacobian, 1.5 cm/decision, <= 1.2 deg on the
+      largest joint), releases when the object bottom is within 4 mm of the table or stops
+      descending, settles 5 decisions; `placed` = released AND resting within 3.5 cm of the goal XY.
+      Two implementation lessons, both measured: a **per-joint** clamp on the IK step rotates the
+      Cartesian direction (61 % placed, 3.0 cm median error) -- scale the whole `dq` uniformly; and
+      the **orientation rows of the Jacobian are load-bearing** -- with position only the null space
+      rotates the wrist and the object, welded a cup radius below the tcp, swings out (38 % placed,
+      4.4 cm error) versus 85.6 % and 1.9 cm with the full 6-D Jacobian. pi places 82.9-86.6 %
+      (+-1.9 pp run-to-run: a 1.9 cm median error against a 3.5 cm threshold puts many episodes on
+      the boundary). Across TD budgets 20 k/40 k/80 k the planner scores -4.5/+3.3/-1.2 pp on
+      PLACEMENTS -- inside the noise -- but lifts the SEAL rate 97.3 -> 99.1-99.2 % well outside it,
+      and does not move `t_placed` at all (the descent is fixed-rate and starts after the dwell).
+      best-of-N drops 20 pp: a hard argmax on Q_time at the moment of arrival trades away exactly the
+      lateral precision the release needs. With the real end of the cycle in the loop the binding
+      constraint is the lateral accuracy of the arrival, not chunk timing.
+    *Commands* (GPU 1 unless noted; nothing here ever touches the robot):
+
+        PY=~/miniconda3/envs/mjwarp/bin/python
+        CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/collect.py --nworld 4096 --batches 2 --mode pi      --tag m0  --seed 0
+        CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/collect.py --nworld 4096 --batches 2 --mode explore --p_explore 0.15 --tag m0 --seed 5
+        CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/collect.py --nworld 4096 --batches 2 --mode scale --scale_lo 0.6 --scale_hi 1.6 --p_explore 0.08 --tag m0 --seed 30
+        CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/collect.py --nworld 4096 --batches 2 --mode scale --scale_lo 0.8 --scale_hi 1.5 --seg 15 --p_explore 0.08 --tag m0b --seed 40
+        CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/critic.py  --data ~/pnp_rl/qplan/data --steps 20000 --batch 4096 --out ~/pnp_rl/qplan/q0b
+        CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/planner.py --eval --q ~/pnp_rl/qplan/q0b/q.pt --nworld 1024 --which full   --out ~/pnp_rl/qplan/m1_ablation_it3.json
+        CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/planner.py --eval --q ~/pnp_rl/qplan/q0b/q.pt --nworld 1024 --which sweep  --out ~/pnp_rl/qplan/m1_sweep.json
+        CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/planner.py --eval --q ~/pnp_rl/qplan/q0b/q.pt --nworld 1024 --which pareto --seed 1 --out ~/pnp_rl/qplan/m1_pareto.json
+        CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/planner.py --eval --q ~/pnp_rl/qplan/q0b/q.pt --nworld 1024 --which velcap --out ~/pnp_rl/qplan/m1_velcap.json
+        CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/diag.py       --q ~/pnp_rl/qplan/q0b/q.pt --nworld 512
+        CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/steps_curve.py --data ~/pnp_rl/qplan/data --steps 2500 5000 10000 20000 40000 --nworld 1024
+        CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/iterate.py --iters 10 --q ~/pnp_rl/qplan/q0b/q.pt --data ~/pnp_rl/qplan/data \
+            --q_steps 10000 --n_cand 16 --lam 0.1 --vel_margin 0 --out ~/pnp_rl/qplan            # v1, the plan as written
+        CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/iterate.py --iters 10 --q ~/pnp_rl/qplan/q0b/q.pt --data ~/pnp_rl/qplan/data \
+            --fixed_data ~/pnp_rl/qplan/data_objerr --q_steps 2500 --fixed_frac 0.35 --lr 1e-4 --patience 2 \
+            --vel_margin 1.2 --vel_mode cap --n_cand 16 --lam 0.1 --out ~/pnp_rl/qplan/v3        # corrected
+        CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/iterate.py --iters 6 --q ~/pnp_rl/qplan/q0b/q.pt --data ~/pnp_rl/qplan/data \
+            --q_steps 20000 --fresh --fixed_frac 0.35 --patience 3 --vel_margin 0 --n_cand 16 --lam 0.1 --out ~/pnp_rl/qplan/v5
+        # tracker-error DR and the scripted place phase
+        CUDA_VISIBLE_DEVICES=0 $PY rl/qplan/collect.py --nworld 4096 --batches 2 --mode pi --obj_err 1 --tag oe --seed 20 --out ~/pnp_rl/qplan/data_objerr
+        CUDA_VISIBLE_DEVICES=0 $PY rl/qplan/collect.py --nworld 4096 --batches 2 --ep_len 180 --place_phase 1 --mode pi --tag p0 --seed 0 --out ~/pnp_rl/qplan/data_place
+        CUDA_VISIBLE_DEVICES=0 $PY rl/qplan/steps_curve.py --data ~/pnp_rl/qplan/data_place --steps 10000 20000 40000 --nworld 1024 --ep_len 180 --place_phase 1
+        CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/plot_final.py                                        # -> ~/pnp_rl/qplan/iterations.png
