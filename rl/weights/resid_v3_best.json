@@ -1,0 +1,15 @@
+{
+ "ckpt": "/home/lisc-frank/Desktop/2026/pick_and_place/rl/weights/resid_v3_best.pt",
+ "obs_dim": 54,
+ "arch": "paper",
+ "step": 7372800,
+ "success": 0.3619652406417112,
+ "residual_base": "/home/lisc-frank/pnp_rl/dagger_v3/best.pt",
+ "residual_bound": 0.3,
+ "base_scale": 0.6667,
+ "dq_max_deg": 3.0,
+ "fp16": false,
+ "max_abs_err_trt": 3.75211238861084e-05,
+ "trt_us": 157.76697546243668,
+ "obs_layout": "q[6] qd[6] p_obj[3] p_goal[3] a_prev[7] tcp[3] cup_axis[3] grasp_rel[3] (q_target-q)[6] obj_half[3] obj_shape_onehot[3] obj_mass[1] dist_rel_tcp[3] dist_half[3] n_dist_over_3[1]"
+}
