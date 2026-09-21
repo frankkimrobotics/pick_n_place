@@ -17,9 +17,13 @@ Everything is env_v2 (diverse objects, big table, walls, measured drive) except:
       `p_post` (0.5) one of them is a TALL POST 0.10-0.25 m high.  Placement is rejection
       sampling: on the table, clear of the base and the bin, >= 6 cm from the target and
       >= 6 cm from the goal xy, >= 4 cm from the other distractors, and -- in `p_corridor`
-      (70 %) of the worlds -- at least one of them sits ON the straight target->goal
-      corridor (perpendicular offset <= 6 cm, 30-70 % along the segment).  The post takes
-      that slot whenever there is one.
+      (0.80) of the worlds -- at least one of them sits ON the straight target->goal
+      corridor (perpendicular offset <= 6 cm, 22-78 % along the segment, clipped to the band
+      that can also keep the size-aware end clearance).  The post takes that slot whenever
+      there is one.  `p_corridor` is the INTENT: about 12 % of those worlds have no feasible
+      corridor spot at all (the segment is short and the bodies are large), so 0.80 is what
+      delivers the 70 % MEASURED occupancy the task specifies (measured 68.7 % at 1024
+      worlds; p_corridor 0.70 delivered only 61.3 %).
       Like the target object in env_v2, the shape is selected per world from TWO geoms on
       ONE body (box + cylinder) by shrinking the inactive one to a 1 mm stub; sizes, mass,
       inertia and colour are written through the batched warp Model fields.  An INACTIVE
@@ -63,7 +67,8 @@ SCENE_V3 = B.OUT_XML_V3
 SPAWN_V3 = (0.20, 0.56, -0.35, 0.35)
 GOAL_X_V3 = (0.18, 0.52)          # back wall x = -0.30 -> >= 0.48 m clear
 GOAL_Y_V3 = (-0.33, 0.33)         # side walls y = +-0.50 -> >= 0.17 m clear
-GOAL_MIN = 0.18                   # minimum |goal - object| xy (a corridor needs the room)
+GOAL_MIN = 0.20                   # minimum |goal - object| xy (a corridor needs the room)
+TARGET_MAX_V3 = 0.32              # maximum |goal - object| xy
 
 # ---- (b) distractors ---------------------------------------------------------
 N_DIST = B.N_DIST                 # bodies in the scene
@@ -74,10 +79,10 @@ N_DIST = B.N_DIST                 # bodies in the scene
 # therefore max(6 cm, r_distractor + r_object + SIZE_PAD).
 DIST_CLEAR_TGT = 0.06             # >= 6 cm from the target (centre to centre)
 DIST_CLEAR_GOAL = 0.06            # >= 6 cm from the goal xy
-SIZE_PAD = 0.05                   # surface clearance added on top of the two radii
+SIZE_PAD = 0.03                   # surface clearance added on top of the two radii
 DIST_CLEAR_EACH = 0.04            # >= 4 cm between distractors (plus their radii)
 CORRIDOR_OFF = 0.06               # "on the corridor" = perpendicular offset <= 6 cm
-CORRIDOR_T = (0.30, 0.70)         # fraction along the target->goal segment
+CORRIDOR_T = (0.22, 0.78)         # fraction along the target->goal segment
 DISP_TOL = 0.01                   # displaced > 1 cm = failure
 
 
@@ -86,8 +91,8 @@ class ObstacleEnv(DiverseEnv):
 
     def __init__(self, nworld=1024, device="cuda:0", seed=0, xml=None,
                  spawn=SPAWN_V3, obstacles=False, n_dist=(1, 3), p_post=0.5,
-                 p_corridor=0.7, goal_min=GOAL_MIN, disp_tol=DISP_TOL,
-                 njmax=256, nconmax=160, **kw):
+                 p_corridor=0.80, goal_min=GOAL_MIN, disp_tol=DISP_TOL,
+                 njmax=256, nconmax=160, target_max=TARGET_MAX_V3, **kw):
         self._v3_ready = False
         self.obstacles = bool(obstacles)
         self.n_dist_range = (int(n_dist[0]), int(n_dist[1])) if not isinstance(n_dist, int) else (int(n_dist), int(n_dist))
@@ -107,7 +112,7 @@ class ObstacleEnv(DiverseEnv):
         self.n_act = torch.zeros(nworld, device=device)
         self.obst_hit_ep = torch.zeros(nworld, dtype=torch.bool, device=device)
         super().__init__(nworld=nworld, device=device, seed=seed, xml=xml, spawn=spawn,
-                         njmax=njmax, nconmax=nconmax, **kw)
+                         njmax=njmax, nconmax=nconmax, target_max=target_max, **kw)
         # ---- distractor ids -------------------------------------------------
         import mujoco
         M, nid = self.mjm, mujoco.mj_name2id
@@ -185,17 +190,23 @@ class ObstacleEnv(DiverseEnv):
                 continue
             r = rad[:, k]
             if k == 0:
-                # corridor candidates first, free candidates as the tail (fallback)
-                t = rng.uniform(*CORRIDOR_T, size=(n, tries))
-                o = rng.uniform(-CORRIDOR_OFF, CORRIDOR_OFF, size=(n, tries))
+                # corridor candidates first, free candidates as the tail (fallback).
+                # The fraction along the segment is clipped to the band that can satisfy the
+                # size-aware end clearance: a fixed U(0.3, 0.7) put most candidates inside the
+                # target's or the goal's keep-out and dropped corridor occupancy to 17 %.
+                pad_l = (np.maximum(DIST_CLEAR_TGT, r + obj_rad + SIZE_PAD) + 0.005) / L
+                lo = np.clip(np.maximum(CORRIDOR_T[0], pad_l), 0.05, 0.5)
+                hi = np.clip(np.minimum(CORRIDOR_T[1], 1.0 - pad_l), 0.5, 0.95)
+                lo, hi = np.minimum(lo, hi), np.maximum(lo, hi)
+                nc = 3 * tries                      # the corridor slot gets more attempts
+                t = lo[:, None] + (hi - lo)[:, None] * rng.random((n, nc))
+                o = rng.uniform(-CORRIDOR_OFF, CORRIDOR_OFF, size=(n, nc))
                 cx = obj_xy[:, 0:1] + t * seg[:, 0:1] + o * perp[:, 0:1]
                 cy = obj_xy[:, 1:2] + t * seg[:, 1:2] + o * perp[:, 1:2]
                 fx = rng.uniform(B.TABLE_X2[0], B.TABLE_X2[1], size=(n, tries))
                 fy = rng.uniform(B.TABLE_Y2[0], B.TABLE_Y2[1], size=(n, tries))
-                cand_x = np.where(want_corr[:, None], cx, fx)
-                cand_y = np.where(want_corr[:, None], cy, fy)
-                cand_x = np.concatenate([cand_x, fx], 1)
-                cand_y = np.concatenate([cand_y, fy], 1)
+                cand_x = np.concatenate([np.where(want_corr[:, None], cx, np.tile(fx, (1, 3))), fx], 1)
+                cand_y = np.concatenate([np.where(want_corr[:, None], cy, np.tile(fy, (1, 3))), fy], 1)
             else:
                 cand_x = rng.uniform(B.TABLE_X2[0], B.TABLE_X2[1], size=(n, tries))
                 cand_y = rng.uniform(B.TABLE_Y2[0], B.TABLE_Y2[1], size=(n, tries))
@@ -215,7 +226,7 @@ class ObstacleEnv(DiverseEnv):
             xy[sel, k, 1] = cand_y[np.arange(n), first][sel]
             spec["act"][live & ~got, k] = False              # no legal spot -> park this slot
             if k == 0:
-                n_corr = int((sel & want_corr & (first < tries)).sum())
+                n_corr = int((sel & want_corr & (first < 3 * tries)).sum())
         spec["n_act"] = spec["act"].sum(1)
         self._last_corr_frac = n_corr / max(1, n)
         return xy
