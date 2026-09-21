@@ -1,0 +1,13 @@
+{
+ "ckpt": "/home/lisc-frank/Desktop/2026/pick_and_place/rl/weights/resid1_real_best.pt",
+ "obs_dim": 40,
+ "arch": "paper",
+ "step": 7864320,
+ "success": 0.9354838709677419,
+ "residual_base": "/home/lisc-frank/pnp_rl/dagger6_real/bc_iter10.pt",
+ "residual_bound": 0.3,
+ "fp16": false,
+ "max_abs_err_trt": 3.927946090698242e-05,
+ "trt_us": 185.97394227981567,
+ "obs_layout": "q[6] qd[6] p_obj[3] p_goal[3] a_prev[7] tcp[3] cup_axis[3] grasp_rel[3] (q_target-q)[6]"
+}

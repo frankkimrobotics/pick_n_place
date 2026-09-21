@@ -1,0 +1,11 @@
+{
+ "ckpt": "/home/lisc-frank/Desktop/2026/pick_and_place/rl/weights/paper14_real_best.pt",
+ "obs_dim": 40,
+ "arch": "paper",
+ "step": 2457600,
+ "success": 0.17724609375,
+ "fp16": false,
+ "max_abs_err_trt": 1.5616416931152344e-05,
+ "trt_us": 135.26249676942825,
+ "obs_layout": "q[6] qd[6] p_obj[3] p_goal[3] a_prev[7] tcp[3] cup_axis[3] grasp_rel[3] (q_target-q)[6]"
+}

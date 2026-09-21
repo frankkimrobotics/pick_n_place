@@ -1,0 +1,11 @@
+{
+ "ckpt": "/home/lisc-frank/Desktop/2026/pick_and_place/rl/weights/dagger5_real_iter7.pt",
+ "obs_dim": 40,
+ "arch": "paper",
+ "step": 0,
+ "success": null,
+ "fp16": false,
+ "max_abs_err_trt": 3.17541416734457e-05,
+ "trt_us": 147.82603830099106,
+ "obs_layout": "q[6] qd[6] p_obj[3] p_goal[3] a_prev[7] tcp[3] cup_axis[3] grasp_rel[3] (q_target-q)[6]"
+}
