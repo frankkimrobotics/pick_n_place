@@ -342,7 +342,7 @@ class PiLink:
 class SimLink:
     """Same interface backed by PaperPickEnv (1 world, measured drive, no DR) for --selftest."""
 
-    def __init__(self, drive="real", nworld=1):
+    def __init__(self, drive="real", nworld=1, dq_max_deg=None):
         import torch
         import warp as wp
         wp.init()
@@ -351,6 +351,12 @@ class SimLink:
         self.N = nworld
         self.env = PaperPickEnv(nworld=nworld, device="cuda:0", xml=os.path.join(HERE, "scenes", "box_med.xml"), dr=False, drive=drive, ep_len=150,
                                 grasp_shaping=True, obs_ee=True, reach_target="grasp", lift_dense=True, w_reach=0.5, w_track_c=4, w_track_f=8)
+        if dq_max_deg is not None:
+            # the env's default is 2 deg/decision; a policy trained at another dq_max (the
+            # residual stack and the Q-planner run at 3) must be simulated at ITS value or the
+            # controller's q_target integration and the simulator disagree -- the selftest then
+            # reports 0 % with a 28 deg command-vs-measured lag.
+            self.env.dq_max = float(np.radians(dq_max_deg))
         self.env.auto_reset = False
         self.exec = True
         self.clock_offset = 0.0
@@ -892,7 +898,7 @@ def main():
         # integration go through the SAME code as the robot path (ObsBuilder.build, tanh policy,
         # q_target += a*dq_max), only the drive/physics is the simulator's
         N = a.episodes
-        link = SimLink(a.drive, nworld=N)
+        link = SimLink(a.drive, nworld=N, dq_max_deg=a.dq_max)
         p_obj, p_goal = link.obj(), link.goal()
         q, qd, _ = link.state()
         q_target = q.copy()

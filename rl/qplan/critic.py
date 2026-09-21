@@ -30,9 +30,11 @@ import torch.nn as nn
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from common import (ACT_DIM, CHUNK_DIM, DATA_ROOT, GAMMA, H, HLG_SIGMA_BINS, N_BINS,  # noqa: E402
-                    OBS_DIM, R_TIME_W, V_RANGE, V_RANGE_PLACE)
+                    OBS_DIM, R_TIME_W, V_RANGE, V_RANGE_PLACE, V_SOFT, speed_excess)
 
-HEADS = ("succ", "time")
+# The head set is taken from the checkpoint's `v_range` (QChunk.head_names), so a two-head critic
+# trained before the speed head existed still loads and still runs the planner.
+HEADS = ("succ", "time", "speed")
 
 
 # --------------------------------------------------------------------------- HL-Gauss
@@ -71,14 +73,29 @@ def mlp(inp, out, hidden=(512, 512, 256)):
 
 
 class QChunk(nn.Module):
+    """Shared trunk + one HL-Gauss head per value.
+
+    `sep_speed=True` gives the SPEED head its own trunk.  Measured (README "Speed head"): with a
+    shared trunk the third head's gradients cost the ranking quality of the other two -- the same
+    planner that scored 99.0 % on the two-head critic scores 97.7 % on the three-head one -- while
+    a separate trunk leaves succ/time exactly as they were and prices speed just as well.
+    """
+
     def __init__(self, obs_dim=OBS_DIM, chunk_dim=CHUNK_DIM, hidden=(512, 512, 256),
-                 n_bins=N_BINS, v_range=None):
+                 n_bins=N_BINS, v_range=None, sep_speed=False):
         super().__init__()
         v_range = V_RANGE if v_range is None else v_range
         self.v_range = {k: tuple(v) for k, v in v_range.items()}
+        # ORDER matters (the trunk's output slice is positional): always succ, time, speed.
+        self.head_names = tuple(k for k in HEADS if k in self.v_range)
         self.obs_dim, self.chunk_dim, self.n_bins = obs_dim, chunk_dim, n_bins
-        self.trunk = mlp(obs_dim + chunk_dim, n_bins * len(HEADS), hidden=hidden)
-        self.heads = nn.ModuleDict({k: HLGauss(*v_range[k], n_bins=n_bins) for k in HEADS})
+        self.sep_speed = bool(sep_speed) and "speed" in self.head_names
+        self.main_heads = tuple(k for k in self.head_names if not (self.sep_speed and k == "speed"))
+        self.trunk = mlp(obs_dim + chunk_dim, n_bins * len(self.main_heads), hidden=hidden)
+        if self.sep_speed:
+            self.trunk_v = mlp(obs_dim + chunk_dim, n_bins, hidden=hidden)
+        self.heads = nn.ModuleDict({k: HLGauss(*self.v_range[k], n_bins=n_bins)
+                                    for k in self.head_names})
         self.register_buffer("obs_mean", torch.zeros(obs_dim))
         self.register_buffer("obs_std", torch.ones(obs_dim))
 
@@ -89,11 +106,15 @@ class QChunk(nn.Module):
     def logits(self, obs, chunk):
         x = torch.cat([(obs - self.obs_mean) / self.obs_std, chunk], -1)
         z = self.trunk(x)
-        return {k: z[..., i * self.n_bins:(i + 1) * self.n_bins] for i, k in enumerate(HEADS)}
+        out = {k: z[..., i * self.n_bins:(i + 1) * self.n_bins]
+               for i, k in enumerate(self.main_heads)}
+        if self.sep_speed:
+            out["speed"] = self.trunk_v(x)
+        return out
 
     def forward(self, obs, chunk):
         lg = self.logits(obs, chunk)
-        return {k: self.heads[k].q(lg[k]) for k in HEADS}
+        return {k: self.heads[k].q(lg[k]) for k in self.head_names}
 
     @torch.no_grad()
     def score(self, obs, chunks):
@@ -111,9 +132,10 @@ class QBuffer:
 
     def __init__(self, device="cuda:0", gamma=GAMMA, hor=H):
         self.device, self.gamma, self.H = device, gamma, hor
-        self.obs = self.act = self.atg = None
+        self.obs = self.act = self.atg = self.qex = None
         self.rterm = self.placed = self.group = None
         self.srcs = []
+        self.qex_derived = 0
 
     def add_file(self, path, group=0):
         d = torch.load(path, map_location="cpu", weights_only=False)
@@ -129,17 +151,27 @@ class QBuffer:
         obs = d["obs"].to(dev)
         act = d["act"].to(dev)
         atg = d["at_goal"].to(dev)
+        if "qd_ex" in d:
+            qex = d["qd_ex"].to(dev)
+        else:
+            # shard collected before the speed head existed: recover the per-decision excess from
+            # the stored observation (qd occupies obs[6:12], and obs_{t+1} holds the velocity the
+            # decision-t action produced).  Costs the 0.005 rad/s observation noise; the collector
+            # stores the clean value from now on.
+            qex = speed_excess(obs[:, 1:, 6:12].float(), V_SOFT).half()
+            self.qex_derived += int(obs.shape[0])
         rt = d["r_term"].to(dev).float()
         pl = d["placed"].to(dev).float()
         gp = torch.full((obs.shape[0],), int(group), dtype=torch.int8, device=dev)
         if self.obs is None:
-            self.obs, self.act, self.atg, self.rterm, self.placed, self.group = \
-                obs, act, atg, rt, pl, gp
+            self.obs, self.act, self.atg, self.qex, self.rterm, self.placed, self.group = \
+                obs, act, atg, qex, rt, pl, gp
         else:
             assert obs.shape[1] == self.obs.shape[1], "ep_len mismatch between shards"
             self.obs = torch.cat([self.obs, obs])
             self.act = torch.cat([self.act, act])
             self.atg = torch.cat([self.atg, atg])
+            self.qex = torch.cat([self.qex, qex])
             self.rterm = torch.cat([self.rterm, rt])
             self.placed = torch.cat([self.placed, pl])
             self.group = torch.cat([self.group, gp])
@@ -203,8 +235,10 @@ class QBuffer:
         # rewards
         r_time = -R_TIME_W * (~self.atg[eb, tic]).float() * valid
         r_succ = self.rterm[e][:, None] * (ti == (T - 1)).float()
+        r_speed = -self.qex[eb, tic].float() * valid
         disc = self.gamma ** ar
-        y = {"succ": (r_succ * disc).sum(-1), "time": (r_time * disc).sum(-1)}
+        y = {"succ": (r_succ * disc).sum(-1), "time": (r_time * disc).sum(-1),
+             "speed": (r_speed * disc).sum(-1)}
         # bootstrap
         nt = (t + Hh).clamp(max=T)
         nobs = self.obs[e, nt].float()
@@ -217,16 +251,17 @@ class QBuffer:
         """Exact discounted return from decision t of episode e (for calibration)."""
         T, dev = self.T, self.device
         ar = torch.arange(T, device=dev)
-        outs = []
+        outs, outs_v = [], []
         for i in range(0, e.numel(), chunk):
             ee, tt = e[i:i + chunk], t[i:i + chunk]
             k = ar[None, :] - tt[:, None]                     # (b, T)
             m = (k >= 0).float()
             disc = self.gamma ** k.clamp(min=0).float() * m
             outs.append((-R_TIME_W * (~self.atg[ee]).float() * disc).sum(-1))
-        g_time = torch.cat(outs)
+            outs_v.append((-self.qex[ee].float() * disc).sum(-1))
+        g_time, g_speed = torch.cat(outs), torch.cat(outs_v)
         g_succ = self.rterm[e] * (self.gamma ** (T - 1 - t).float())
-        return {"succ": g_succ, "time": g_time}
+        return {"succ": g_succ, "time": g_time, "speed": g_speed}
 
 
 # --------------------------------------------------------------------------- training
@@ -240,12 +275,12 @@ def ema_(tgt, src, tau):
 
 def train_q(buf, q=None, steps=20000, batch=4096, lr=3e-4, tau=0.005, gamma=GAMMA,
             device="cuda:0", target_chunk="exec", pol=None, seed=0, log_every=1000,
-            log=print, holdout=0.05, fixed_frac=None, v_range=None):
+            log=print, holdout=0.05, fixed_frac=None, v_range=None, sep_speed=False):
     if q is None:
-        q = QChunk(v_range=v_range).to(device)
+        q = QChunk(v_range=v_range, sep_speed=sep_speed).to(device)
         m, s = buf.obs_stats()
         q.set_norm(m, s)
-    qt = QChunk(v_range=q.v_range).to(device)
+    qt = QChunk(v_range=q.v_range, sep_speed=q.sep_speed).to(device)
     qt.load_state_dict(q.state_dict())
     for p in qt.parameters():
         p.requires_grad_(False)
@@ -265,9 +300,9 @@ def train_q(buf, q=None, steps=20000, batch=4096, lr=3e-4, tau=0.005, gamma=GAMM
             else:
                 nc = b["nchunk"]
             qn = qt(b["nobs"], nc)
-            y = {k: b["y"][k] + (1 - b["done"]) * gH * qn[k] for k in HEADS}
+            y = {k: b["y"][k] + (1 - b["done"]) * gH * qn[k] for k in q.head_names}
         lg = q.logits(b["obs"], b["chunk"])
-        losses = {k: q.heads[k].loss(lg[k], y[k]).mean() for k in HEADS}
+        losses = {k: q.heads[k].loss(lg[k], y[k]).mean() for k in q.head_names}
         loss = sum(losses.values())
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -276,16 +311,19 @@ def train_q(buf, q=None, steps=20000, batch=4096, lr=3e-4, tau=0.005, gamma=GAMM
         ema_(qt, q, tau)
         if it % log_every == 0 or it == 1:
             with torch.no_grad():
-                qpred = {k: q.heads[k].q(lg[k]) for k in HEADS}
-                td = {k: float((qpred[k] - y[k]).abs().mean()) for k in HEADS}
-            row = dict(step=it, loss=float(loss), l_succ=float(losses["succ"]),
-                       l_time=float(losses["time"]), td_succ=td["succ"], td_time=td["time"],
-                       q_succ=float(qpred["succ"].mean()), q_time=float(qpred["time"].mean()),
-                       gnorm=float(gn), sec=round(time.time() - t0, 1))
+                qpred = {k: q.heads[k].q(lg[k]) for k in q.head_names}
+                td = {k: float((qpred[k] - y[k]).abs().mean()) for k in q.head_names}
+            row = dict(step=it, loss=float(loss), gnorm=float(gn), sec=round(time.time() - t0, 1))
+            for k in q.head_names:
+                row[f"l_{k}"] = float(losses[k])
+                row[f"td_{k}"] = td[k]
+                row[f"q_{k}"] = float(qpred[k].mean())
             hist.append(row)
-            log(f"[q] {it:6d}/{steps} loss {row['loss']:.4f} (succ {row['l_succ']:.4f} "
-                f"time {row['l_time']:.4f}) |TD| succ {td['succ']:.4f} time {td['time']:.4f} "
-                f"Q succ {row['q_succ']:+.3f} time {row['q_time']:+.3f} [{row['sec']:.0f}s]")
+            log(f"[q] {it:6d}/{steps} loss {row['loss']:.4f} ("
+                + " ".join(f"{k} {row[f'l_{k}']:.4f}" for k in q.head_names) + ") |TD| "
+                + " ".join(f"{k} {td[k]:.4f}" for k in q.head_names) + " Q "
+                + " ".join(f"{k} {row[f'q_{k}']:+.3f}" for k in q.head_names)
+                + f" [{row['sec']:.0f}s]")
     return q, hist
 
 
@@ -303,7 +341,7 @@ def calibrate(q, buf, n=50_000, device="cuda:0", bins=10, seed=0):
     pred = q(b["obs"], b["chunk"])
     mc = buf.mc_return(e, t)
     out = {}
-    for k in HEADS:
+    for k in q.head_names:
         p, g = pred[k].float(), mc[k].float()
         order = torch.argsort(p)
         ps, gs = p[order], g[order]
@@ -326,7 +364,7 @@ def calibrate(q, buf, n=50_000, device="cuda:0", bins=10, seed=0):
 
 def fmt_cal(c):
     s = []
-    for k in HEADS:
+    for k in [k for k in HEADS if k in c]:
         d = c[k]
         s.append(f"[cal] {k:<5} pred {d['pred_mean']:+.4f} real {d['real_mean']:+.4f} "
                  f"bias {d['bias']:+.4f} mae {d['mae']:.4f} rmse {d['rmse']:.4f} corr {d['corr']:.3f}")
@@ -358,6 +396,9 @@ def main():
     ap.add_argument("--target_chunk", default="exec", choices=["exec", "pi"])
     ap.add_argument("--holdout", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--sep_speed", action="store_true",
+                    help="give the speed head its own trunk (keeps succ/time exactly as the "
+                         "two-head critic learned them)")
     ap.add_argument("--place", action="store_true",
                     help="use the wider time support of the ep_len 180 place-phase episodes")
     ap.add_argument("--out", default=os.path.join(DATA_ROOT, "q0"))
@@ -374,11 +415,13 @@ def main():
         pol = load_pi(dev)
     q, hist = train_q(buf, steps=a.steps, batch=a.batch, lr=a.lr, tau=a.tau, gamma=a.gamma,
                       device=dev, target_chunk=a.target_chunk, pol=pol, seed=a.seed,
-                      holdout=a.holdout, v_range=(V_RANGE_PLACE if a.place else V_RANGE))
+                      holdout=a.holdout, v_range=(V_RANGE_PLACE if a.place else V_RANGE),
+                      sep_speed=a.sep_speed)
     cal = calibrate(q, buf, device=dev, seed=a.seed)
     print(fmt_cal(cal), flush=True)
     torch.save(dict(q=q.state_dict(), args=vars(a), hist=hist, cal=cal, v_range=q.v_range,
-                    sources=buf.srcs, episodes=buf.E), os.path.join(a.out, "q.pt"))
+                    sep_speed=q.sep_speed, sources=buf.srcs, episodes=buf.E),
+               os.path.join(a.out, "q.pt"))
     with open(os.path.join(a.out, "train.json"), "w") as f:
         json.dump(dict(args=vars(a), hist=hist, cal=cal, episodes=buf.E,
                        transitions=buf.n_trans), f, indent=1)

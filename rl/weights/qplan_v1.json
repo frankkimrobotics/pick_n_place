@@ -1,0 +1,33 @@
+{
+ "kind": "qplan",
+ "q": "/home/lisc-frank/Desktop/2026/pick_and_place/rl/weights/qplan_v1_critic.pt",
+ "pi": "/home/lisc-frank/Desktop/2026/pick_and_place/rl/weights/resid3_fast_best.pt",
+ "n_cand": 16,
+ "lam": 0.1,
+ "succ_frac": 0.9,
+ "fine": false,
+ "hash_gain": 5.0,
+ "w_speed": 0.0,
+ "speed_margin": 0.4,
+ "ema": 0.7,
+ "rule": "weighted",
+ "noise_seed": 31337,
+ "heads": [
+  "succ",
+  "time",
+  "speed"
+ ],
+ "obs_dim": 40,
+ "fp16": false,
+ "dq_max_deg": 3.0,
+ "gpu": "NVIDIA GeForce RTX 2080 Ti",
+ "max_abs_err_onnx": 4.32133674621582e-06,
+ "max_abs_err_planner": 3.546476364135742e-06,
+ "obs_layout": "q[6] qd[6] p_obj[3] p_goal[3] a_prev[7] tcp[3] cup_axis[3] grasp_rel[3] (q_target-q)[6]",
+ "max_abs_err_trt": 1.8138325214385986,
+ "med_abs_err_trt": 1.7881393432617188e-07,
+ "n_over_1e4": 15,
+ "n_verify": 256,
+ "verify_obs": "m0_pi_b00.pt",
+ "trt_us": 238.66631090641022
+}

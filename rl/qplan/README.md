@@ -17,6 +17,7 @@ critic.py      M1: Q_phi, HL-Gauss heads, replay buffer, H-step bootstrap + EMA 
 planner.py     M1: the planner + the paired deterministic ablation
 diag.py        per-family / scale-ladder diagnostic of what Q believes about a candidate
 iterate.py     M2: deploy -> append -> retrain -> eval, K times, + the curve plot
+export.py      M3: the whole planner as ONE TensorRT graph (obs -> executed action)
 ```
 
 ## Design (and where it deviates from the plan)
@@ -30,11 +31,13 @@ built from. A chunk is 5 × 7 = 35 numbers, flattened.
 |---|---|---|
 | `succ` | 0, except at the last decision: `placed - 0.02 · (final distance in cm)` | [-1.0, 1.2] |
 | `time` | `-0.1` until the object is lifted AND within `succ_tol` of the goal | [-8.0, 0.5] |
+| `speed` | `-sum_j relu(|qd_j| - v_soft) / v_soft`, `v_soft` = 32 deg/s, on the decision-boundary velocity | [-9.0, 0.5] |
 
 γ = 0.99, H-step bootstrap `y = Σ_{i<H} γ^i r_{t+i} + (1-done) γ^H Q̄(o_{t+H}, c_{t+H})`,
 EMA target τ = 0.005, Adam 3e-4, batch 4096. Both heads are HL-Gauss: 51 uniform bins, the
 scalar target projected with a Gaussian kernel of σ = 0.75 bin widths (truncated-normal CDF
-differences, renormalised), cross-entropy loss, `Q = Σ_b v_b softmax_b`. A unit test
+differences, renormalised), cross-entropy loss, `Q = Σ_b v_b softmax_b`. The `speed` head gets its OWN trunk (`--sep_speed`); sharing one costs
+the other two heads more than a point of planner success (§Speed head). A unit test
 (`γ`-decomposition and projection) is in the session notes: the Bellman split is exact to 5e-7
 and HL-Gauss is unbiased to 1.2e-4.
 
@@ -101,6 +104,18 @@ CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/diag.py    --q ~/pnp_rl/qplan/q0b/q.pt --nwo
 # how many TD steps should Q get?  (the answer that explains M2)
 CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/steps_curve.py --data ~/pnp_rl/qplan/data \
     --steps 2500 5000 10000 20000 40000 --nworld 1024
+
+# M3 — the speed head, the exported planner (GPU 1)
+CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/critic.py  --data ~/pnp_rl/qplan/data --steps 20000 --sep_speed --out ~/pnp_rl/qplan/q1sep
+CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/planner.py --eval --q ~/pnp_rl/qplan/q1sep/q.pt --nworld 1024 --which speed  --w_speed 0.25 0.5 1.0 2.0
+CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/planner.py --eval --q ~/pnp_rl/qplan/q1sep/q.pt --nworld 1024 --which spgate --sp_margin 0.05 0.1 0.2 0.4
+CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/planner.py --eval --q ~/pnp_rl/qplan/q1sep/q.pt --nworld 1024 --which smooth --w_speed_pick 0.5 --ema 0.7
+CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/planner.py --eval --q ~/pnp_rl/qplan/q1sep/q.pt --nworld 1024 --which final \
+    --sp_margin_pick 0.4 --ema 0.7 --hash_tab rl/weights/qplan_v1_hash.pt --seed 0     # the exported planner
+CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/export.py --out rl/weights/qplan_v1 --speed_margin 0.4 --ema 0.7
+CUDA_VISIBLE_DEVICES=1 $PY rl/real_policy_ctrl.py --selftest --policy rl/weights/qplan_v1 --episodes 256 --dq_max 3.0
+# the engine is GPU specific -- rebuild it on the controller's GPU with the same command:
+CUDA_VISIBLE_DEVICES=0 $PY rl/qplan/export.py --out rl/weights/qplan_v1 --speed_margin 0.4 --ema 0.7
 
 # M2 — the self-improvement loop (v5: the only recipe that does not decay)
 CUDA_VISIBLE_DEVICES=1 $PY rl/qplan/iterate.py --iters 6 --q ~/pnp_rl/qplan/q0b/q.pt \
@@ -403,13 +418,201 @@ cycle in the loop, chunk re-ranking of this policy buys seals, not placements an
 time; the next lever is lateral accuracy at the goal, which needs either a proposal family that
 moves the arrival point or a place-phase the planner is allowed to shape.**
 
+### Speed head (M3, 2026-09-21) — the M1 gate, passed
+
+> **Which twin these numbers come from.** The sweeps below the M1 gate were measured before
+> `env_warp`'s suction-righting-spring fix (commit `d132356`, landed in the shared tree mid-session)
+> and the M3 gate table after it. Every comparison is PAIRED inside one run -- pi and the planner
+> always see the same env, the same seeds and the same draws -- and pi's own numbers move by less
+> than the run-to-run spread across the change (96.48-97.17 % after, 96.68-97.17 % before), so the
+> two halves are directly comparable. This branch (`qplan-speed`, off `main` at `e80da0e`) does not
+> contain that fix.
+
+
+The M1 gate failed on ONE criterion: peak |qd| p90 48.5 against a budget of pi + 2 = 45.6, and
+§M1 argued the fix had to be a third head rather than more tuning. It is, plus one thing the
+head cannot do on its own.
+
+**The head.** `r_speed(t) = -sum_j relu(|qd_j| - v_soft) / v_soft` with `v_soft` = 32 deg/s,
+evaluated on the decision-boundary joint velocity — the same hinge and the same instant as
+`env_warp._speed_penalty` (`common.speed_excess`). Same bootstrap, same 51-bin HL-Gauss, support
+[-9, 0.5] (the discounted excess is 0 for 93 % of decisions, p99 6.9, p999 14.2 over the M0
+buffer, so 0.5 % of targets clip). `collect.py` now stores it per decision (`qd_ex`); shards
+collected before it existed are recovered from the stored observation (qd is `obs[6:12]` and
+`obs_{t+1}` holds the velocity decision t produced) — **re-collection was not needed**: the
+recovered value agrees with the logged one to 5e-4 in excess units (corr 0.9997), because the
+0.005 rad/s observation noise only matters within 0.3 deg/s of a hinge that is inactive 93 % of
+the time.
+
+**Give the speed head its own trunk.** A third head on the SHARED trunk costs the other two
+their ranking quality, which is invisible in the calibration and obvious in the paired eval:
+
+| critic (20 k TD steps, same M0 buffer) | Q_succ corr | Q_time corr | Q_speed corr | planner with NO speed term |
+|---|---|---|---|---|
+| `q0b`, two heads (§M1) | 0.835 | 0.856 | - | 99.02 % (+1.85 pp) |
+| `q1sp`, three heads, shared trunk | 0.836 | 0.857 | 0.580 | 97.66 % (+0.59 pp) |
+| `q1sep`, three heads, **separate speed trunk** | 0.835 | 0.856 | 0.592 | 98.44 % (+1.66 pp) |
+
+`critic.py --sep_speed` (used for everything below). The speed head is well calibrated either way
+(bias +0.002, mae 0.68) and `diag.py` shows it ranks the scale ladder exactly as it should —
+Q_speed is monotone in the scale, -0.52 at 1.0 x to -1.05 at 1.7 x pre-seal (-0.15 to -0.37
+post-seal), against Q_time differences of only ~0.03 across the same ladder. That ratio is why
+`w_speed` is effective at 0.25-1.0 and crushes the time gain above 2.
+
+**Two ways to spend Q_speed.** Softmax on `Q_time + w_speed * Q_speed`, or softmax on `Q_time`
+alone after dropping candidates whose Q_speed is more than `margin` below the PI CHUNK's
+(`--sp_margin`, a soft gate on the critic's PREDICTED excess — not the hard velocity mask of
+§M1, which biased the survivors slow). 1024 paired episodes each; the gate is success >= pi+1 pp,
+t_goal <= pi-0.3 s, p90 <= pi+2:
+
+| scoring (N=16, lam=0.1, succ_frac=0.9) | success | d success | t_goal | d t_goal | peak qd p90 | gate |
+|---|---|---|---|---|---|---|
+| pi alone | 96.78 % | - | 7.80 s | - | 43.5 | - |
+| no speed term | 98.44 % | +1.66 | 7.23 s | -0.56 | 48.6 | speed |
+| `Q_time + 0.25 Q_speed` | 98.44 % | +1.66 | 7.30 s | -0.50 | 46.2 | speed |
+| **`Q_time + 0.5 Q_speed`** | 98.24 % | +1.46 | 7.39 s | -0.41 | **44.3** | **PASS** |
+| `Q_time + 1.0 Q_speed` | 98.14 % | +1.37 | 7.56 s | -0.23 | 43.3 | time |
+| `Q_time + 2.0 Q_speed` | 98.05 % | +1.27 | 7.84 s | +0.04 | 42.8 | time |
+| pi alone (gate sweep run) | 97.17 % | - | 7.80 s | - | 43.6 | - |
+| speed gate, margin 0.05 | 97.36 % | +0.20 | 7.83 s | +0.03 | 41.4 | succ, time |
+| speed gate, margin 0.1 | 98.05 % | +0.88 | 7.53 s | -0.27 | 41.6 | succ, time |
+| speed gate, margin 0.2 | 98.14 % | +0.98 | 7.32 s | -0.47 | 42.5 | succ (by 1 episode) |
+| **speed gate, margin 0.4** | 98.44 % | +1.27 | 7.25 s | -0.55 | 44.9 | **PASS** |
+
+On the shared-trunk critic the same `w_speed` ladder traces the same front one point lower
+(97.66 / 98.05 / 98.14 / 98.05 / 97.56 / 97.36 % at w = 0 / 0.25 / 0.5 / 1 / 2 / 4, p90
+48.7 -> 44.2), and nothing on it passes: the speed head fixes the speed axis, it cannot pay for
+the success the shared trunk lost.
+
+**The jerk is the re-planning, not the candidates** (the §M1 diagnosis, now measured three ways).
+Same critic, same gates, three ways to turn the survivors into one action:
+
+| executed action | with `w_speed` 0.5 | | | no speed term | | |
+|---|---|---|---|---|---|---|
+| | success | t_goal | p90 | success | t_goal | p90 |
+| (a) softmax-weighted mixture | 98.34 % | 7.37 s | 44.4 | 98.14 % | 7.23 s | 48.6 |
+| (b) single best candidate after the gates | 98.44 % | 7.18 s | 45.0 | 98.44 % | 6.98 s | 50.7 |
+| (c) mixture, then EMA with a_prev (alpha 0.7) | 97.95 % | 7.42 s | **36.0** | 97.95 % | 7.27 s | **40.3** |
+
+(b) is not smoother than (a) — **the mixture is not the problem**; what costs peak speed is that
+the executed action changes between decisions at all, and a one-step EMA on the joint channels
+(`a = 0.7 a_mix + 0.3 a_prev`, suction left alone so the latch is not delayed) takes 8 deg/s off
+p90 for ~0.05 s of cycle time. a_prev is read from the OBSERVATION (columns 18:24), so the rule
+is stateless and exports as part of the graph.
+
+The two levers compose, and together they go well past the gate — p90 below pi's *and* below the
+robot's 36 deg/s firmware ceiling in absolute terms:
+
+| N=16, lam=0.1 | success | t_goal | peak qd med/p90 |
+|---|---|---|---|
+| pi alone | 96.68 % | 7.80 s | 38.7 / 43.5 |
+| speed gate 0.4 + EMA 0.7 | **98.24 %** | **7.26 s** | 30.4 / **33.5** |
+| speed gate 0.2 + EMA 0.7 | 97.95 % | 7.38 s | 28.4 / 31.1 |
+| `w_speed` 0.5 + gate 0.4 + EMA 0.7 | 98.24 % | 7.42 s | 28.7 / 32.7 |
+
+**Chosen: N=16, lambda=0.1, succ_frac=0.9, speed gate margin 0.4, EMA alpha 0.7.**
+
+### Exporting the planner (`qplan/export.py` -> `rl/weights/qplan_v1.{onnx,plan,json}`)
+
+The deployed controller calls `policy(obs) -> 7-D action` once per decision and knows nothing
+else, so the WHOLE planner goes into one TensorRT graph: pi, the 16 candidate chunks, the
+three-head critic on all 16, both gates, the softmax mixture and the EMA. `QPlanGraph` re-writes
+`QPlanner.plan` with float masks instead of boolean reductions (TensorRT's bool reductions are
+patchy) and is asserted against the class itself on real observations. Nothing else changes:
+`real_policy_ctrl.load_policy` already prefers `<stem>.plan`, so
+`--policy rl/weights/qplan_v1` is the entire integration.
+
+**The gaussian family cannot be frozen.** A graph has no RNG, and the obvious fixes all fail —
+this is the one place where the export forced a design change rather than a port:
+
+| gaussian family (gate 0.4 + EMA 0.7, 1024 paired episodes) | success | vs its pi | t_goal | p90 |
+|---|---|---|---|---|
+| fresh draw every decision (what §M1 evaluated) | 98.24 % | +1.56 | 7.26 s | 33.5 |
+| ONE frozen noise table, seed A | 93.46 % | **-3.22** | 7.31 s | 33.7 |
+| ONE frozen noise table, seed B | 95.51 % | **-1.27** | 7.58 s | 33.3 |
+| replaced by seven more ladder scales (`--fine`) | 95.51 % | **-1.37** | 7.66 s | 33.1 |
+| collapsed onto pi (sigma = 0) | 95.41 % | **-1.66** | 7.79 s | 32.4 |
+| **`sin(W z + b)` of the normalised observation (`--hash`)** | **98.24 %** | **+1.46** | 7.29 s | 33.4 |
+
+Those seven noisy candidates carry only ~5 % of the softmax weight, and removing them still costs
+1.4-3.2 pp: they are a seven-sample random SEARCH around pi, re-drawn at 10 Hz, and freezing the
+sample set turns the search into a fixed bias that integrates over the episode (the two frozen
+tables are worse than pi, not just worse than the planner). Hashing the observation restores it
+exactly — `eps = sqrt(2) * (sigma_shared * sin(W_s z + b_s) + sigma_step * sin(W_t z + b_t))`
+with `z` the critic's own normalised observation and a gain of 5 / sqrt(40), chosen so one
+decision's change in `o_t` moves the phase by radians. It is a pure function of `o_t`, so the
+graph stays deterministic and `f(obs)`, and the diagnostics match the RNG version decision for
+decision (survivors 4.5/16, w(pi) 0.20, |dchunk| 0.028). The tables are written next to the
+engine (`qplan_v1_hash.pt`) and `planner.py --hash_tab` evaluates exactly what was exported.
+
+**Verification** (`export.py` does all of it, 256 REAL observations drawn from the M0 buffer --
+N(0,1) noise is far outside the critic's normaliser, where every candidate's Q collapses onto
+every other and the gates become coin flips):
+
+| check | result |
+|---|---|
+| candidate builder == `proposals.propose` | 0.0 (exact) |
+| graph == `QPlanner` (torch, same tables) | 3.6e-06 |
+| onnxruntime vs torch | **4.3e-06** |
+| TensorRT vs torch, median | **1.8e-07** |
+| TensorRT vs torch, 15 of 256 observations | up to 1.8 |
+| latency, RTX 2080 Ti (GPU 1) | **239 us/call** (budget 2 ms; the controller's GPU 0 is faster) |
+
+The 15 outliers are the price of putting GATES in a graph: on those observations a candidate sits
+within a few 1e-3 of the success or speed threshold and the engine puts it on the other side, so
+the mixture changes. It is not a numerical error in the network -- a Q-only graph, where the
+values are network OUTPUTS rather than interior tensors, agrees with torch to 1.4e-5 -- it is
+TensorRT's fused execution of the interior. **The behaviour is what matters, and it is
+unchanged**: driving the controller's own loop with the engine (`real_policy_ctrl.py --selftest`,
+SimLink, 256 episodes, the deployment's 0.005 observation noise, `--dq_max 3`) gives
+**98.0 % success, 98 % sealed, 266 us/call, final command-vs-measured lag 0.95 deg**, against the
+twin's 98.1-98.2 % below. (`--selftest` needed one fix to be meaningful for this policy at all:
+`SimLink` built the env at the default `dq_max` of 2 deg while the controller integrated
+`q_target` at 3, which by itself reported 0 % success and a 28 deg lag.)
+
+### M3 gate -- PASSED
+
+Paired eval of the EXPORTED planner (`--hash_tab rl/weights/qplan_v1_hash.pt`, i.e. exactly the
+graph in `qplan_v1.plan`), 1024 episodes, DR on, two seeds:
+
+| | success | seal | t_seal | t_goal | final d med | peak qd med/p90/max |
+|---|---|---|---|---|---|---|
+| seed 0, pi alone | 96.48 % | 97.36 % | 5.23 s | 7.86 s | 0.9 cm | 38.6 / 43.5 / 54.5 |
+| seed 0, **qplan_v1** | **98.14 %** | 98.83 % | 4.79 s | **7.34 s** | 0.9 cm | 30.5 / **33.6** / 40.4 |
+| seed 1, pi alone | 97.07 % | 98.05 % | 5.17 s | 7.77 s | 0.9 cm | 38.7 / 43.4 / 57.9 |
+| seed 1, **qplan_v1** | **98.24 %** | 98.73 % | 4.78 s | **7.30 s** | 1.0 cm | 30.4 / **33.5** / 42.2 |
+
+| criterion | required | seed 0 | seed 1 | |
+|---|---|---|---|---|
+| success vs pi | >= +1.0 pp | +1.66 pp | +1.17 pp | PASS |
+| t_goal vs pi | >= -0.30 s | -0.51 s | -0.47 s | PASS |
+| peak qd p90 | <= pi p90 + 2 | 33.6 <= 45.5 | 33.5 <= 45.4 | PASS |
+
+Every criterion passes on both seeds, and the speed one passes by 12 deg/s -- the planner is now
+*smoother* than the policy it re-ranks (p90 33.5 against pi's 43.5) while still arriving half a
+second earlier, which also puts it under the absolute 36 deg/s firmware ceiling for the first
+time. Cross-checks: with DR OFF (where pi degrades because it is trained with observation noise,
+FINDINGS 16) the same pair is 93.36 -> 94.43 % at p90 44.4 -> 34.1, and the controller's
+selftest, which is no-DR physics WITH the deployment's observation noise, gives 98.0 %.
+
+**Loading it on the robot: no code change.** `real_policy_ctrl.load_policy` already prefers
+`<stem>.plan`, and the interface is identical (obs 40 in, action 7 out), so
+`rl/real_policy_ctrl.py --policy rl/weights/qplan_v1 --dq_max 3.0 ...` is the whole change; a
+`--qplan` flag would be dead weight. Two caveats: `.plan` files are GPU/driver specific, so the
+controller machine rebuilds with `CUDA_VISIBLE_DEVICES=0 rl/qplan/export.py` (same flags, the
+hash tables come out identical from the same `--noise_seed`), and there is no torch fallback for
+this stem -- `qplan_v1_critic.pt` is the critic, not a policy checkpoint.
+
 ### What to do next
 
-1. A **third HL-Gauss head** on a per-decision joint-speed-excess reward, and a speed term in the
-   planner's filter. That is the only thing that can make the speed criterion and the time
-   criterion compatible.
+1. ~~A third HL-Gauss head on a per-decision joint-speed-excess reward.~~ **Done** (§Speed head):
+   it needs its own trunk, the soft speed GATE beats the weighted score, and the EMA on the
+   executed action is what actually buys the peak speed. M1's gate now passes on both seeds.
 2. **Select the critic by the paired eval, not by TD loss.** `steps_curve.py` should be part of
    every critic build; the fixed point of TD is not the best ranker.
 3. **Widen the proposal set beyond a tube around pi** (the plan's own "later: CFM/DP proposals").
    Everything measured here says the remaining headroom is not reachable from scaled pi chunks.
 4. The tracker-error DR needs an **observable** error cue before any critic can help with it.
+5. Run `qplan_v1` on the arm. The twin says it is 1.2-1.7 pp better, 0.5 s faster and 10 deg/s
+   smoother than the policy that flew in FINDINGS 24; the smoothness is the part the twin
+   over-reads least (it is a COMMAND-side effect, not a drive-model effect).
