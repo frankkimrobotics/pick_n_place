@@ -1,0 +1,171 @@
+<title>Q-Planning for the Pro 630</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#f6f7f5; --ink:#1c2733; --muted:#5f6d78; --line:#d5dbdf; --panel:#eceff0;
+  --accent:#0f7c8a; --accent-ink:#0b5e69; --warm:#b85a19; --ok:#2f7d4a; --code:#e7ecee;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#121a20; --ink:#e4eaee; --muted:#9aa8b2; --line:#2c3942; --panel:#1a242b;
+  --accent:#4fc3d0; --accent-ink:#8fdbe4; --warm:#e08a4a; --ok:#6fc48a; --code:#1f2b33; } }
+:root[data-theme="dark"]{
+  --bg:#121a20; --ink:#e4eaee; --muted:#9aa8b2; --line:#2c3942; --panel:#1a242b;
+  --accent:#4fc3d0; --accent-ink:#8fdbe4; --warm:#e08a4a; --ok:#6fc48a; --code:#1f2b33; }
+body{background:var(--bg);color:var(--ink);font-family:"IBM Plex Sans",system-ui,sans-serif;font-size:15.5px;line-height:1.55;padding-inline:16px;padding-block:32px 64px}
+.wrap{max-width:76ch;margin:0 auto}
+h1{font-size:2rem;font-weight:600;line-height:1.15;margin:0 0 .3rem;text-wrap:balance}
+h2{font-size:1.25rem;font-weight:600;margin:2.4rem 0 .6rem;text-wrap:balance}
+h3{font-size:1rem;font-weight:600;margin:1.4rem 0 .3rem}
+p{margin:.5rem 0}
+.eyebrow{font-family:"IBM Plex Mono",monospace;font-size:.75rem;letter-spacing:.08em;text-transform:uppercase;color:var(--accent-ink);margin-bottom:.4rem}
+.lede{color:var(--muted);font-size:1.05rem;margin-bottom:1.2rem}
+.src{font-size:.85rem;color:var(--muted)}
+.src a{color:var(--accent-ink)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;margin:.6rem 0 1rem}
+th,td{text-align:left;vertical-align:top;padding:.4rem .55rem;border-bottom:1px solid var(--line)}
+th{font-weight:600;color:var(--muted);font-size:.8rem;letter-spacing:.04em;text-transform:uppercase}
+td.num,th.num{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;white-space:nowrap}
+.tbl{overflow-x:auto}
+code,kbd{font-family:"IBM Plex Mono",monospace;font-size:.86em;background:var(--code);padding:.05em .35em;border-radius:3px}
+pre{font-family:"IBM Plex Mono",monospace;font-size:.82rem;background:var(--code);padding:.8rem 1rem;border-radius:4px;overflow-x:auto;line-height:1.45}
+figure{margin:1.2rem 0}
+figure svg{width:100%;height:auto;display:block;color:var(--ink)}
+figcaption{font-size:.85rem;color:var(--muted);margin-top:.4rem}
+.fig{overflow-x:auto}
+ul{padding-left:1.2rem;margin:.4rem 0}
+li{margin:.25rem 0}
+.callout{border-left:3px solid var(--accent);background:var(--panel);padding:.6rem .9rem;margin:.9rem 0;font-size:.95rem}
+.warm{color:var(--warm);font-weight:500}
+.ok{color:var(--ok);font-weight:500}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:.9rem}
+.box{background:var(--panel);padding:.7rem .9rem;border-radius:4px}
+.box h3{margin-top:0}
+</style>
+<div class="wrap">
+<div class="eyebrow">Plan · 2026-09-21 · pick_and_place / rl</div>
+<h1>Q-Planning for the Pro 630</h1>
+<p class="lede">Self-improving the deployed suction pick policy without touching its weights: a small off-policy Q-critic over 0.5 s action chunks scores candidate chunks proposed by the frozen policy, learns from every twin and robot rollout including the failed ones, and is retrained between deployments.</p>
+<p class="src">Paper: Giridhar, Khandelwal, Collins, Georgiev, Garg, <em>Beyond Imitation: Self-Improving Robot Policies via Off-Policy Q-Planning</em> (<a href="https://q-planning.github.io/">q-planning.github.io</a>, arXiv 2608.21204, code on GitHub). Our stack: <code>rl/env_paper.py</code> twin on mujoco_warp with the measured drive, <code>rl/weights/resid3_fast_best</code> (96.4 % in the twin, 3° bound), <code>rl/real_policy_ctrl.py</code> + spline controller on the Pi, two-camera success monitor.</p>
+
+<h2>What the paper does, in three sentences</h2>
+<p>A behaviour-cloned policy stays frozen; a separate Q-function over action chunks is trained off-policy with categorical (HL-Gauss) regression on sparse episode rewards. At run time N chunks are sampled from the policy, scored by Q, and the softmax-Q-weighted average chunk is executed. After each deployment all episodes, successes and failures, go into a replay buffer and only Q is fine-tuned; ten such iterations took LIBERO-10 from 90 to 99 % and two real bimanual tasks from 40→90 % and 25→80 %.</p>
+<div class="callout">Why it fits us: the residual PPO already showed that the frozen base sets the pace and quality and a small correction on top is what improves (87.9→94.7→96.4 %). Q-Planning is the same idea moved from the weights to the action selection, and it consumes exactly the data we now produce every night: twin rollouts at 4096 worlds and robot runs with a camera success label.</div>
+
+<h2>Inference: what runs at 10 Hz</h2>
+<figure class="fig">
+<svg viewBox="0 0 960 330" role="img" aria-label="Frozen policy proposes N chunks, the Q-critic scores them, the weighted chunk goes to the spline controller; rollouts feed a replay buffer that retrains only Q">
+ <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+ <g fill="none" stroke="currentColor" stroke-width="1.3" font-family="IBM Plex Sans, system-ui" font-size="12.5">
+  <rect x="20" y="70" width="150" height="66" rx="3"/><text x="95" y="96" text-anchor="middle" fill="currentColor" stroke="none">state o<tspan font-size="9" dy="3">t</tspan> (40-D)</text><text x="95" y="114" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">q, q̇, object, goal, lag</text>
+  <rect x="215" y="70" width="160" height="66" rx="3"/><text x="295" y="96" text-anchor="middle" fill="currentColor" stroke="none">frozen policy π</text><text x="295" y="114" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">resid3_fast, deterministic</text>
+  <rect x="420" y="40" width="180" height="126" rx="3"/><text x="510" y="64" text-anchor="middle" fill="currentColor" stroke="none">N = 32 chunk proposals</text><text x="510" y="86" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">H = 5 decisions (0.5 s)</text><text x="510" y="106" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">π rollout + Gaussian noise</text><text x="510" y="124" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">+ speed-scaled ×1.2 / ×1.4</text><text x="510" y="142" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">+ hold / slow-down variants</text>
+  <rect x="645" y="70" width="140" height="66" rx="3" stroke="#0f7c8a" stroke-width="2"/><text x="715" y="96" text-anchor="middle" fill="currentColor" stroke="none">Q-critic Q<tspan font-size="9" dy="3">φ</tspan>(o, chunk)</text><text x="715" y="114" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">MLP, HL-Gauss 51 bins</text>
+  <rect x="830" y="70" width="110" height="66" rx="3"/><text x="885" y="96" text-anchor="middle" fill="currentColor" stroke="none">softmax-Q</text><text x="885" y="114" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">weighted chunk</text>
+  <line x1="170" y1="103" x2="213" y2="103" marker-end="url(#ar)"/>
+  <line x1="375" y1="103" x2="418" y2="103" marker-end="url(#ar)"/>
+  <line x1="600" y1="103" x2="643" y2="103" marker-end="url(#ar)"/>
+  <line x1="785" y1="103" x2="828" y2="103" marker-end="url(#ar)"/>
+  <rect x="640" y="215" width="200" height="60" rx="3"/><text x="740" y="239" text-anchor="middle" fill="currentColor" stroke="none">spline controller (Pi, 100 Hz)</text><text x="740" y="257" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">chunk = 5 B-spline targets</text>
+  <path d="M885,136 L885,245 L842,245" marker-end="url(#ar)"/>
+  <rect x="400" y="215" width="180" height="60" rx="3"/><text x="490" y="239" text-anchor="middle" fill="currentColor" stroke="none">twin (4096 worlds) / robot</text><text x="490" y="257" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">press primitive still guards contact</text>
+  <line x1="638" y1="245" x2="582" y2="245" marker-end="url(#ar)"/>
+  <path d="M400,245 L95,245 L95,138" marker-end="url(#ar)"/><text x="230" y="238" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">next observation</text>
+  <rect x="180" y="285" width="200" height="36" rx="3" stroke-dasharray="4 3"/><text x="280" y="308" text-anchor="middle" fill="currentColor" stroke="none">replay buffer (all episodes)</text>
+  <path d="M490,275 L490,303 L382,303" stroke-dasharray="4 3" marker-end="url(#ar)"/><text x="470" y="318" text-anchor="end" fill="currentColor" stroke="none" font-size="11">success / time / distance labels</text>
+  <path d="M180,303 L60,303 L60,180 L715,180 L715,138" stroke-dasharray="4 3" stroke="#0f7c8a" marker-end="url(#ar)"/><text x="330" y="174" text-anchor="middle" fill="#0f7c8a" stroke="none" font-size="11">retrain Q only (EMA target), π never changes</text>
+ </g>
+</svg>
+<figcaption>Inference path (solid) and the self-improvement path (dashed). Only the Q-critic is trained; the policy, the press primitive and the spline controller are unchanged.</figcaption>
+</figure>
+
+<h2>Mapping the paper onto our stack</h2>
+<div class="tbl"><table>
+<tr><th>Paper</th><th>Ours</th><th>Note</th></tr>
+<tr><td>Frozen BC visuomotor policy (flow matching, images + language)</td><td>Frozen <code>resid3_fast_best</code> on the 40-D state; later the CFM / DP policies from the IL v2 plan</td><td>Our policy is deterministic, so proposal diversity has to be added explicitly (next section)</td></tr>
+<tr><td>Action chunk a<sub>t:t+H</sub></td><td>H = 5 joint deltas at 10 Hz (0.5 s) + suction bit</td><td>Matches the Pi's B-spline welder: a chunk is literally the control polygon it already receives</td></tr>
+<tr><td>Q-decoder: transformer on DinoV2 + T5 features, HL-Gauss head</td><td>MLP [512, 512, 256] on (state, chunk flattened 35-D), HL-Gauss 51 bins, twin heads</td><td>No vision: ~2 µs per candidate in TensorRT, N = 32 costs nothing at 10 Hz</td></tr>
+<tr><td>Sparse terminal reward (episode success)</td><td>Head 1: placed within 3.5 cm and sealed. Head 2: time-to-goal (−0.1 per decision until at goal) with a final-distance term</td><td>Accuracy and speed become two scalarised values; the planner temperature per head sets the trade-off</td></tr>
+<tr><td>Deployment rollouts (20 per iteration on the robot)</td><td>Twin: 4096 worlds per iteration under DR. Robot: 10–20 runs per iteration with the two-camera monitor as the label</td><td>Twin iterations are minutes; the robot loop is what the paper actually demonstrates</td></tr>
+<tr><td>Softmax-Q weighted average (temperature λ)</td><td>Same; ablate against best-of-N as the paper did (weighted won: 99 vs 95 %)</td><td>Weighting also smooths the executed chunk, which the drive likes</td></tr>
+</table></div>
+
+<h2>Proposal distribution</h2>
+<p>The paper samples from a generative policy. Ours is a point estimate, so the N = 32 candidates are built around it:</p>
+<ul>
+<li><strong>16 noisy rollouts.</strong> Unroll π for H = 5 steps in the twin's one-step model? No: too slow on the robot. Instead perturb π(o<sub>t</sub>) with chunk-correlated Gaussian noise (σ = 0.15 action units, shared across the chunk with a small per-step term), the same 0.005 observation noise the policy was trained with.</li>
+<li><strong>12 structured variants.</strong> The same chunk scaled ×0.7, ×1.2, ×1.4 on the joint dims, and with the suction bit flipped. Our twin test showed that scaling <em>blanketly</em> in free space fails (96.7 → 88 % at ×1.3), but a Q-critic can choose the fast variant only in the states where it is safe. This is the honest route to the 1.2 s that the drive ceiling still allows in the approach.</li>
+<li><strong>4 safety chunks.</strong> Hold, and slow-down to 50 %, so the planner can always pick "wait" near contact.</li>
+<li><strong>Later:</strong> once the CFM / diffusion policies of the IL v2 plan exist, they replace the noisy rollouts as the generative proposal, exactly as in the paper.</li>
+</ul>
+
+<h2>Rewards, accuracy and time</h2>
+<div class="tbl"><table>
+<tr><th>Head</th><th>Signal (twin and robot)</th><th>Planner use</th></tr>
+<tr><td>Q<sub>succ</sub></td><td>1 if the object is lifted and within 3.5 cm of the goal at episode end (twin: <code>placed</code>; robot: monitor verdict "PICK AND PLACE OK"), else 0. Bonus −0.02 per cm of final distance for a graded signal.</td><td>Primary weight; a candidate with Q<sub>succ</sub> below 0.9·max is dropped before speed is considered</td></tr>
+<tr><td>Q<sub>time</sub></td><td>−0.1 per decision until at goal (already in <code>env_paper</code> as <code>w_time</code>); robot: from the run timeline</td><td>Softmax over the survivors with λ<sub>time</sub>; this is where speed-scaled chunks win</td></tr>
+<tr><td>penalty</td><td>drive envelope: peak joint speed above 34 °/s in the chunk, contact metric above TAU_HARD, guard clips</td><td>Hard mask on the robot, soft in the twin</td></tr>
+</table></div>
+
+<h2>Domain randomisation the critic must see</h2>
+<p>The critic is only useful on the robot if it has seen the twin's spread of conditions. Everything below is already implemented or measured today; the new item is the tracker error.</p>
+<div class="tbl"><table>
+<tr><th>Factor</th><th>Range</th><th>Source</th></tr>
+<tr><td>Drive velocity cap / accel cap / dead time</td><td class="num">0.9–1.1× 50 °/s · 0.75–1.15× 800 °/s² · 30–65 ms</td><td>env_warp DRIVE_DR (calibrated)</td></tr>
+<tr><td>Observation noise, action latency</td><td class="num">σ 0.005 · one decision on half the worlds</td><td>env_paper</td></tr>
+<tr><td>Object top height, footprint, mass</td><td class="num">2–9 cm · 3–8 cm · 50–400 g</td><td>env_v2 DiverseEnv (box, cylinder, hex)</td></tr>
+<tr><td>Object xy, place goal</td><td class="num">x 0.17–0.50, y ±0.30 · goal within 0.30 m, height 5–25 cm</td><td>env_paper / env_v2</td></tr>
+<tr><td class="warm">Object-position error (new)</td><td class="num">±15 mm xy bias per episode, ±5 mm jitter, top −6 to +2 cm</td><td>measured tonight: the D435 was 16 mm off in y, camera tops 1–6 cm low</td></tr>
+<tr><td>Table friction, suction seal thresholds</td><td class="num">0.6–1.2× · seal distance 0.8–1.2×</td><td>env_warp DR</td></tr>
+</table></div>
+
+<h2>The self-improvement loop</h2>
+<figure class="fig">
+<svg viewBox="0 0 960 250" role="img" aria-label="Iterations: offline Q from existing rollouts, ten twin iterations of deploy-collect-retrain, then five robot iterations of 20 runs each labelled by the monitor">
+ <defs><marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+ <g fill="none" stroke="currentColor" stroke-width="1.3" font-family="IBM Plex Sans, system-ui" font-size="12.5">
+  <line x1="30" y1="120" x2="930" y2="120" marker-end="url(#ar2)"/>
+  <rect x="40" y="60" width="150" height="50" rx="3"/><text x="115" y="80" text-anchor="middle" fill="currentColor" stroke="none">iteration 0</text><text x="115" y="98" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">Q offline on 200k twin steps</text>
+  <rect x="220" y="60" width="330" height="50" rx="3" stroke="#0f7c8a"/><text x="385" y="80" text-anchor="middle" fill="currentColor" stroke="none">twin iterations 1–10 (minutes each)</text><text x="385" y="98" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">deploy planner in 4096 DR worlds → append → retrain Q (10k grad steps)</text>
+  <rect x="580" y="60" width="330" height="50" rx="3" stroke="#b85a19"/><text x="745" y="80" text-anchor="middle" fill="currentColor" stroke="none">robot iterations 1–5</text><text x="745" y="98" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">20 random-object runs → monitor labels → retrain Q on twin + robot buffer</text>
+  <text x="115" y="150" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">gate: planner ≥ π on paired eval</text>
+  <text x="385" y="150" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">gate: 99 % success, t_goal ≤ 6.5 s, peak q̇ ≤ 36 °/s</text>
+  <text x="745" y="150" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">gate: ≥ 9 / 10 placed within 3.5 cm, no drive fault</text>
+  <rect x="220" y="185" width="690" height="40" rx="3" stroke-dasharray="4 3"/><text x="565" y="209" text-anchor="middle" fill="currentColor" stroke="none" font-size="11.5">every iteration: TensorRT export of π + Q as one batched graph (N = 32), same controller flags, phase timeline logged</text>
+ </g>
+</svg>
+<figcaption>Twin iterations are cheap and de-risk the critic; the robot iterations are the paper's actual claim and use the monitor verdict as the terminal label.</figcaption>
+</figure>
+
+<h3>Algorithm, adapted</h3>
+<pre>buffer D ← twin rollouts of π (successes and failures), chunked with H = 5
+repeat for k = 1..K:
+    deploy: at each decision sample N chunks around π(o), score with Q_φ,
+            execute the softmax-Q weighted chunk through the spline controller;
+            the guarded press primitive still owns contact and the attach
+    append every episode (obs, chunk, r_succ, r_time, done) to D
+    retrain only Q_φ: HL-Gauss cross-entropy to the H-step bootstrapped target
+            y = Σ_{i&lt;H} γ^i r_{t+i} + γ^H Q_φ̄(o_{t+H}, chunk_π(o_{t+H})),  φ̄ = EMA(φ)
+    gate on the paired deterministic eval before the next deployment</pre>
+
+<h2>Milestones and acceptance tests</h2>
+<div class="tbl"><table>
+<tr><th>#</th><th>Deliverable</th><th>Test</th><th>Effort</th></tr>
+<tr><td class="num">M0</td><td>Chunked rollout collector on the twin (<code>rl/qplan/collect.py</code>), buffer format, labels; monitor verdict + phase timeline parsed from robot logs</td><td>200k transitions from π under DR in under 10 min; label agreement with <code>placed</code></td><td class="num">1 day</td></tr>
+<tr><td class="num">M1</td><td>Q-critic (<code>rl/qplan/critic.py</code>): HL-Gauss, twin heads, EMA target; planner wrapper (<code>rl/qplan/planner.py</code>) with the proposal set</td><td>Paired eval 1024 eps: planner ≥ π + 1 pp success, t_goal −0.3 s, peak q̇ unchanged; best-of-N vs weighted ablation</td><td class="num">2 days</td></tr>
+<tr><td class="num">M2</td><td>Ten twin iterations under full DR incl. tracker-error DR</td><td>99 % success, t_goal ≤ 6.5 s (from 7.7), placement median ≤ 1.5 cm; robustness across DR bins reported</td><td class="num">1 day</td></tr>
+<tr><td class="num">M3</td><td>Deployment: fused TRT graph, controller flag <code>--qplan</code>, N, λ, H as flags; dry run + selftest</td><td>≤ 2 ms per decision on GPU 0; selftest success matches the twin eval</td><td class="num">1 day</td></tr>
+<tr><td class="num">M4</td><td>Robot loop: 5 iterations × 20 random-object runs, monitor-labelled, Q retrained between iterations</td><td>From tonight's 2 / 6 to ≥ 9 / 10 placed within 3.5 cm; approach + carry ≤ 6 s; zero drive faults</td><td class="num">2 sessions</td></tr>
+</table></div>
+
+<h2>Risks and how the plan handles them</h2>
+<ul>
+<li><strong>The critic can only choose what the policy can propose</strong> (the paper's own limitation). The structured variants widen the support where it matters (speed); a generative proposal comes with IL v2.</li>
+<li><strong>Q over-estimation on unseen chunks.</strong> HL-Gauss plus a small conservative term (penalise Q on proposal chunks far from π), and the 0.9·max success gate before any speed selection.</li>
+<li><strong>Label noise on the robot.</strong> The monitor was right on the two no-move runs but its fixed-camera localisation still needs the depth-first fix; until then the operator confirms each verdict, as tonight.</li>
+<li><strong>Contact.</strong> The planner acts in free space and during the carry; the guarded press, attach and place-down primitives stay in charge at contact, so a bad chunk cannot press into the table.</li>
+<li><strong>Twin-to-robot gap.</strong> The drive model now matches the deployed law to +25 % on peak speed; the tracker-error DR is the missing factor and is in M2.</li>
+</ul>
+
+<h2>Where it starts tomorrow</h2>
+<p>M0 and M1 need no robot: the collector and the critic run on GPU 1 against the twin while the ZED gets its USB 3 port. The first number worth waiting for is the M1 paired eval; if the weighted planner does not beat the frozen policy in the twin, the proposal set is what to fix before anything touches the robot.</p>
+</div>

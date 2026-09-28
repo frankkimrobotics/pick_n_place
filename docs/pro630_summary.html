@@ -1,0 +1,306 @@
+<title>Pro 630 Pick Program</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;500;600;700&family=Source+Code+Pro:wght@400;500&display=swap">
+<style>
+:root{--bg:#f4f5f2;--ink:#1a2530;--muted:#5c6b76;--line:#d3d9dc;--panel:#e9edee;--panel2:#dfe5e7;--accent:#1f6f8b;--accent2:#c0611e;--ok:#2e7d4f;--bad:#b23a3a;--code:#e4e9eb;--chip:#d7e6ec}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#121b21;--ink:#e6ebee;--muted:#9fadb6;--line:#2d3b44;--panel:#1a252c;--panel2:#22303a;--accent:#5cc0dd;--accent2:#e9924f;--ok:#6ccb8f;--bad:#e07a7a;--code:#1e2b33;--chip:#213641}}
+:root[data-theme="dark"]{--bg:#121b21;--ink:#e6ebee;--muted:#9fadb6;--line:#2d3b44;--panel:#1a252c;--panel2:#22303a;--accent:#5cc0dd;--accent2:#e9924f;--ok:#6ccb8f;--bad:#e07a7a;--code:#1e2b33;--chip:#213641}
+body{background:var(--bg);color:var(--ink);font-family:"Source Sans 3",system-ui,sans-serif;font-size:16px;line-height:1.5;padding-inline:16px;padding-block:28px 60px}
+.wrap{max-width:1040px;margin:0 auto}
+h1{font-size:2.1rem;font-weight:700;margin:0 0 .2rem;line-height:1.1;text-wrap:balance}
+h2{font-size:1.3rem;font-weight:600;margin:0 0 .6rem}
+h3{font-size:1.02rem;font-weight:600;margin:.9rem 0 .3rem}
+.lede{color:var(--muted);font-size:1.05rem;max-width:70ch;margin-bottom:1.2rem}
+.eyebrow{font-family:"Source Code Pro",monospace;font-size:.74rem;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);margin-bottom:.35rem}
+nav{display:flex;flex-wrap:wrap;gap:6px;margin:1rem 0 1.4rem;position:sticky;top:env(safe-area-inset-top,0px);background:var(--bg);padding-block:8px;z-index:2;border-bottom:1px solid var(--line)}
+nav button{font:inherit;font-size:.92rem;font-weight:500;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:.35rem .85rem;cursor:pointer}
+nav button[aria-selected="true"]{background:var(--accent);color:#fff;border-color:var(--accent)}
+nav button:focus-visible{outline:2px solid var(--accent2);outline-offset:2px}
+section{display:none}section.on{display:block}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:.8rem 0 1.2rem}
+.kpi{background:var(--panel);border-radius:6px;padding:.7rem .85rem}
+.kpi .v{font-size:1.6rem;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.1}
+.kpi .l{font-size:.82rem;color:var(--muted)}
+.tbl{overflow-x:auto;margin:.5rem 0 1rem}
+table{border-collapse:collapse;width:100%;font-size:.92rem}
+th,td{text-align:left;padding:.4rem .55rem;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:.76rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:600}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums;font-family:"Source Code Pro",monospace;font-size:.86rem;white-space:nowrap}
+tr.hl td{background:var(--chip)}
+.ok{color:var(--ok);font-weight:600}.bad{color:var(--bad);font-weight:600}
+code{font-family:"Source Code Pro",monospace;font-size:.85em;background:var(--code);padding:.05em .35em;border-radius:3px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+.card{background:var(--panel);border-radius:6px;padding:.8rem 1rem}
+.card h3{margin-top:0}
+ul{padding-left:1.15rem;margin:.3rem 0}li{margin:.22rem 0}
+figure{margin:.8rem 0}figure svg{width:100%;height:auto;display:block;color:var(--ink)}
+figcaption{font-size:.84rem;color:var(--muted);margin-top:.3rem}
+.chart{position:relative}
+.chart .tip{position:absolute;pointer-events:none;background:var(--ink);color:var(--bg);font-size:.8rem;padding:.25rem .5rem;border-radius:4px;transform:translate(-50%,-120%);white-space:nowrap;opacity:0;transition:opacity .12s}
+.controls{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin:.4rem 0 .6rem;font-size:.9rem}
+.controls label{display:flex;align-items:center;gap:6px}
+.stage{display:flex;flex-wrap:wrap;gap:6px}
+.stage button{font:inherit;font-size:.86rem;background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:.3rem .6rem;cursor:pointer;color:var(--ink)}
+.stage button[aria-pressed="true"]{background:var(--accent2);color:#fff;border-color:var(--accent2)}
+.stage button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.detail{background:var(--panel);border-left:3px solid var(--accent2);padding:.6rem .9rem;border-radius:0 4px 4px 0;margin:.5rem 0;min-height:4.5rem}
+.small{font-size:.86rem;color:var(--muted)}
+.bar{height:10px;border-radius:5px;background:var(--panel2);overflow:hidden}
+.bar i{display:block;height:100%;background:var(--accent)}
+details{margin:.5rem 0}summary{cursor:pointer;font-weight:600}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+<div class="wrap">
+<div class="eyebrow">myCobot Pro 630 · suction pick-and-place · RL twin → real arm · 17–27 Sep 2026</div>
+<h1>Pro 630 Pick Program</h1>
+<p class="lede">One page for the whole effort: a hardware-calibrated mujoco_warp twin, a policy trained by cuRobo demonstrations, DAgger and residual PPO, its deployment through TensorRT and a spline controller on the Pi, three real-robot series, and the twin-side extensions (Q-Planning, obstacles, a suction bug). Click a tab; hover the charts.</p>
+
+<nav role="tablist" aria-label="Sections">
+<button role="tab" aria-selected="true" data-t="overview">Overview</button>
+<button role="tab" aria-selected="false" data-t="pipeline">Pipeline</button>
+<button role="tab" aria-selected="false" data-t="twin">Twin &amp; drive</button>
+<button role="tab" aria-selected="false" data-t="robot">Robot series</button>
+<button role="tab" aria-selected="false" data-t="time">Cycle time</button>
+<button role="tab" aria-selected="false" data-t="qplan">Q-Planning</button>
+<button role="tab" aria-selected="false" data-t="v3">Obstacles &amp; bug</button>
+<button role="tab" aria-selected="false" data-t="next">Open items</button>
+</nav>
+
+<section id="overview" class="on">
+<h2>Where things stand</h2>
+<div class="kpis">
+<div class="kpi"><div class="v">98.2 %</div><div class="l">best twin success (Q-planner on resid3, DR on)</div></div>
+<div class="kpi"><div class="v">33.5 °/s</div><div class="l">planner peak joint speed p90 (drive fault at 36)</div></div>
+<div class="kpi"><div class="v">7 / 9</div><div class="l">robot carries, series 2 (5 within 3.5 cm)</div></div>
+<div class="kpi"><div class="v">43 s</div><div class="l">last real run, of which policy ≈ 10 s</div></div>
+<div class="kpi"><div class="v">+16 mm</div><div class="l">tracker y bias found and corrected</div></div>
+<div class="kpi"><div class="v">36 → 1</div><div class="l">seal breaks per 128 worlds after the suction fix</div></div>
+</div>
+<div class="grid">
+<div class="card"><h3>What works on the robot</h3><ul>
+<li>Deployed policy: DAgger round 10 (87.8 %) + bounded residual PPO (94.7 → 96.4 % with a 3° bound).</li>
+<li>Spline-tracked 10 Hz reference on the Pi (K0 10, 45 ms lead): the 10 Hz sawtooth that looked jerky is gone in the 100 Hz logs.</li>
+<li>Live colour/depth tracker, touch calibration of the object top, guarded press, scripted lift, guarded settle.</li>
+<li>Two-camera before/after success monitor on the free D405s.</li></ul></div>
+<div class="card"><h3>What was learned the hard way</h3><ul>
+<li>Cross-drive transfer is dead: an 89 % ideal-drive policy scores 1 % on the measured drive. The twin must model the Pi law exactly.</li>
+<li>Plain PPO from a DAgger init decays; a frozen base + small residual keeps the press behaviour.</li>
+<li>The BC clone needs its training observation noise at test time (31 % → 78 %).</li>
+<li>Object position and height errors, not the policy, caused most real failures; a wrong sign in the tracker bias put the cup on the rim.</li>
+<li>The twin's suction righting spring was spinning light objects and breaking seals; fixing it lifted a teacher from 60 to 88 %.</li></ul></div>
+</div>
+</section>
+
+<section id="pipeline">
+<h2>Training pipeline</h2>
+<p class="small">Click a stage for its recipe and the number it produced.</p>
+<figure class="chart">
+<svg viewBox="0 0 1000 200" role="img" aria-label="Pipeline stages from the twin through teacher, DAgger, residual PPO, TensorRT export, controller and robot, each clickable">
+<defs><marker id="pa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10z" fill="currentColor"/></marker></defs>
+<g id="pipe" fill="none" stroke="currentColor" stroke-width="1.3" font-family="Source Sans 3, system-ui" font-size="13"></g>
+</svg>
+<figcaption>Solid arrows are data; the dashed return arrow is DAgger relabelling by the cuRobo teacher.</figcaption>
+</figure>
+<div class="stage" id="stagebtns"></div>
+<div class="detail" id="stagedetail">Select a stage.</div>
+<div class="tbl"><table>
+<tr><th>Stage</th><th>Trains</th><th>Data / teacher</th><th>Objective</th><th class="n">Result</th></tr>
+<tr><td>Twin</td><td>–</td><td>Pro 630 probes: step, sine, following error</td><td>Drive model within the measured onset, rise, settle</td><td class="n">timing exact; peak +25 %</td></tr>
+<tr><td>Teacher</td><td>–</td><td>cuRobo transit + 20 mm slow press</td><td>Demonstrations on the measured drive</td><td class="n">80–91 %</td></tr>
+<tr><td>BC + DAgger</td><td>MLP [256,128,64]</td><td>Teacher, β 0.5/0.3/0.1/0, IK-waypoint relabel</td><td>MSE on atanh(action)</td><td class="n">87.8 % (r10)</td></tr>
+<tr><td>Residual PPO</td><td>Residual MLP, privileged critic</td><td>Frozen base + 0.3·tanh residual, zero-init</td><td>Paper reward + press/seal shaping</td><td class="n">94.7 %</td></tr>
+<tr><td>Speed residual</td><td>Residual on the residual</td><td>3° bound, time penalty, speed hinge</td><td>Same + −0.1/decision until at goal</td><td class="n">96.4 %, seal 5.3 s</td></tr>
+<tr><td>Q-planner</td><td>Q critic over 0.5 s chunks</td><td>Frozen policy rollouts + scale exploration</td><td>HL-Gauss TD, 3 heads</td><td class="n">98.2 %, p90 33.5 °/s</td></tr>
+</table></div>
+</section>
+
+<section id="twin">
+<h2>Twin and drive model</h2>
+<p>The twin runs 4096 worlds of mujoco_warp with the deployed Pi law inside each 10 ms tick: <code>u = vff·v_ref(t+lead) − K0(q − q_ref(t+lead)) − K1(q̇ − v_ref)</code>, clamped at 50 °/s, delayed 45 ms, acceleration-capped at 800 °/s², with a bounded 3° lead like the controller. The reference is the same uniform cubic B-spline the Pi welds.</p>
+<h3>Peak joint speed the same policy shows in each drive model</h3>
+<figure class="chart" id="drivechart"><svg viewBox="0 0 900 260" role="img" aria-label="Bar chart of median peak joint speed for the same policy under four twin variants and on the real robot"></svg><div class="tip"></div>
+<figcaption>Same deployed policy, 256 deterministic episodes. The old twin over-read peaks by 135 %; the new one by 25 %, with timing exact (first contact 5.1 s in both).</figcaption></figure>
+<div class="tbl"><table>
+<tr><th>Twin variant</th><th class="n">success</th><th class="n">peak |q̇| median</th><th class="n">first seal</th></tr>
+<tr><td>old: K0 20, linear ramp</td><td class="n">97.3 %</td><td class="n">64.7 °/s</td><td class="n">5.1 s</td></tr>
+<tr><td>K0 10, linear</td><td class="n">97.3 %</td><td class="n">34.8</td><td class="n">5.1 s</td></tr>
+<tr><td>K0 10, spline, no lead clip</td><td class="n">97.7 %</td><td class="n">41.1</td><td class="n">5.0 s</td></tr>
+<tr class="hl"><td>deployed law (K0 10, lead 45 ms, spline, clip)</td><td class="n">97.3 %</td><td class="n">41.1</td><td class="n">5.1 s</td></tr>
+<tr><td>real robot (7 runs)</td><td class="n">–</td><td class="n">22–34</td><td class="n">3.1–3.6 s to first suction</td></tr>
+</table></div>
+<h3>Domain randomisation</h3>
+<div class="tbl"><table>
+<tr><th>Factor</th><th>Range</th><th>Where</th></tr>
+<tr><td>Drive vmax · amax · dead time</td><td>0.9–1.1× · 0.75–1.15× · 30–65 ms</td><td>env_warp DRIVE_DR</td></tr>
+<tr><td>Observation noise · action latency</td><td>σ 0.005 · one decision on half the worlds</td><td>env_paper (noise required at test time)</td></tr>
+<tr><td>Object shape · size · mass</td><td>box / cyl / hex · 2–9 cm · 30–150 g</td><td>env_v2</td></tr>
+<tr><td>Spawn · goal</td><td>x 0.20–0.56, y ±0.35 · height 5–25 cm</td><td>env_v3</td></tr>
+<tr><td>Distractors</td><td>1–3, tall post on the corridor in 69 % of worlds</td><td>env_v3</td></tr>
+<tr><td>Object-position error (critic only)</td><td>±15 mm bias, ±5 mm jitter, top −6..+2 cm</td><td>qplan collector; policy falls 97 → 18 %</td></tr>
+</table></div>
+</section>
+
+<section id="robot">
+<h2>Real-robot series</h2>
+<div class="controls"><span>Series:</span>
+<label><input type="radio" name="ser" value="s2" checked> 2 · 20 Sep night (random goal, one object)</label>
+<label><input type="radio" name="ser" value="s3" > 3 · six objects, random object + goal</label>
+<label><input type="radio" name="ser" value="s4" > 4 · fast policy, corrected bias</label></div>
+<div class="tbl"><table id="runtbl"><thead><tr><th>Run</th><th>Object</th><th>Outcome</th><th>Cause / note</th></tr></thead><tbody></tbody></table></div>
+<div class="grid">
+<div class="card"><h3>Controller additions that came out of the series</h3><ul>
+<li>Touch calibration of the object top before each run (camera tops were 1–6 cm low on cups).</li>
+<li>Guarded press to a target contact force; flat hold chunks; scripted 8 cm lift after the attach.</li>
+<li>Tracking freezes below 25 cm; blob-size sanity; follow the candidate nearest the current estimate.</li>
+<li>Press descends at the estimated centre, 3 mm lateral per decision (the 50 °/s kick at contact).</li>
+<li>Depth-first tracker: objects = anything 1 cm above the table plane, split into clusters, shadows excluded.</li></ul></div>
+<div class="card"><h3>Calibration result</h3>
+<p>The D435 tracker's raw centre is +16 mm in y and +5 mm in x from the true lid centre, measured by a wrist-camera circle fit from a 12 cm hover and confirmed by eye on two objects. The earlier bias file had the opposite y sign, which is why the cup kept landing on the +y rim. Torque rim probing was tried and rejected: it pushes light cans.</p>
+<p class="small">Cameras: D435 (tracker, on a USB 2 hub), fixed D405 + wrist D405 (success monitor). A ZED 2i is ready in software (tracker + board calibration) but needs a USB 3 port.</p></div>
+</div>
+</section>
+
+<section id="time">
+<h2>Cycle time</h2>
+<p class="small">Phases of one run. Toggle to compare the committed controller (series 2) with the fast version measured on run s4_02 and the projected next pass. Hover for seconds.</p>
+<div class="controls"><span>Show:</span>
+<label><input type="checkbox" class="tv" value="0" checked> series 2 (measured)</label>
+<label><input type="checkbox" class="tv" value="1" checked> fast controller, s4_02 (measured)</label>
+<label><input type="checkbox" class="tv" value="2" checked> next pass (projected)</label></div>
+<figure class="chart" id="timechart"><svg viewBox="0 0 900 230" role="img" aria-label="Stacked horizontal bars of run phases for three controller versions"></svg><div class="tip"></div>
+<figcaption>The policy (approach + press + carry) is about 10 s in every version; the scripted phases are what shrink. Approach is drive-limited at ≈2.3 s for the 67° of travel, so ≤1.2 s is left there.</figcaption></figure>
+<div class="tbl"><table>
+<tr><th>What changed in the fast controller</th><th>Before</th><th>After</th></tr>
+<tr><td>Scripted legs</td><td>5–10 °/s ramp + fixed 1.4 s pad</td><td>min-jerk at 25 °/s peak, wait on joint feedback (0.7° for 3 polls)</td></tr>
+<tr><td>Calibration descent</td><td>2 cm/s from 7 cm</td><td>4 cm/s to 2 cm above the camera top, then 2 cm/s</td></tr>
+<tr><td>Press step · settle step</td><td>1 mm / decision</td><td>2 mm / decision</td></tr>
+<tr><td>Attach dwell</td><td>1.0 s</td><td>0.5 s tried, gave a false attach → back to 1.0 s</td></tr>
+<tr><td>At-goal dwell · release wait</td><td>1.0 s · 0.6 s</td><td>0.5 s · 0.3 s</td></tr>
+</table></div>
+</section>
+
+<section id="qplan">
+<h2>Q-Planning on the twin</h2>
+<p>After Giridhar et al. 2026: the policy stays frozen; a small critic over 0.5 s action chunks (HL-Gauss, three heads: success, time, joint speed) scores N = 16 proposals built around the policy's action, a success gate keeps the top candidates, a soft speed gate drops the jerky ones, and the softmax-weighted chunk's first action is executed with a one-step EMA.</p>
+<h3>Paired evaluation, 1024 episodes, DR on</h3>
+<figure class="chart" id="qchart"><svg viewBox="0 0 900 250" role="img" aria-label="Grouped bars comparing frozen policy, blanket speed scaling, and the Q-planner on success, time to goal and peak speed"></svg><div class="tip"></div>
+<figcaption>Blanket ×1.3 speed scaling is the control: faster but 9 pp worse. The planner is faster, better, and smoother than the policy it re-ranks.</figcaption></figure>
+<div class="tbl"><table>
+<tr><th>Policy</th><th class="n">success</th><th class="n">seal at</th><th class="n">goal at</th><th class="n">peak |q̇| p90</th></tr>
+<tr><td>frozen resid3 (3°)</td><td class="n">96.5–97.1 %</td><td class="n">5.2 s</td><td class="n">7.8 s</td><td class="n">43.5 °/s</td></tr>
+<tr><td>blanket ×1.3 (control)</td><td class="n">88.3 %</td><td class="n">5.5 s</td><td class="n">7.3 s</td><td class="n">53.2</td></tr>
+<tr><td>planner, no speed head</td><td class="n">99.0 %</td><td class="n">4.8 s</td><td class="n">7.1 s</td><td class="n">48.5</td></tr>
+<tr class="hl"><td>planner qplan_v1 (speed gate + EMA)</td><td class="n">98.1–98.2 %</td><td class="n">4.9 s</td><td class="n">7.3 s</td><td class="n">33.5</td></tr>
+</table></div>
+<div class="grid">
+<div class="card"><h3>Self-improvement loop: flat in the twin</h3><p>Ten iterations never beat iteration 0 (best 98.7 %, then decay). Two causes, both measured: the critic has a sharp optimum in TD steps (20k) that warm-started retraining walks off, and every failed twin episode is a physically impossible seal under DR, so re-ranking the same policy's chunks has nothing to learn from. The loop is worth running where failures are recoverable: on the robot, with the monitor as the label.</p></div>
+<div class="card"><h3>Details that mattered</h3><ul>
+<li>Q_time collapsed onto Q_succ until the buffer had speed-scaled rollouts that mostly succeed at different times.</li>
+<li>Jerk was the re-planning, not fast candidates and not the mixture; a hard velocity mask biased survivors slow.</li>
+<li>The speed head needs its own trunk (shared: −1.3 pp).</li>
+<li>Training the critic on corrupted-observation data made it worse; a clean critic still recovers 3–6 pp under tracker error.</li>
+<li>Exported as one TensorRT graph (proposals, scoring, gates inside); loads like a policy; 0.24 ms per call.</li></ul></div>
+</div>
+</section>
+
+<section id="v3">
+<h2>Obstacles, larger cell, and the suction bug</h2>
+<div class="grid">
+<div class="card"><h3>env v3</h3><ul><li>Spawn x 0.20–0.56, y ±0.35; goals ≥ 10 cm from the walls (back −0.30, sides ±0.50).</li><li>1–3 distractor bodies, a 0.10–0.25 m post on the carry corridor in 69 % of worlds; contact or &gt;1 cm displacement = failure.</li><li>Observation 54-D: + nearest distractor's relative position, half-extents, count.</li><li>The old student drops 56 → 32 % here with 32 % obstacle hits.</li></ul></div>
+<div class="card"><h3>Suction bug</h3><p>The righting spring on the cup saturated after 1.1° of tilt and injected 30–230 rad/s of spin into light objects; the damper turned that into fake linear velocity and the seal broke by force saturation. Seal breaks 36 → 1 per 128 worlds after capping the torque and spin. Neutral on the deployed policy; the likely cause of the earlier diverse-object teacher ceiling at 50 %.</p></div>
+</div>
+<div class="tbl"><table>
+<tr><th>Policy on env v3</th><th class="n">success</th><th class="n">obstacle hits</th><th class="n">wall hits</th><th class="n">goal at</th></tr>
+<tr><td>cuRobo teacher (obstacle-aware, fast retiming)</td><td class="n">77.7 %</td><td class="n">7–12 %</td><td class="n">–</td><td class="n">–</td></tr>
+<tr><td>DAgger student, best round</td><td class="n">57.6–59.2 %</td><td class="n">15.4 %</td><td class="n">2.1 %</td><td class="n">14.9 s</td></tr>
+<tr class="hl"><td>residual PPO (init std −2.0)</td><td class="n">58.9 %</td><td class="n">15.5 %</td><td class="n">1.8 %</td><td class="n">14.8 s</td></tr>
+<tr><td>residual PPO, default std (failed)</td><td class="n">32.7 %</td><td class="n">–</td><td class="n">–</td><td class="n">–</td></tr>
+</table></div>
+<p class="small">Rule added to the recipe: match the exploration std to the base's robustness. If the first training window sits more than 10 pp below the base's deterministic score, the residual is at the wrong operating point.</p>
+</section>
+
+<section id="next">
+<h2>Open items</h2>
+<div class="tbl"><table>
+<tr><th>Item</th><th>Needs</th><th>Expected effect</th></tr>
+<tr><td>Run qplan_v1 + corrected tracker + fast controller on the robot</td><td>arm on, D435 or ZED tracker</td><td>the first real test of the planner; robot loop of 20 runs per iteration with monitor labels</td></tr>
+<tr><td>ZED 2i tracker</td><td>a USB 3 port (it is on a USB 2 hub); board calibration at (0.4, 0, 0)</td><td>replaces the D435; software ready</td></tr>
+<tr><td>Re-run diverse-object DAgger with the suction fix</td><td>twin only</td><td>teacher 50 → 80 %+; a stronger base for env v2/v3</td></tr>
+<tr><td>Faster teacher at the 3° bound</td><td>twin only</td><td>the remaining 1.2 s in the approach</td></tr>
+<tr><td>Scripted-phase speed pass 2</td><td>controller only</td><td>−11 s per run (scripted peaks 32 °/s, lighter calibration)</td></tr>
+<tr><td>Monitor fixed-camera localisation</td><td>depth-first like the tracker</td><td>reliable verdicts with many objects</td></tr>
+<tr><td>Pi feedback broadcaster deaths (5 today)</td><td>root cause on the Pi</td><td>no more mid-series relaunches</td></tr>
+<tr><td>IL v2 (DP / CFM / ACT from cuRobo, vision)</td><td>plan exists</td><td>generative proposals for the planner</td></tr>
+</table></div>
+<details><summary>Repository map</summary>
+<ul><li><code>rl/env_warp.py</code> drive model · <code>rl/env_paper.py</code> task · <code>rl/env_v2.py</code> objects + walls · <code>rl/env_v3.py</code> obstacles</li>
+<li><code>rl/bc_curobo.py</code> teacher + DAgger · <code>rl/ppo.py</code> residual PPO · <code>rl/qplan/</code> critic, planner, export</li>
+<li><code>rl/export_trt.py</code> · <code>rl/real_policy_ctrl.py</code> controller · <code>rl/rgb_track.py</code>, <code>rl/zed_track.py</code> trackers · <code>rl/success_monitor.py</code></li>
+<li><code>rl/FINDINGS.md</code> items 1–27 · <code>policy/PLAN_QPLANNING.md</code> · <code>policy/PLAN_IL_V2_CUROBO_WARP.md</code> · README (pipeline diagrams)</li></ul></details>
+</section>
+</div>
+
+<script>
+(function(){
+const tabs=[...document.querySelectorAll('nav [role=tab]')],secs=[...document.querySelectorAll('section')];
+function show(id){tabs.forEach(b=>b.setAttribute('aria-selected',b.dataset.t===id));secs.forEach(s=>s.classList.toggle('on',s.id===id));try{localStorage.setItem('p630tab',id)}catch(e){}}
+tabs.forEach(b=>b.addEventListener('click',()=>show(b.dataset.t)));
+try{const t=localStorage.getItem('p630tab');if(t&&secs.some(s=>s.id===t))show(t)}catch(e){}
+
+/* pipeline */
+const stages=[
+ ['twin','Twin','mujoco_warp, 4096 worlds, the Pi law inside every 10 ms tick (K0 10, lead 45 ms, spline, 50 °/s, 800 °/s², 45 ms dead time). Validated on hardware probes: onset 60 ms, rise 0.24 s, settle 0.43 s. Peaks read 25 % high; timing exact.'],
+ ['teacher','cuRobo teacher','Transit plans from cuRobo (L-BFGS B-spline, fast retiming from the sweep: 2.35 s mean) plus a scripted 20 mm slow press. The press depth was the blocker on the measured drive: 4 mm → 3 % teacher success, 20 mm → 91 %.'],
+ ['dagger','BC + DAgger','MLP [256,128,64] ELU clone with mu = atanh(a). Rounds with β 0.5 / 0.3 / 0.1 / 0 and IK-waypoint relabelling. Rounds are noisy (41 / 36 / 85 / 62 / 70 / 88 %): keep the best-scoring round. Round 10 = 87.8 %.'],
+ ['resid','Residual PPO','Frozen DAgger base + 0.3·tanh(residual), output layer zero-initialised, privileged critic (seal state + DR params), lr 5e-5, clip 0.1, 8M steps. 87.9 → 94.7 %; residual magnitude stays ~0.02. Plain PPO from the same init decays to ≤24 %.'],
+ ['speed','Speed residual','Residual on the residual with a 3° action bound (base rescaled by 2/3 so it reproduces its trained behaviour), time penalty −0.1/decision, speed hinge at 32 °/s. 95.3 → 96.4 %, seal 5.7 → 5.3 s, goal 8.2 → 7.8 s.'],
+ ['trt','TensorRT export','Fused deterministic graph (base + residuals, later + the Q-planner) → ONNX → .plan, built on the controller GPU (engines are GPU-specific). 0.14–0.27 ms per call; verified against torch to 1e-5.'],
+ ['ctrl','Controller','rl/real_policy_ctrl.py at 10 Hz: observation rebuilt by MuJoCo FK exactly as the twin (max diff 3e-7), targets welded on the Pi as a uniform cubic B-spline, bounded 3° lead, torque contact guard, guarded press, scripted lift, live tracker, touch calibration, two-camera verdict.'],
+ ['robot','Robot','Series 1: 5/10. Series 2: 7 carries / 9 runs, 5 within 3.5 cm. Series 3 and 4 found and fixed the tracker bias sign; after the fix the cup attached on centre and placed at the goal.']];
+const g=document.getElementById('pipe');let x=10,w=112,gap=12,html='';
+stages.forEach((s,i)=>{const cx=x+i*(w+gap);html+=`<g class="st" data-i="${i}" style="cursor:pointer"><rect x="${cx}" y="60" width="${w}" height="56" rx="4" fill="var(--panel)"/><text x="${cx+w/2}" y="93" text-anchor="middle" fill="currentColor" stroke="none" font-weight="600">${s[1]}</text></g>`;if(i<stages.length-1)html+=`<line x1="${cx+w}" y1="88" x2="${cx+w+gap-1}" y2="88" marker-end="url(#pa)"/>`;});
+html+=`<path d="M${x+2*(w+gap)+w/2},116 L${x+2*(w+gap)+w/2},150 L${x+(w+gap)+w/2},150 L${x+(w+gap)+w/2},118" stroke-dasharray="4 3" marker-end="url(#pa)"/><text x="${x+1.5*(w+gap)+w/2}" y="166" text-anchor="middle" fill="currentColor" stroke="none" font-size="11.5">relabel with the teacher</text>`;
+html+=`<path d="M${x+6*(w+gap)+w/2},116 L${x+6*(w+gap)+w/2},150 L${x+w/2},150 L${x+w/2},118" stroke-dasharray="4 3" marker-end="url(#pa)"/><text x="${x+3.5*(w+gap)}" y="190" text-anchor="middle" fill="currentColor" stroke="none" font-size="11.5">--selftest: the controller path replayed in the twin (verified to 3e-7)</text>`;
+g.innerHTML=html;
+const sb=document.getElementById('stagebtns'),sd=document.getElementById('stagedetail');
+stages.forEach((s,i)=>{const b=document.createElement('button');b.textContent=s[1];b.setAttribute('aria-pressed','false');b.addEventListener('click',()=>sel(i));sb.appendChild(b);});
+function sel(i){sd.innerHTML='<strong>'+stages[i][1]+'.</strong> '+stages[i][2];[...sb.children].forEach((b,j)=>b.setAttribute('aria-pressed',String(i===j)));[...g.querySelectorAll('.st rect')].forEach((r,j)=>r.setAttribute('stroke',i===j?'var(--accent2)':'currentColor'));}
+g.querySelectorAll('.st').forEach(el=>el.addEventListener('click',()=>sel(+el.dataset.i)));sel(3);
+
+/* generic bar helpers */
+function tipOn(fig){const t=fig.querySelector('.tip');return{show(e,txt){const r=fig.getBoundingClientRect();t.textContent=txt;t.style.left=(e.clientX-r.left)+'px';t.style.top=(e.clientY-r.top)+'px';t.style.opacity=1},hide(){t.style.opacity=0}}}
+function bars(figId,rows,vmax,unit,colors){const fig=document.getElementById(figId),svg=fig.querySelector('svg'),tp=tipOn(fig);const W=900,L=300,R=40,top=20,bh=30,gapy=14;let h='';
+rows.forEach((r,i)=>{const y=top+i*(bh+gapy);const w=(W-L-R)*r.v/vmax;h+=`<text x="${L-10}" y="${y+bh/2+5}" text-anchor="end" fill="currentColor" font-size="13">${r.l}</text><rect class="b" data-t="${r.l}: ${r.v} ${unit}" x="${L}" y="${y}" width="${w}" height="${bh}" rx="3" fill="${colors[i]||'var(--accent)'}"/><text x="${L+w+8}" y="${y+bh/2+5}" fill="currentColor" font-size="13" font-family="Source Code Pro, monospace">${r.v}</text>`;});
+[0.25,0.5,0.75,1].forEach(f=>{const x=L+(W-L-R)*f;h+=`<line x1="${x}" y1="${top-6}" x2="${x}" y2="${top+rows.length*(bh+gapy)}" stroke="var(--line)" stroke-dasharray="2 3"/><text x="${x}" y="${top+rows.length*(bh+gapy)+16}" text-anchor="middle" fill="var(--muted)" font-size="11">${Math.round(vmax*f)}</text>`});
+svg.innerHTML=h;svg.querySelectorAll('.b').forEach(b=>{b.addEventListener('mousemove',e=>tp.show(e,b.dataset.t));b.addEventListener('mouseleave',tp.hide)});}
+bars('drivechart',[{l:'old twin (K0 20, linear)',v:64.7},{l:'K0 10, linear',v:34.8},{l:'K0 10, spline, no clip',v:41.1},{l:'deployed law (new twin)',v:41.1},{l:'real robot (median of 7 runs)',v:27}],70,'°/s',['var(--bad)','var(--accent)','var(--accent)','var(--accent2)','var(--ok)']);
+
+/* robot series */
+const series={s2:[['1','cylinder','carried, 6 cm off',''],['2','cup','carried, 6 cm off',''],['3','cup','placed at goal','verified on camera'],['4','can','tipped on release','→ guarded settle added'],['5','cup','placed, 3.4 cm',''],['6','cylinder','placed','camera verdict wrong, confirmed by eye'],['7','3 cm object','placed, 1.9 cm',''],['8','2.6 cm object','placed after 7 failed attempts','thin object: z-shift + floor rules'],['9','open-top cup','no seal, twice','unsealable']],
+s3:[['1','far can','carried, 8 cm off','1.5 cm attach offset'],['2','grey cup','placed 2–4 cm','ok'],['3','merged blob','nothing moved','colour tracker fused two cans + shadows'],['4','can → bottle','pressed the bottle at the elbow limit','tracker followed the LARGEST blob mid-approach'],['5','red bottle','no seal','sloped cap'],['6','grey cup','carried, 8 cm off','attached 13 mm off-centre (+y)']],
+s4:[['1','grey cup','nothing moved','0.5 s attach dwell → false attach; reverted to 1.0 s'],['2','grey cup','placed at goal (confirmed by eye)','corrected bias: attach offset (0, 0); planner-free fast policy; 43 s total']]};
+const tb=document.querySelector('#runtbl tbody');function fill(k){tb.innerHTML=series[k].map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td><td class="${/placed|ok/.test(r[2])?'ok':(/no seal|nothing|pressed|tipped/.test(r[2])?'bad':'')}">${r[2]}</td><td>${r[3]}</td></tr>`).join('')}
+document.querySelectorAll('input[name=ser]').forEach(r=>r.addEventListener('change',()=>fill(r.value)));fill('s2');
+
+/* cycle time */
+const phases=['calibration','approach','press + lift','carry','place + settle','release + home'];
+const tv=[{n:'series 2',v:[9,3.3,6.5,4,8.5,12]},{n:'fast, s4_02',v:[14.2,5.8,4.1,4.1,6.5,6.1]},{n:'next pass',v:[7,4.5,3.5,3.5,5,4.5]}];
+const pc=['#1f6f8b','#3f8fae','#c0611e','#e28d4f','#5e6d78','#95a3ac'];
+function drawTime(){const fig=document.getElementById('timechart'),svg=fig.querySelector('svg'),tp=tipOn(fig);const on=[...document.querySelectorAll('.tv')].filter(c=>c.checked).map(c=>+c.value);const W=900,L=120,R=30,top=24,bh=34,gapy=18,vmax=50;let h='';
+on.forEach((ti,row)=>{const y=top+row*(bh+gapy);let x=L;h+=`<text x="${L-10}" y="${y+bh/2+5}" text-anchor="end" fill="currentColor" font-size="13">${tv[ti].n}</text>`;tv[ti].v.forEach((v,pi)=>{const w=(W-L-R)*v/vmax;h+=`<rect class="b" data-t="${phases[pi]}: ${v} s" x="${x}" y="${y}" width="${w}" height="${bh}" fill="${pc[pi]}"/>`;x+=w;});const tot=tv[ti].v.reduce((a,b)=>a+b,0).toFixed(1);h+=`<text x="${x+8}" y="${y+bh/2+5}" fill="currentColor" font-size="13" font-family="Source Code Pro, monospace">${tot} s</text>`;});
+[10,20,30,40,50].forEach(s=>{const x=L+(W-L-R)*s/vmax;h+=`<line x1="${x}" y1="${top-8}" x2="${x}" y2="${top+on.length*(bh+gapy)}" stroke="var(--line)" stroke-dasharray="2 3"/><text x="${x}" y="${top+on.length*(bh+gapy)+16}" text-anchor="middle" fill="var(--muted)" font-size="11">${s} s</text>`});
+phases.forEach((p,i)=>{h+=`<rect x="${L+i*128}" y="${210}" width="12" height="12" fill="${pc[i]}"/><text x="${L+i*128+16}" y="${221}" fill="currentColor" font-size="11.5">${p}</text>`});
+svg.innerHTML=h;svg.querySelectorAll('.b').forEach(b=>{b.addEventListener('mousemove',e=>tp.show(e,b.dataset.t));b.addEventListener('mouseleave',tp.hide)});}
+document.querySelectorAll('.tv').forEach(c=>c.addEventListener('change',drawTime));drawTime();
+
+/* qplan grouped bars */
+(function(){const fig=document.getElementById('qchart'),svg=fig.querySelector('svg'),tp=tipOn(fig);
+const metrics=[{n:'success %',v:[96.8,88.3,99.0,98.2],max:100,lo:80},{n:'time to goal (s)',v:[7.8,7.3,7.1,7.3],max:9,lo:6},{n:'peak |q̇| p90 (°/s)',v:[43.5,53.2,48.5,33.5],max:60,lo:20}];
+const pol=['frozen policy','blanket ×1.3','planner, no speed head','planner qplan_v1'],pc2=['#5e6d78','#b23a3a','#3f8fae','#c0611e'];
+const W=900,gw=250,gx0=40,top=30,H=160;let h='';
+metrics.forEach((m,mi)=>{const gx=gx0+mi*(gw+40);h+=`<text x="${gx+gw/2}" y="${top-12}" text-anchor="middle" fill="currentColor" font-size="13" font-weight="600">${m.n}</text><line x1="${gx}" y1="${top+H}" x2="${gx+gw}" y2="${top+H}" stroke="var(--line)"/>`;
+m.v.forEach((v,pi)=>{const bw=gw/4-8,x=gx+pi*(gw/4)+4,bh=H*(v-m.lo)/(m.max-m.lo),y=top+H-bh;h+=`<rect class="b" data-t="${pol[pi]}: ${v}" x="${x}" y="${y}" width="${bw}" height="${bh}" fill="${pc2[pi]}" rx="2"/><text x="${x+bw/2}" y="${y-4}" text-anchor="middle" fill="currentColor" font-size="11" font-family="Source Code Pro, monospace">${v}</text>`;});
+h+=`<text x="${gx}" y="${top+H+14}" fill="var(--muted)" font-size="10.5">axis from ${m.lo}</text>`;});
+pol.forEach((p,i)=>{h+=`<rect x="${gx0+i*210}" y="${228}" width="12" height="12" fill="${pc2[i]}"/><text x="${gx0+i*210+16}" y="${239}" fill="currentColor" font-size="11.5">${p}</text>`});
+svg.innerHTML=h;svg.querySelectorAll('.b').forEach(b=>{b.addEventListener('mousemove',e=>tp.show(e,b.dataset.t));b.addEventListener('mouseleave',tp.hide)});})();
+})();
+</script>
