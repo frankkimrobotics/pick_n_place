@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wrench-Limited Extraction · myCobot Pro 630</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;500;600;700;800&family=Source+Code+Pro:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#0c121b; --panel:#121b27; --panel2:#0e1621; --line:#233141;
+  --ink:#e9eef5; --muted:#8a99ac; --faint:#5c6b7d;
+  --accent:#34c6d4; --accent-dim:#1f8f9b;
+  --good:#5fbf86; --warn:#eaa24e; --bad:#ef5f6b;
+  --grid:rgba(138,153,172,.14);
+  --shadow:0 1px 0 rgba(255,255,255,.03), 0 8px 30px rgba(0,0,0,.35);
+}
+@media (prefers-color-scheme: light){
+  :root{
+    --bg:#eef2f6; --panel:#ffffff; --panel2:#f4f7fa; --line:#d6dee7;
+    --ink:#132030; --muted:#56657a; --faint:#8695a7;
+    --accent:#0e97a6; --accent-dim:#53c3cd;
+    --good:#2f9e63; --warn:#c6801f; --bad:#d64452;
+    --grid:rgba(60,80,100,.12);
+    --shadow:0 1px 0 rgba(0,0,0,.02), 0 10px 30px rgba(30,50,70,.10);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0c121b; --panel:#121b27; --panel2:#0e1621; --line:#233141;
+  --ink:#e9eef5; --muted:#8a99ac; --faint:#5c6b7d;
+  --accent:#34c6d4; --accent-dim:#1f8f9b;
+  --good:#5fbf86; --warn:#eaa24e; --bad:#ef5f6b;
+  --grid:rgba(138,153,172,.14);
+  --shadow:0 1px 0 rgba(255,255,255,.03), 0 8px 30px rgba(0,0,0,.35);
+}
+:root[data-theme="light"]{
+  --bg:#eef2f6; --panel:#ffffff; --panel2:#f4f7fa; --line:#d6dee7;
+  --ink:#132030; --muted:#56657a; --faint:#8695a7;
+  --accent:#0e97a6; --accent-dim:#53c3cd;
+  --good:#2f9e63; --warn:#c6801f; --bad:#d64452;
+  --grid:rgba(60,80,100,.12);
+  --shadow:0 1px 0 rgba(0,0,0,.02), 0 10px 30px rgba(30,50,70,.10);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion: reduce){html{scroll-behavior:auto}}
+body{
+  margin:0;background:var(--bg);color:var(--ink);
+  font-family:"Source Sans 3",system-ui,-apple-system,sans-serif;
+  font-size:16px;line-height:1.55;-webkit-font-smoothing:antialiased;
+  font-variant-numeric:tabular-nums;
+}
+.mono{font-family:"Source Code Pro",ui-monospace,SFMono-Regular,Menlo,monospace}
+.wrap{max-width:960px;margin:0 auto;padding:0 20px}
+a{color:var(--accent)}
+
+/* top bar */
+.bar{position:sticky;top:0;z-index:40;background:color-mix(in srgb,var(--bg) 86%,transparent);
+  backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.bar .wrap{display:flex;align-items:center;gap:18px;height:52px}
+.brand{font-family:"Source Code Pro",monospace;font-weight:600;font-size:.82rem;letter-spacing:.04em;color:var(--ink);white-space:nowrap}
+.brand b{color:var(--accent)}
+.navlinks{display:flex;gap:16px;margin-left:auto;overflow-x:auto}
+.navlinks a{font-family:"Source Code Pro",monospace;font-size:.74rem;letter-spacing:.03em;color:var(--muted);text-decoration:none;text-transform:uppercase;white-space:nowrap}
+.navlinks a:hover{color:var(--accent)}
+.tgl{background:none;border:1px solid var(--line);color:var(--muted);border-radius:7px;width:34px;height:30px;cursor:pointer;font-size:.9rem;flex:none}
+.tgl:hover{border-color:var(--accent);color:var(--accent)}
+.tgl:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* hero */
+.hero{padding:54px 0 30px;border-bottom:1px solid var(--line)}
+.eyebrow{font-family:"Source Code Pro",monospace;font-size:.75rem;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin:0 0 14px}
+h1{font-size:clamp(2.1rem,5.2vw,3.3rem);font-weight:800;line-height:1.03;letter-spacing:-.02em;margin:0 0 14px;text-wrap:balance}
+.lede{color:var(--muted);font-size:1.12rem;max-width:64ch;margin:0 0 26px}
+.statrow{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:28px}
+.stat{flex:1 1 150px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;box-shadow:var(--shadow)}
+.stat .v{font-family:"Source Code Pro",monospace;font-size:1.9rem;font-weight:600;letter-spacing:-.01em;line-height:1}
+.stat .l{font-size:.82rem;color:var(--muted);margin-top:7px}
+.stat.ok .v{color:var(--good)} .stat.sig .v{color:var(--accent)} .stat.amb .v{color:var(--warn)}
+
+figure.scope{margin:0;background:
+    linear-gradient(var(--grid) 1px,transparent 1px) 0 0/100% 28px,
+    var(--panel2);
+  border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:var(--shadow)}
+figure.scope canvas{display:block;width:100%;height:auto}
+figcaption{font-family:"Source Code Pro",monospace;font-size:.72rem;color:var(--faint);
+  padding:9px 14px;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+
+/* sections */
+section{padding:46px 0;border-bottom:1px solid var(--line)}
+h2{font-size:1.65rem;font-weight:700;letter-spacing:-.015em;margin:0 0 6px;text-wrap:balance}
+h2 .n{font-family:"Source Code Pro",monospace;font-size:.95rem;color:var(--accent);font-weight:500;margin-right:12px}
+.sub{color:var(--muted);max-width:66ch;margin:0 0 24px}
+h3{font-size:1.05rem;font-weight:700;margin:26px 0 8px}
+p{max-width:68ch}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:720px){.grid2{grid-template-columns:1fr}}
+
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;box-shadow:var(--shadow)}
+
+/* bug cards */
+.bug{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--bad);
+  border-radius:11px;padding:15px 17px}
+.bug h4{margin:0 0 6px;font-size:1rem;font-weight:700}
+.bug .sym{color:var(--muted);font-size:.92rem;margin:0 0 8px}
+.bug .fix{font-size:.9rem;color:var(--ink);margin:0;padding-top:8px;border-top:1px dashed var(--line)}
+.bug .fix b{color:var(--good);font-family:"Source Code Pro",monospace;font-size:.8rem;letter-spacing:.02em;text-transform:uppercase;font-weight:600}
+.teacherbar{display:flex;align-items:center;gap:14px;margin:18px 0 4px;flex-wrap:wrap}
+.chip{font-family:"Source Code Pro",monospace;font-size:.82rem;padding:5px 11px;border-radius:999px;border:1px solid var(--line);white-space:nowrap}
+.chip.bad{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 45%,var(--line))}
+.chip.good{color:var(--good);border-color:color-mix(in srgb,var(--good) 45%,var(--line))}
+.arrow{color:var(--faint);font-size:1.2rem}
+
+/* interactive wrench explorer */
+.explorer{display:grid;grid-template-columns:minmax(0,1fr) 250px;gap:18px;align-items:start}
+@media(max-width:720px){.explorer{grid-template-columns:1fr}}
+#wrenchCanvasWrap{background:var(--panel2);border:1px solid var(--line);border-radius:12px;overflow:hidden;touch-action:none}
+#wrenchCanvas{display:block;width:100%;height:auto;cursor:grab}
+#wrenchCanvas:active{cursor:grabbing}
+.readout{display:flex;flex-direction:column;gap:12px}
+.gauge{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.gauge .big{font-family:"Source Code Pro",monospace;font-size:2.1rem;font-weight:600;line-height:1}
+.gauge .cap{font-size:.8rem;color:var(--muted);margin-top:4px}
+.state{font-family:"Source Code Pro",monospace;font-weight:600;font-size:.95rem;padding:10px 14px;border-radius:10px;text-align:center;letter-spacing:.03em}
+.state.sealed{background:color-mix(in srgb,var(--good) 16%,transparent);color:var(--good);border:1px solid color-mix(in srgb,var(--good) 40%,var(--line))}
+.state.broken{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad);border:1px solid color-mix(in srgb,var(--bad) 40%,var(--line))}
+.ctl{display:flex;flex-direction:column;gap:5px}
+.ctl label{font-family:"Source Code Pro",monospace;font-size:.76rem;color:var(--muted);display:flex;justify-content:space-between}
+.ctl label b{color:var(--accent);font-weight:600}
+input[type=range]{width:100%;accent-color:var(--accent);height:22px}
+.hint{font-size:.82rem;color:var(--faint);margin:14px 0 0}
+
+/* journey chart */
+#journeyWrap{position:relative;background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:10px 6px 4px;touch-action:none}
+#journeyCanvas{display:block;width:100%;height:auto;cursor:crosshair}
+.jtip{position:absolute;pointer-events:none;opacity:0;transition:opacity .12s;
+  background:var(--panel);border:1px solid var(--accent);border-radius:9px;padding:9px 11px;
+  font-size:.82rem;max-width:230px;box-shadow:var(--shadow);z-index:5}
+.jtip .jt{font-family:"Source Code Pro",monospace;font-weight:600;color:var(--accent);font-size:.78rem;letter-spacing:.03em}
+.jtip .jv{font-family:"Source Code Pro",monospace;font-weight:600}
+.jtip .jn{color:var(--muted);margin-top:3px;display:block;line-height:1.35}
+@media(prefers-reduced-motion:reduce){.jtip{transition:none}}
+.leg{display:flex;gap:16px;flex-wrap:wrap;font-size:.8rem;color:var(--muted);margin-top:12px}
+.leg i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+
+/* cycle bar */
+.cyc{display:flex;height:46px;border-radius:10px;overflow:hidden;border:1px solid var(--line);margin:6px 0 10px}
+.cyc div{display:flex;align-items:center;justify-content:center;font-family:"Source Code Pro",monospace;font-size:.78rem;font-weight:600;color:#06121a;white-space:nowrap;overflow:hidden}
+.cyc .s1{background:var(--accent)} .cyc .s2{background:var(--good)} .cyc .s3{background:var(--warn)}
+.cyclab{display:flex;justify-content:space-between;font-size:.82rem;color:var(--muted);flex-wrap:wrap;gap:8px}
+
+/* data table */
+table{width:100%;border-collapse:collapse;font-size:.92rem;margin:4px 0}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line)}
+th{font-family:"Source Code Pro",monospace;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600}
+td.num,th.num{text-align:right;font-family:"Source Code Pro",monospace}
+.tag{font-family:"Source Code Pro",monospace;font-size:.72rem;padding:2px 8px;border-radius:999px;font-weight:600}
+.tag.g{background:color-mix(in srgb,var(--good) 18%,transparent);color:var(--good)}
+.tag.r{background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad)}
+.scrollx{overflow-x:auto}
+
+.note{font-size:.9rem;color:var(--muted);border-left:3px solid var(--accent);padding:4px 0 4px 14px;margin:18px 0}
+.kv{font-family:"Source Code Pro",monospace;font-size:.84rem}
+.kv b{color:var(--accent);font-weight:600}
+footer{padding:40px 0 70px;color:var(--faint);font-size:.85rem}
+footer .mono{font-size:.78rem;color:var(--faint)}
+</style>
+</head>
+<body>
+
+<div class="bar"><div class="wrap">
+  <span class="brand">pick_n_place · <b>wrench&nbsp;extraction</b></span>
+  <nav class="navlinks">
+    <a href="#task">Task</a><a href="#wrench">Wrench set</a><a href="#method">Method</a>
+    <a href="#journey">Journey</a><a href="#results">Results</a><a href="#robot">Robot</a>
+  </nav>
+  <button class="tgl" id="themeBtn" aria-label="Toggle light / dark theme" title="Toggle theme">◐</button>
+</div></div>
+
+<header class="hero"><div class="wrap">
+  <p class="eyebrow">myCobot Pro 630 · suction · reinforcement learning</p>
+  <h1>Picking a block blind from a tight pack — without tearing it off the cup.</h1>
+  <p class="lede">A vacuum-cup policy lifts the centre block out of a dense array whose neighbour
+  heights it can't see, carries it across the table, and sets it in a box — while keeping the
+  force on the seal inside the cup's admissible envelope. Trained entirely in a batched
+  MuJoCo-Warp twin of the real arm, it reaches <b>12 / 12 on unseen geometry with zero seal
+  breaks</b>.</p>
+
+  <div class="statrow">
+    <div class="stat ok"><div class="v">12/12</div><div class="l">unseen randomized scenes placed</div></div>
+    <div class="stat sig"><div class="v">0</div><div class="l">seal breaks across every eval</div></div>
+    <div class="stat amb"><div class="v">~10.3<span style="font-size:1rem"> s</span></div><div class="l">home-to-placed cycle time</div></div>
+  </div>
+
+  <figure class="scope">
+    <canvas id="hero" width="920" height="300" role="img"
+      aria-label="Animated side view: a suction cup descends onto the centre block of a tight array, seals, extracts it vertically, carries it to a box, and releases."></canvas>
+    <figcaption><span>LIVE TWIN · side view</span><span id="heroPhase">phase —</span></figcaption>
+  </figure>
+</div></header>
+
+<main>
+
+<section id="task"><div class="wrap">
+  <h2><span class="n">01</span>The task</h2>
+  <p class="sub">Nine blocks packed with 2–5&nbsp;mm gaps. The target is the centre one. The policy
+  is told a <em>noisy belief</em> of the heights — never the truth — so it doesn't know how far
+  it must pull before the block clears its neighbours.</p>
+  <div class="grid2">
+    <div class="panel">
+      <h3 style="margin-top:0">What makes it hard</h3>
+      <p style="margin:0">Pull too little and the block snags a taller neighbour on the way out.
+      Pull too hard, or swing it while carrying, and the transmitted force leaves the cup's
+      <b>admissible wrench set</b> — the seal lets go and the block drops. The safe window is
+      narrow and the geometry changes every scene.</p>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0">Not a vision model</h3>
+      <p style="margin:0">The policy reads a <b>33-dimensional state vector</b> — joint angles,
+      tool pose, target-relative offsets, the height belief, and the live wrench reading. On the
+      real arm those entries come from the depth + segmentation stack; in training, injected
+      belief noise stands in for that perception uncertainty.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="wrench"><div class="wrap">
+  <h2><span class="n">02</span>The constraint, hands-on</h2>
+  <p class="sub">A vacuum cup can only transmit so much before it peels. As the <em>lifting
+  tension</em> (pull) rises toward the cup's limit, the force left over for shear, peel and twist
+  collapses toward zero. Drag the demand point — or raise the pull — and watch the seal margin.</p>
+
+  <div class="explorer">
+    <div id="wrenchCanvasWrap">
+      <canvas id="wrenchCanvas" width="640" height="440"></canvas>
+    </div>
+    <div class="readout">
+      <div class="state sealed" id="wState">SEALED</div>
+      <div class="gauge">
+        <div class="big" id="wMargin" style="color:var(--good)">0.60</div>
+        <div class="cap">seal margin — how far inside the envelope (0 = at the edge)</div>
+      </div>
+      <div class="ctl">
+        <label>lift tension (pull) <b><span id="pullV">6.0</span> N</b></label>
+        <input type="range" id="pullR" min="0" max="18" step="0.1" value="6">
+      </div>
+      <div class="ctl">
+        <label>shear demand <b><span id="shearV">3.0</span> N</b></label>
+        <input type="range" id="shearR" min="0" max="12" step="0.1" value="3">
+      </div>
+      <p class="hint">Hold a demand outside the envelope for ~0.3&nbsp;s of wall-clock and the
+      block detaches. The trained policy keeps the margin positive the entire carry.</p>
+    </div>
+  </div>
+  <p class="kv" style="margin-top:16px">cup model &nbsp; <b>F_V</b> = 18 N vacuum &nbsp;·&nbsp; <b>μ</b> = 0.5 &nbsp;·&nbsp; shear limit = μ·(F_V − pull) &nbsp;·&nbsp; margin = min over all four limits</p>
+</div></section>
+
+<section id="method"><div class="wrap">
+  <h2><span class="n">03</span>How it was built</h2>
+  <p class="sub">A privileged scripted expert generates the data; behaviour cloning turns it into a
+  stateless policy. Reinforcement learning never produced the final weights — it was the
+  diagnostic that proved the task solvable and exposed the physics.</p>
+
+  <div class="panel" style="margin-bottom:24px">
+    <h3 style="margin-top:0">The pipeline</h3>
+    <div class="teacherbar">
+      <span class="chip">scripted waypoint teacher<br><span class="mono" style="font-size:.7rem;color:var(--muted)">privileged · wrench-governed</span></span>
+      <span class="arrow">→</span>
+      <span class="chip">behaviour cloning<br><span class="mono" style="font-size:.7rem;color:var(--muted)">h=512 · canonical obs · DART noise</span></span>
+      <span class="arrow">→</span>
+      <span class="chip good">stateless policy<br><span class="mono" style="font-size:.7rem;color:var(--muted)">obs → action · 12/12</span></span>
+    </div>
+    <p style="margin:12px 0 0">Two negative results shaped this. <b>DAgger consistently hurt</b>:
+    the waypoint teacher's labels are only valid near its own trajectory, so relabelling the
+    policy's drift states fed it systematic garbage — every DAgger round regressed. And
+    <b>PPO fine-tuning overfit or collapsed</b> once the imitation signal was gone. The winning
+    recipe is teacher-only cloning with exploration noise large enough that the teacher
+    <em>demonstrates its own corrections</em>.</p>
+  </div>
+
+  <h3>Four physics bugs — found by tracing the expert, not tuning the reward</h3>
+  <p style="margin-top:0;color:var(--muted)">Seven RL runs stalled before the real blockers
+  turned out to be in the simulated contact, not the learning. Tracing the scripted expert and
+  decomposing the interface force exposed each one. Before: <b>0%</b> of carries survived.
+  After: <b>128 / 128</b>.</p>
+
+  <div class="grid2" style="gap:14px">
+    <div class="bug">
+      <h4>Inverted cup axis</h4>
+      <p class="sym">The cup's pointing vector was negated, so tension and compression were
+      swapped — true vacuum pull was never checked against the 18 N limit.</p>
+      <p class="fix"><b>fix</b> use the tool z-axis directly (it already points at the block)</p>
+    </div>
+    <div class="bug">
+      <h4>Damper on absolute velocity</h4>
+      <p class="sym">The seal's damping acted on world-frame object speed — a 0.5 m/s carry
+      generated ~15 N of phantom drag-shear against an 8.6 N budget, so <em>every</em> transport
+      broke the seal.</p>
+      <p class="fix"><b>fix</b> damp the relative cup–object velocity instead</p>
+    </div>
+    <div class="bug">
+      <h4>Double-modelled contact</h4>
+      <p class="sym">A rigid cup-tip contact fought the suction spring once sealed — 9 N standing
+      preload, 26 N spikes — manufacturing breaks that no real cup would see.</p>
+      <p class="fix"><b>fix</b> exclude the cup–block contact while the seal is active</p>
+    </div>
+    <div class="bug">
+      <h4>Carry snagged the wall</h4>
+      <p class="sym">The block hangs ~5 cm below the tool; the box walls top out at 0.25 m, so a
+      low carry path dragged the block into the rim and sheared it off.</p>
+      <p class="fix"><b>fix</b> carry at 0.33 m, above every obstacle</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="journey"><div class="wrap">
+  <h2><span class="n">04</span>The distillation journey</h2>
+  <p class="sub">Success on held-out scenes across the cloning rounds. Hover any point for what
+  changed and what it taught. The dips are not noise — each is a specific, now-understood
+  failure of imitation.</p>
+
+  <div id="journeyWrap">
+    <canvas id="journeyCanvas" width="920" height="340"></canvas>
+    <div class="jtip" id="jtip"></div>
+  </div>
+  <div class="leg">
+    <span><i style="background:var(--good)"></i>solved (≥90%)</span>
+    <span><i style="background:var(--warn)"></i>partial</span>
+    <span><i style="background:var(--bad)"></i>collapsed</span>
+    <span style="color:var(--faint)">x-axis: cloning round · y-axis: unseen-scene success</span>
+  </div>
+</div></section>
+
+<section id="results"><div class="wrap">
+  <h2><span class="n">05</span>What it does now</h2>
+  <p class="sub">Evaluated from the home pose on twelve scenes with geometry never seen in
+  training — random block size, gap, array position, and heights.</p>
+
+  <div class="scrollx panel" style="padding:6px 6px 2px;margin-bottom:26px">
+    <table>
+      <thead><tr><th>metric</th><th class="num">value</th><th>note</th></tr></thead>
+      <tbody>
+        <tr><td>placed in box</td><td class="num"><span class="tag g">12 / 12</span></td><td>unseen randomized geometry</td></tr>
+        <tr><td>seal breaks</td><td class="num"><span class="tag g">0 / 12</span></td><td>wrench margin stayed positive throughout</td></tr>
+        <tr><td>neighbour disturbance</td><td class="num">~28 mm</td><td>total shift summed over 8 neighbours</td></tr>
+        <tr><td>cycle time</td><td class="num">~10.3 s</td><td>home → approach → seal → extract → carry → place</td></tr>
+        <tr><td>training variants</td><td class="num">32</td><td>batched across 512 parallel worlds</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="grid2">
+    <div class="panel">
+      <h3 style="margin-top:0">Where the 10.3 s goes</h3>
+      <div class="cyc" aria-hidden="true">
+        <div class="s1" style="flex:40">4.0 s</div>
+        <div class="s2" style="flex:5">0.5</div>
+        <div class="s3" style="flex:58">5.8 s</div>
+      </div>
+      <div class="cyclab">
+        <span><span style="color:var(--accent)">■</span> approach + press · 40</span>
+        <span><span style="color:var(--good)">■</span> extract · 5</span>
+        <span><span style="color:var(--warn)">■</span> carry + place · 58</span>
+      </div>
+      <p style="font-size:.92rem;margin-bottom:0">Decisions per phase. Press and carry dominate —
+      and both are slow <em>by constraint</em>, not by timidity.</p>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0">Can it go faster?</h3>
+      <p style="margin-top:0">Amplifying the policy's motion by 1.0×, 1.3×, 1.6× gave the
+      <em>identical</em> result each time:</p>
+      <p class="kv" style="margin:0 0 8px"><b>12/12</b> · 0 breaks · <b>106</b> decisions — flat.</p>
+      <p style="margin:0">The arm isn't slow from caution — in free motion it already uses only
+      ~60% of its speed clamp. The remaining time lives in the seal-limited press and carry,
+      where the margin <em>is</em> the safety buffer. Going faster there means spending exactly
+      the constraint this whole project protects.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="robot"><div class="wrap">
+  <h2><span class="n">06</span>From twin to real arm</h2>
+  <p class="sub">The policy is state-based, and its observation maps one-to-one onto the real
+  perception stack — so deployment reuses the controller already proven on this hardware.</p>
+  <div class="grid2">
+    <div class="panel">
+      <h3 style="margin-top:0">Bring-up, verified</h3>
+      <p style="margin:0">MPC stack relaunched on the Pi, feedback streaming at 2 ms latency, a
+      1° joint probe confirming the drives follow, and object localization from the calibrated
+      fixed depth camera. The streaming controller (<span class="mono">real_wrench_ctrl.py</span>)
+      maps sim decisions to the measured velocity-mode drive with the same torque-contact guard
+      and lead-limited reference used in prior real runs.</p>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0">Safety by construction</h3>
+      <p style="margin:0">Suction releases only when the block is both cleared and over the box —
+      the executor gates the pump the same way the sim does. A joint-space guard box, torque
+      abort, and touch-only demo mode bound every motion; an interrupt stops the stream and drops
+      vacuum.</p>
+    </div>
+  </div>
+  <p class="note">Appearance is irrelevant to a state-based policy by construction — the showcase
+  run below varies lighting, colour and block palette on top of the geometry randomization, and
+  the behaviour is unchanged: 6 / 6, zero breaks.</p>
+</div></section>
+
+</main>
+
+<footer><div class="wrap">
+  <p>Built on a measured-drive MuJoCo-Warp twin of the myCobot Pro 630. Scripted expert →
+  behaviour cloning → stateless policy; reinforcement learning as the diagnostic that found the
+  physics.</p>
+  <p class="mono">repo: frankkimrobotics/pick_n_place · rl/wrench_extract.py · policy_final_12of12</p>
+</div></footer>
+
+<script>
+(function(){
+  "use strict";
+  var reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* ---- theme toggle ---- */
+  var btn = document.getElementById("themeBtn");
+  function cur(){ return document.documentElement.getAttribute("data-theme")
+      || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"); }
+  btn.addEventListener("click", function(){
+    document.documentElement.setAttribute("data-theme", cur()==="dark" ? "light" : "dark");
+    draws.forEach(function(f){ f(); });
+  });
+  function css(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+  function fitHiDPI(cv){
+    var r = cv.getBoundingClientRect(), d = Math.min(2, window.devicePixelRatio||1);
+    if(!r.width) return cv.getContext("2d");
+    cv.width = Math.round(r.width*d); cv.height = Math.round(r.height*d);
+    var ctx = cv.getContext("2d"); ctx.setTransform(d,0,0,d,0,0);
+    cv._w = r.width; cv._h = r.height; return ctx;
+  }
+  var draws = [];
+
+  /* ================= HERO: pick/extract/carry/place loop ================= */
+  (function(){
+    var cv = document.getElementById("hero");
+    var cap = document.getElementById("heroPhase");
+    var ctx, W, H;
+    // scene: a row of blocks, cup picks the centre, lifts, carries right, drops in a box
+    var blocks = [40,58,36,52,30,48,44], target = 3; // heights px
+    function layout(){ ctx = fitHiDPI(cv); W = cv._w; H = cv._h; }
+    function draw(t){
+      if(!ctx) layout();
+      var ink=css("--ink"), acc=css("--accent"), good=css("--good"),
+          warn=css("--warn"), bad=css("--bad"), line=css("--line"), muted=css("--muted");
+      ctx.clearRect(0,0,W,H);
+      var floor = H-46, bw = 34, gap = 6;
+      var arrX0 = 70, boxX = W-140;
+      var totalW = blocks.length*(bw+gap);
+      var x0 = arrX0;
+      // box
+      ctx.strokeStyle = line; ctx.lineWidth=2;
+      ctx.strokeRect(boxX-6, floor-54, 96, 54);
+      ctx.fillStyle = muted; ctx.font = "11px 'Source Code Pro',monospace";
+      ctx.fillText("box", boxX+30, floor-60);
+      // floor
+      ctx.strokeStyle = line; ctx.beginPath(); ctx.moveTo(20,floor); ctx.lineTo(W-20,floor); ctx.stroke();
+
+      // phase machine (period ~ 9s)
+      var P = reduce ? 0.18 : ((t/1000)%9)/9; // 0..1
+      var tgtX = x0 + target*(bw+gap) + bw/2;
+      var tgtTop = floor - blocks[target];
+      var cupX, cupY, carrying=false, phase="";
+      var liftH = 150;
+      if(P<0.18){ // descend
+        var k=P/0.18; cupX=tgtX; cupY=20+(tgtTop-28-20)*ease(k); phase="approach + press";
+      } else if(P<0.30){ cupX=tgtX; cupY=tgtTop-28; phase="seal"; }
+      else if(P<0.48){ var k=(P-0.30)/0.18; cupX=tgtX; cupY=(tgtTop-28)-(liftH)*ease(k); carrying=true; phase="extract"; }
+      else if(P<0.72){ var k=(P-0.48)/0.24; cupX=tgtX+(boxX+36-tgtX)*ease(k); cupY=(tgtTop-28)-liftH; carrying=true; phase="carry"; }
+      else if(P<0.86){ var k=(P-0.72)/0.14; cupX=boxX+36; cupY=((tgtTop-28)-liftH)+(floor-40-((tgtTop-28)-liftH))*ease(k); carrying=true; phase="lower + place"; }
+      else { cupX=boxX+36; cupY=((tgtTop-28)-liftH); carrying=false; phase="release → home"; }
+
+      // draw array blocks (target removed once carrying)
+      for(var i=0;i<blocks.length;i++){
+        if(i===target && (P>=0.30)) continue;
+        var bx = x0 + i*(bw+gap), h=blocks[i];
+        ctx.fillStyle = (i===target)? bad : "color-mix" in window ? css("--panel") : "#1d2836";
+        ctx.fillStyle = (i===target)? bad : css("--panel");
+        ctx.strokeStyle = (i===target)? bad : line; ctx.lineWidth = (i===target)?2:1.5;
+        roundRect(ctx, bx, floor-h, bw, h, 4); ctx.fill(); ctx.stroke();
+      }
+      // carried block
+      if(P>=0.30 && P<0.86){
+        var bh = blocks[target];
+        ctx.fillStyle = bad; ctx.strokeStyle=bad; ctx.lineWidth=2;
+        roundRect(ctx, cupX-bw/2, cupY+22, bw, bh, 4); ctx.fill(); ctx.stroke();
+      }
+      // placed block
+      if(P>=0.86){
+        var bh2=blocks[target];
+        ctx.fillStyle=bad; ctx.strokeStyle=bad; ctx.lineWidth=2;
+        roundRect(ctx, boxX+36-bw/2, floor-bh2, bw, bh2, 4); ctx.fill(); ctx.stroke();
+      }
+      // arm: vertical shaft + cup
+      ctx.strokeStyle = acc; ctx.lineWidth=3;
+      ctx.beginPath(); ctx.moveTo(cupX, 8); ctx.lineTo(cupX, cupY); ctx.stroke();
+      // cup
+      ctx.fillStyle = carrying? good : acc;
+      ctx.beginPath(); ctx.moveTo(cupX-13,cupY); ctx.lineTo(cupX+13,cupY);
+      ctx.lineTo(cupX+8,cupY+14); ctx.lineTo(cupX-8,cupY+14); ctx.closePath(); ctx.fill();
+      // seal glow when carrying
+      if(carrying){
+        ctx.strokeStyle = good; ctx.globalAlpha=.35; ctx.lineWidth=6;
+        ctx.beginPath(); ctx.moveTo(cupX-13,cupY+13); ctx.lineTo(cupX+13,cupY+13); ctx.stroke();
+        ctx.globalAlpha=1;
+      }
+      cap.textContent = "phase · "+phase;
+    }
+    function ease(x){ return x<.5 ? 2*x*x : 1-Math.pow(-2*x+2,2)/2; }
+    draws.push(function(){ layout(); draw(performance.now()); });
+    window.addEventListener("resize", function(){ layout(); if(reduce) draw(0); });
+    layout();
+    if(reduce){ draw(0); }
+    else { (function loop(t){ draw(t); requestAnimationFrame(loop); })(performance.now()); }
+  })();
+
+  function roundRect(c,x,y,w,h,r){ c.beginPath();
+    c.moveTo(x+r,y); c.arcTo(x+w,y,x+w,y+h,r); c.arcTo(x+w,y+h,x,y+h,r);
+    c.arcTo(x,y+h,x,y,r); c.arcTo(x,y,x+w,y,r); c.closePath(); }
+
+  /* ================= WRENCH-SET EXPLORER ================= */
+  (function(){
+    var cv = document.getElementById("wrenchCanvas");
+    var FV=18, MU=0.5, maxShear=12;
+    var pull=6, shear=3, ctx,W,H,pad=46;
+    var pullR=document.getElementById("pullR"), shearR=document.getElementById("shearR");
+    var pullV=document.getElementById("pullV"), shearV=document.getElementById("shearV");
+    var mEl=document.getElementById("wMargin"), sEl=document.getElementById("wState");
+
+    function layout(){ ctx=fitHiDPI(cv); W=cv._w; H=cv._h; }
+    function X(p){ return pad + (p/FV)*(W-pad-14); }
+    function Y(s){ return H-pad - (s/maxShear)*(H-pad-16); }
+    function limit(p){ return MU*Math.max(0,FV-p); }
+    function margin(){
+      var head = Math.max(0, FV-pull);
+      var mPull = 1 - pull/FV;
+      var mShear = head<=0 ? -1 : 1 - shear/(MU*head);
+      return Math.min(mPull, mShear);
+    }
+    function draw(){
+      if(!ctx) layout();
+      var ink=css("--ink"), acc=css("--accent"), good=css("--good"),
+          bad=css("--bad"), line=css("--line"), muted=css("--muted"), grid=css("--grid");
+      ctx.clearRect(0,0,W,H);
+      // grid
+      ctx.strokeStyle=grid; ctx.lineWidth=1; ctx.font="10px 'Source Code Pro',monospace"; ctx.fillStyle=muted;
+      for(var p=0;p<=18;p+=3){ ctx.beginPath(); ctx.moveTo(X(p),Y(0)); ctx.lineTo(X(p),Y(maxShear)); ctx.stroke();
+        ctx.fillText(p, X(p)-4, H-pad+16); }
+      for(var s=0;s<=12;s+=2){ ctx.beginPath(); ctx.moveTo(X(0),Y(s)); ctx.lineTo(X(18),Y(s)); ctx.stroke();
+        ctx.fillText(s, 14, Y(s)+3); }
+      // axes labels
+      ctx.fillStyle=muted; ctx.font="11px 'Source Code Pro',monospace";
+      ctx.fillText("pull (lift tension) → N", W/2-60, H-10);
+      ctx.save(); ctx.translate(13,H/2+40); ctx.rotate(-Math.PI/2); ctx.fillText("shear → N",0,0); ctx.restore();
+      // admissible region (triangle under shear = MU*(FV-pull))
+      ctx.beginPath(); ctx.moveTo(X(0),Y(0)); ctx.lineTo(X(0),Y(limit(0))); ctx.lineTo(X(FV),Y(0)); ctx.closePath();
+      ctx.fillStyle = "color-mix(in srgb,"+good+" 16%,transparent)"; ctx.fill();
+      ctx.strokeStyle=good; ctx.lineWidth=2; ctx.stroke();
+      // forbidden hatch label
+      ctx.fillStyle=muted; ctx.font="11px 'Source Code Pro',monospace";
+      ctx.fillText("admissible", X(2), Y(limit(2)/2));
+      ctx.fillStyle = "color-mix(in srgb,"+bad+" 70%,"+muted+")";
+      ctx.fillText("detach region", X(9), Y(9));
+      // demand point
+      var inside = margin()>=0;
+      var px=X(pull), py=Y(shear);
+      ctx.strokeStyle = inside?good:bad; ctx.lineWidth=1.5; ctx.setLineDash([4,4]);
+      ctx.beginPath(); ctx.moveTo(X(0),py); ctx.lineTo(px,py); ctx.moveTo(px,Y(0)); ctx.lineTo(px,py); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = inside?good:bad;
+      ctx.beginPath(); ctx.arc(px,py,8,0,7); ctx.fill();
+      ctx.strokeStyle=css("--panel"); ctx.lineWidth=2; ctx.stroke();
+    }
+    function sync(){
+      pullV.textContent=pull.toFixed(1); shearV.textContent=shear.toFixed(1);
+      pullR.value=pull; shearR.value=shear;
+      var m=margin();
+      mEl.textContent=(m<0?"":"+")+m.toFixed(2);
+      if(m>=0){ mEl.style.color=css("--good"); sEl.textContent="SEALED"; sEl.className="state sealed"; }
+      else { mEl.style.color=css("--bad"); sEl.textContent="DETACHING"; sEl.className="state broken"; }
+      draw();
+    }
+    pullR.addEventListener("input",function(){ pull=+pullR.value; if(shear>maxShear)shear=maxShear; sync(); });
+    shearR.addEventListener("input",function(){ shear=+shearR.value; sync(); });
+    function fromEvent(e){
+      var r=cv.getBoundingClientRect();
+      var cxp=(e.touches?e.touches[0].clientX:e.clientX)-r.left;
+      var cyp=(e.touches?e.touches[0].clientY:e.clientY)-r.top;
+      pull = Math.max(0,Math.min(FV, (cxp-pad)/(cv._w-pad-14)*FV));
+      shear= Math.max(0,Math.min(maxShear, (cv._h-pad-cyp)/(cv._h-pad-16)*maxShear));
+      sync();
+    }
+    var drag=false;
+    cv.addEventListener("pointerdown",function(e){ drag=true; cv.setPointerCapture(e.pointerId); fromEvent(e); });
+    cv.addEventListener("pointermove",function(e){ if(drag) fromEvent(e); });
+    cv.addEventListener("pointerup",function(){ drag=false; });
+    window.addEventListener("resize",function(){ layout(); draw(); });
+    draws.push(function(){ layout(); sync(); });
+    layout(); sync();
+  })();
+
+  /* ================= JOURNEY CHART ================= */
+  (function(){
+    var data = [
+      {id:"v3", lab:"fixed geometry", s:6,n:6, note:"Home-start baseline on one fixed layout — works."},
+      {id:"v4", lab:"+ random geometry", s:3,n:6, note:"Absolute-coordinate observations overfit each layout."},
+      {id:"v5", lab:"+ DAgger", s:0,n:6, note:"Stateful teacher mislabels the policy's off-trajectory states."},
+      {id:"v6", lab:"32 variants, clean", s:0,n:6, note:"h=256 network underfits the geometry diversity."},
+      {id:"v8", lab:"h512 + DART noise", s:9,n:12, note:"Bigger net; teacher must demonstrate its own corrections."},
+      {id:"v9", lab:"DAgger on v8", s:0,n:12, note:"DAgger regresses again — the poison is confirmed."},
+      {id:"v12",lab:"sharp-aligned teacher", s:4,n:12, note:"A discontinuous teacher clones badly."},
+      {id:"v13",lab:"smooth, slow descent", s:0,n:12, note:"Tiny press actions sink below the clone's noise floor."},
+      {id:"v14",lab:"canonical obs + runway", s:12,n:12, note:"Array-frame obs + press above the noise floor → solved."}
+    ];
+    var cv=document.getElementById("journeyCanvas"), tip=document.getElementById("jtip");
+    var ctx,W,H,padL=44,padR=16,padT=18,padB=42, pts=[];
+    function layout(){ ctx=fitHiDPI(cv); W=cv._w; H=cv._h; }
+    function col(v){ return v>=0.9?css("--good"):v>0?css("--warn"):css("--bad"); }
+    function draw(){
+      if(!ctx) layout();
+      var ink=css("--ink"), acc=css("--accent"), line=css("--line"), muted=css("--muted"), grid=css("--grid");
+      ctx.clearRect(0,0,W,H);
+      var x0=padL, x1=W-padR, y0=padT, y1=H-padB;
+      ctx.strokeStyle=grid; ctx.fillStyle=muted; ctx.font="10px 'Source Code Pro',monospace"; ctx.lineWidth=1;
+      [0,0.25,0.5,0.75,1].forEach(function(f){
+        var y=y1-(y1-y0)*f; ctx.beginPath(); ctx.moveTo(x0,y); ctx.lineTo(x1,y); ctx.stroke();
+        ctx.fillText(Math.round(f*100)+"%", 8, y+3);
+      });
+      pts = data.map(function(d,i){
+        return { x: x0 + (x1-x0)*(i/(data.length-1)), y: y1-(y1-y0)*(d.s/d.n), d:d };
+      });
+      // connecting line
+      ctx.strokeStyle=acc; ctx.lineWidth=2; ctx.globalAlpha=.55; ctx.beginPath();
+      pts.forEach(function(p,i){ i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y); }); ctx.stroke(); ctx.globalAlpha=1;
+      // points + x labels
+      pts.forEach(function(p){
+        ctx.fillStyle=col(p.d.s/p.d.n);
+        ctx.beginPath(); ctx.arc(p.x,p.y,6,0,7); ctx.fill();
+        ctx.strokeStyle=css("--panel2"); ctx.lineWidth=2; ctx.stroke();
+        ctx.fillStyle=muted; ctx.font="10px 'Source Code Pro',monospace";
+        ctx.save(); ctx.translate(p.x, y1+14); ctx.fillText(p.d.id, -8, 0); ctx.restore();
+      });
+      ctx.fillStyle=muted; ctx.font="11px 'Source Code Pro',monospace";
+    }
+    function hover(e){
+      var r=cv.getBoundingClientRect();
+      var mx=(e.touches?e.touches[0].clientX:e.clientX)-r.left;
+      var my=(e.touches?e.touches[0].clientY:e.clientY)-r.top;
+      var best=null,bd=1e9;
+      pts.forEach(function(p){ var d=Math.hypot(p.x-mx,p.y-my); if(d<bd){bd=d;best=p;} });
+      if(best && bd<40){
+        tip.style.opacity=1;
+        var left=Math.min(best.x+14, cv._w-220), top=Math.max(6,best.y-10);
+        tip.style.left=left+"px"; tip.style.top=top+"px";
+        tip.innerHTML='<span class="jt">'+best.d.id+' · '+best.d.lab+'</span>'+
+          '<div class="jv" style="color:'+col(best.d.s/best.d.n)+'">'+best.d.s+' / '+best.d.n+' placed</div>'+
+          '<span class="jn">'+best.d.note+'</span>';
+      } else tip.style.opacity=0;
+    }
+    cv.addEventListener("pointermove",hover);
+    cv.addEventListener("pointerleave",function(){ tip.style.opacity=0; });
+    cv.addEventListener("pointerdown",hover);
+    window.addEventListener("resize",function(){ layout(); draw(); });
+    draws.push(function(){ layout(); draw(); });
+    layout(); draw();
+  })();
+
+})();
+</script>
+</body>
+</html>
