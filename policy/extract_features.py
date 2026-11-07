@@ -37,6 +37,19 @@ def load_encoder(name):
         def fwd(px):
             # drop CLS: dinov2-base at 224px -> 16x16 = 256 patch tokens
             return mdl(pixel_values=px).last_hidden_state[:, 1:]
+    elif name == "cradio":
+        mdl = torch.hub.load('NVlabs/RADIO', 'radio_model', version='c-radio_v4-h',
+                             progress=True, skip_validation=True, trust_repo=True)
+        mdl = mdl.eval().to(DEV)
+        for p in mdl.parameters():
+            p.requires_grad_(False)
+        # RADIO expects raw [0,1] input (it normalizes internally)
+        mean = torch.zeros(1, 3, 1, 1)
+        std = torch.ones(1, 3, 1, 1)
+
+        def fwd(px):
+            out = mdl(px)
+            return out[1] if isinstance(out, tuple) else out.features   # [B,196,1280]
     elif name == "lingbot":
         from lingbot_vision import load_pretrained_backbone
         mdl, dim = load_pretrained_backbone(variant="base", device=DEV,
@@ -64,7 +77,7 @@ def frames_224(mp4):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--enc", required=True, choices=["clip", "dinov2", "lingbot"])
+    ap.add_argument("--enc", required=True, choices=["clip", "dinov2", "lingbot", "cradio"])
     ap.add_argument("--batch", type=int, default=64)
     a = ap.parse_args()
     fwd, mean, std = load_encoder(a.enc)

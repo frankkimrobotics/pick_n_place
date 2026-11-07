@@ -100,6 +100,9 @@ class Policy:
         if a.ckpt:
             ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
             self.model, self.action = ck["model"], ck["action"]
+            self.wrist_only = bool(ck.get("wrist_only", False))
+            if self.wrist_only:
+                tl.NIMG = 2
             self.spec = ck["spec"]
             self.lo = ck["lo"].to(dev)
             self.hi = ck["hi"].to(dev)
@@ -115,6 +118,7 @@ class Policy:
                 self.ctx.load_state_dict(ck["ctx"])
         else:                                             # --untrained smoke
             self.model, self.action = a.untrained, "q"
+            self.wrist_only = False
             self.spec = json.load(open(os.path.join(
                 os.path.expanduser(a.data), "dataset_spec.json")))
             self.lo = torch.full((7,), -1.0, device=dev)
@@ -194,6 +198,15 @@ def main():
     ap.add_argument("--steps_max", type=int, default=150,
                     help="max policy steps per pick episode")
     ap.add_argument("--gpu", type=int, default=0)
+    ap.add_argument("--max_objs", type=int, default=0,
+                    help="cap picks per scene (0 = all objects)")
+    ap.add_argument("--array", action="store_true",
+                    help="replace the sampled scene with a tight 3x3 block array; pick the centre block only")
+    ap.add_argument("--abrefit", action="store_true",
+                    help="ABPolicy-style continuity refit: constrain the new chunk's first two "
+                         "control points to continue the committed reference (C1), re-fit the next "
+                         "n_free points by least squares, keep the tail. Replaces the quintic bridge.")
+    ap.add_argument("--ab_free", type=int, default=4, help="free control points in the refit window")
     a = ap.parse_args()
     assert a.ckpt or a.untrained, "need --ckpt or --untrained"
     torch.manual_seed(0)
@@ -208,6 +221,26 @@ def main():
     demo = {"__file__": os.path.join(ROOT, "mjwarp_pick_demo.py")}
     exec(open(demo["__file__"]).read().split("if __name__")[0], demo)
     objs = dg.sample_scene(a.scene)
+    if a.array:
+        rng = np.random.default_rng(a.scene * 7919 + 77)
+        pitch_half = float(rng.uniform(0.015, 0.026))
+        gap = float(rng.uniform(0.002, 0.005))
+        pitch = 2 * pitch_half + gap
+        cx, cy = 0.36, 0.0
+        objs = []
+        order9 = [4] + [i for i in range(9) if i != 4]
+        for n_, cell in enumerate(order9):
+            r_, c_ = divmod(cell, 3)
+            hz = float(rng.uniform(0.015, 0.030))
+            x = cx + (r_ - 1) * pitch
+            y = cy + (c_ - 1) * pitch
+            rgba = [0.85, 0.2, 0.15] if n_ == 0 else list(rng.uniform(0.2, 0.9, 3))
+            objs.append(dict(
+                name=f"object{n_}", shape="box", kind="cube",
+                size=f"{pitch_half:.4f} {pitch_half:.4f} {hz:.4f}",
+                half_extents=[pitch_half, pitch_half, hz],
+                pos=[round(x, 4), round(y, 4), round(hz, 4)], yaw=0.0,
+                quat="1 0 0 0", rgba=[round(v, 3) for v in rgba] + [1.0]))
     light = dg.LIGHTS[a.scene % 3]
     xml = os.path.join(odir, "scene.xml")
     dg.build_scene_xml(objs, light, xml)
@@ -251,6 +284,31 @@ def main():
     H10 = (_bt**3 - 2 * _bt**2 + _bt) * (NB * CTRL_DT)
     H01 = -2 * _bt**3 + 3 * _bt**2
     H11 = (_bt**3 - _bt**2) * (NB * CTRL_DT)
+
+    # ---- ABPolicy continuity refit (https://teee000.github.io/ABPolicy/) ----
+    # clamped cubic: spline(0) = c0 ; spline'(0) = DEGREE*(c1-c0)/knotspan.
+    AB_KSPAN = cl.KNOTS[cl.DEGREE + 1] - cl.KNOTS[0]           # first internal span
+    AB_S = np.linspace(0.0, cl.T_SPAN, 64)
+    AB_PHI = np.stack([cl.bspline_basis(x) for x in AB_S])     # (64, 16)
+
+    def ab_refit(ctrl, anchor, n_free):
+        """Return control points whose spline continues (p0, v0) at s=0 and
+        stays least-squares-close to the predicted spline elsewhere."""
+        p0, v0, _ = anchor
+        v0 = np.clip(v0, -0.5, 0.5)       # rad/s guard: a runaway committed
+        #                                   velocity must not propagate into
+        #                                   every subsequent chunk via C1
+        c = ctrl.copy()
+        c[0] = p0
+        c[1] = p0 + v0 * AB_KSPAN / cl.DEGREE
+        lo, hi = 2, min(2 + n_free, len(c) - 1)
+        if hi > lo:
+            target = AB_PHI @ ctrl                              # predicted trajectory
+            fixed = AB_PHI[:, :lo] @ c[:lo] + AB_PHI[:, hi:] @ c[hi:]
+            A = AB_PHI[:, lo:hi]
+            sol, *_ = np.linalg.lstsq(A, target - fixed, rcond=None)
+            c[lo:hi] = sol
+        return c
 
     def bridge(qref_ext, anchor):
         """qref_ext has n_exec+2 rows; returns n_exec rows. QUINTIC entry
@@ -308,12 +366,17 @@ def main():
 
     order = sorted(range(len(objs)),
                    key=lambda i: np.hypot(*np.array(objs[i]["pos"][:2])))
+    if a.array:
+        order = [0]                        # centre block only
+    elif a.max_objs > 0:
+        order = order[:a.max_objs]
     for oi in order:
         o = objs[oi]
         bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, o["name"])
         eq_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_EQUALITY,
                                   f"suction_{o['name']}")
         latched = was_latched = False
+        touched = False
         prev = None
         off_count = 0                    # suction-release debounce counter
         chunks = []                      # temporal-ensemble buffer
@@ -339,7 +402,8 @@ def main():
             dR = R_t.T @ R_g
             goal = np.concatenate([R_t.T @ (g_pos - p_t),
                                    dR[:, 0], dR[:, 1]]).astype(np.float32)
-            jpgs = [prev[0], j405, prev[1], j435]
+            jpgs = ([prev[0], j405] if pol.wrist_only
+                    else [prev[0], j405, prev[1], j435])
             ctrl, suc_cmd = pol(jpgs, prop, goal)
 
             if a.ensemble:
@@ -367,7 +431,11 @@ def main():
                     anchor = (ref_tail[-1],
                               (ref_tail[-1] - ref_tail[-2]) / CTRL_DT,
                               (ref_tail[-1] - 2 * ref_tail[-2] + ref_tail[-3]) / CTRL_DT**2)
-                qref = bridge(DENSE @ ctrl, anchor)
+                if a.abrefit:
+                    ctrl = ab_refit(ctrl, anchor, a.ab_free)
+                    qref = (DENSE @ ctrl)[:n_exec]
+                else:
+                    qref = bridge(DENSE @ ctrl, anchor)
             ref_tail = qref[-3:].copy()
             qdref, tau_ff, kp, kd = demo["_gains_and_ff"](m, d, qref)
             sched = dict(qref=qref, qdref=qdref, tau_ff=tau_ff, kp=kp, kd=kd)
@@ -402,6 +470,9 @@ def main():
                     fb = cv2.resize(cv2.cvtColor(render_cam("fixed_d435"),
                                                  cv2.COLOR_RGB2BGR), (432, 240))
                     video.write(np.hstack([fa, fb]))
+            if not touched:
+                f_, tilt_ = cup_contact_with(m, d, cup_gid, tip_sid, bid)
+                touched = touched or (f_ > 0.0)
             if was_latched and not latched:
                 break                                       # placed (or dropped)
         if latched:                                         # never released
@@ -412,6 +483,7 @@ def main():
                   and abs(p[1] - dg.BIN_XY[1]) < dg.BIN_HALF and p[2] < 0.12)
         metrics["picks"].append(dict(
             object=oi, kind=o["kind"], success=ok, sealed=bool(was_latched),
+            touched=bool(touched or was_latched),
             policy_steps=step + 1, wall_s=round(time.time() - t0, 1)))
         print(f"[rollout] object{oi} ({o['kind']}): sealed={was_latched} "
               f"in_bin={ok} steps={step+1}", flush=True)

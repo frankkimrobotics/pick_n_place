@@ -1,0 +1,420 @@
+"""dataset_gen :: 100 random pick-and-place scenes with RGBD + state recording.
+
+Per scene: 1-10 random objects (cylinder / cube / cuboid -- no spheres) with
+random dimensions, colours, yaws, rejection-sampled non-overlapping poses on
+the table; one of 3 light positions (scene % 3). The arm press-to-seal picks
+every object into the bin one by one (up to 2 retries each) until the table
+is clear. Recorded at 10 Hz throughout:
+  - wrist D405 + fixed D435 RGB (mp4) and depth (uint16 mm, compressed npz)
+  - joint angles q[6], velocities qd[6]
+  - tip rangefinder value, suction state, active target index
+Per-scene meta.json: every object's shape, OBB half-extents, colour, initial
+pose, final pose, picked/in-bin outcome, light position, seed; plus a "picks"
+array with one entry per pick ATTEMPT (in execution order): 10 Hz frame range
+(start/latch/release/end), the nominal grasp pose (planned IK target: object
+top + cup radius, top-down quat, and the 15 mm press target) and the executed
+grasp pose (tcp site pos/quat captured at the instant the suction latched,
+plus the object pose then), success flag and fail reason.
+
+Batching note: mujoco_warp batches identical models -- every scene here is a
+DIFFERENT model (object count/dims), and the wall-clock is dominated by
+OSMesa rendering which is CPU. So scenes are parallelised across worker
+PROCESSES instead (see --workers).
+
+Run in the mjwarp env:
+    conda activate mjwarp && python dataset_gen.py --count 100 --workers 12
+The MJCF generator needs the curobo2 env, so scene XMLs are built by
+shelling out to it (sim_robot_mjcf.build with objects=...).
+"""
+import argparse
+import json
+import multiprocessing as mp
+import os
+import subprocess
+import sys
+import zlib
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+DEFAULT_OUT = "/media/lisc-frank/pnp_dataset"
+FALLBACK_OUT = os.path.expanduser("~/pnp_dataset")
+CUROBO_PY = "/home/lisc-frank/miniconda3/envs/curobo2/bin/python"
+
+REC_HZ = 10
+W, H = 424, 240
+LIGHTS = [(0.3, 0.1, 1.5), (1.0, -0.7, 1.3), (-0.5, 0.9, 1.1)]
+BIN_XY = np.array([0.10, 0.40])
+BIN_HALF = 0.145
+TABLE_X = (0.24, 0.52)
+TABLE_Y = (-0.16, 0.16)
+MAX_RETRY = 2
+
+
+# --------------------------------------------------------------------------- #
+# scene sampling
+def sample_scene(idx):
+    """Diversified: plates, bars, tall boxes, discs, tall cylinders; wider sizes/counts."""
+    rng = np.random.default_rng(idx * 7919 + 13)
+    n = int(rng.integers(2, 12))
+    objs, placed = [], []
+    KINDS = ["cylinder", "cube", "cuboid", "plate", "bar", "tallbox", "disc", "tallcyl"]
+    for i in range(n):
+        for _ in range(300):
+            shape = rng.choice(KINDS)
+            if shape == "cylinder":
+                r, hh = rng.uniform(0.016, 0.034), rng.uniform(0.012, 0.026)
+                size, half, z, ext = f"{r:.4f} {hh:.4f}", [r, r, hh], hh, r
+            elif shape == "disc":
+                r, hh = rng.uniform(0.030, 0.048), rng.uniform(0.008, 0.014)
+                size, half, z, ext = f"{r:.4f} {hh:.4f}", [r, r, hh], hh, r
+            elif shape == "tallcyl":
+                r, hh = rng.uniform(0.016, 0.026), rng.uniform(0.028, 0.045)
+                size, half, z, ext = f"{r:.4f} {hh:.4f}", [r, r, hh], hh, r
+            elif shape == "cube":
+                s_ = rng.uniform(0.014, 0.032)
+                size, half, z, ext = f"{s_:.4f} {s_:.4f} {s_:.4f}", [s_] * 3, s_, s_ * 1.42
+            elif shape == "plate":
+                sx, sy, sz = rng.uniform(0.030, 0.055), rng.uniform(0.030, 0.055), rng.uniform(0.006, 0.012)
+                size, half, z, ext = f"{sx:.4f} {sy:.4f} {sz:.4f}", [sx, sy, sz], sz, float(np.hypot(sx, sy))
+            elif shape == "bar":
+                sx, sy, sz = rng.uniform(0.040, 0.070), rng.uniform(0.012, 0.020), rng.uniform(0.012, 0.022)
+                size, half, z, ext = f"{sx:.4f} {sy:.4f} {sz:.4f}", [sx, sy, sz], sz, float(np.hypot(sx, sy))
+            elif shape == "tallbox":
+                sx, sy, sz = rng.uniform(0.014, 0.026), rng.uniform(0.014, 0.026), rng.uniform(0.030, 0.048)
+                size, half, z, ext = f"{sx:.4f} {sy:.4f} {sz:.4f}", [sx, sy, sz], sz, float(np.hypot(sx, sy))
+            else:
+                sx, sy, sz = (rng.uniform(0.015, 0.035), rng.uniform(0.015, 0.035), rng.uniform(0.012, 0.030))
+                size, half, z, ext = f"{sx:.4f} {sy:.4f} {sz:.4f}", [sx, sy, sz], sz, float(np.hypot(sx, sy))
+            x = rng.uniform(*TABLE_X)
+            y = rng.uniform(*TABLE_Y)
+            if all(np.hypot(x - px, y - py) > ext + pe + 0.015 for px, py, pe in placed):
+                break
+        else:
+            continue
+        cyl = shape in ("cylinder", "disc", "tallcyl")
+        yaw = float(rng.uniform(0, np.pi)) if not cyl else 0.0
+        quat = f"{np.cos(yaw/2):.4f} 0 0 {np.sin(yaw/2):.4f}"
+        rgba = rng.uniform(0.10, 0.97, 3)
+        objs.append(dict(
+            name=f"object{i}", shape=("cylinder" if cyl else "box"),
+            kind=shape, size=size, half_extents=[round(v, 4) for v in half],
+            pos=[round(x, 4), round(y, 4), round(z, 4)], yaw=round(yaw, 4),
+            quat=quat, rgba=[round(v, 3) for v in rgba] + [1.0]))
+        placed.append((x, y, ext))
+    return objs
+
+
+
+def build_scene_xml(objs, light, out_xml):
+    """Build the per-scene MJCF via the generator (curobo2 env has yourdfpy)."""
+    tuples = [(o["name"], o["shape"], o["size"],
+               " ".join(f"{v:.4f}" for v in o["pos"]),
+               " ".join(f"{v:g}" for v in o["rgba"]), o["quat"]) for o in objs]
+    code = (f"import sys; sys.path.insert(0, {HERE!r});\n"
+            f"import sim_robot_mjcf as g;\n"
+            f"g.build(warp=True, objects={tuples!r}, light_pos={tuple(light)!r}, "
+            f"out_path={out_xml!r})")
+    subprocess.run([CUROBO_PY, "-c", code], check=True, capture_output=True)
+
+
+# --------------------------------------------------------------------------- #
+# per-scene execution (runs inside a worker process)
+
+
+def _rot_small(rng, deg):
+    """Small random rotation matrix (max angle deg)."""
+    ax = rng.normal(size=3); ax /= np.linalg.norm(ax)
+    th = np.radians(rng.uniform(-deg, deg))
+    K = np.array([[0,-ax[2],ax[1]],[ax[2],0,-ax[0]],[-ax[1],ax[0],0]])
+    return np.eye(3)+np.sin(th)*K+(1-np.cos(th))*(K@K)
+
+
+def apply_dr(xml_path, rng):
+    """Domain randomization: lights, table/floor colors, camera extrinsic jitter."""
+    import re as _re
+    x = open(xml_path).read()
+    # light: position + diffuse
+    lp = (rng.uniform(-0.6,1.1), rng.uniform(-0.9,1.0), rng.uniform(0.9,1.7))
+    ld = rng.uniform(0.45,1.0)
+    x = _re.sub(r'<light pos="[^"]*" dir="0 0 -1" diffuse="[^"]*"/>',
+                f'<light pos="{lp[0]:.3f} {lp[1]:.3f} {lp[2]:.3f}" dir="0 0 -1" diffuse="{ld:.2f} {ld:.2f} {ld:.2f}"/>', x)
+    hd = rng.uniform(0.3,0.8); ha = rng.uniform(0.2,0.55)
+    x = _re.sub(r'<headlight diffuse="[^"]*" ambient="[^"]*"/>',
+                f'<headlight diffuse="{hd:.2f} {hd:.2f} {hd:.2f}" ambient="{ha:.2f} {ha:.2f} {ha:.2f}"/>', x)
+    # table colour: whites/greys/warm range (real table is white)
+    base = rng.uniform(0.45,0.95); tint = rng.uniform(-0.06,0.06,3)
+    tc = np.clip(base+tint,0,1)
+    x = _re.sub(r'<material name="table" rgba="[^"]*"/>',
+                f'<material name="table" rgba="{tc[0]:.2f} {tc[1]:.2f} {tc[2]:.2f} 1"/>', x)
+    # floor checker colours
+    c1 = rng.uniform(0.05,0.5,3); c2 = np.clip(c1+rng.uniform(-0.15,0.15,3),0,1)
+    x = _re.sub(r'rgb1="[^"]*" rgb2="[^"]*"',
+                f'rgb1="{c1[0]:.2f} {c1[1]:.2f} {c1[2]:.2f}" rgb2="{c2[0]:.2f} {c2[1]:.2f} {c2[2]:.2f}"', x, count=1)
+    # wrist cam extrinsic jitter: pos +-4 mm, rot +-1.5 deg
+    mw = _re.search(r'<camera name="wrist_d405" pos="([^"]*)" quat="([^"]*)" fovy="([^"]*)"/>', x)
+    if mw:
+        p = np.array([float(v) for v in mw.group(1).split()]) + rng.uniform(-0.004,0.004,3)
+        q = np.array([float(v) for v in mw.group(2).split()])
+        Rw = np.zeros(9); import mujoco as _mj
+        _mj.mju_quat2Mat(Rw, q); Rw = (_rot_small(rng,1.5) @ Rw.reshape(3,3))
+        q2 = np.zeros(4); _mj.mju_mat2Quat(q2, Rw.reshape(9))
+        x = x.replace(mw.group(0), f'<camera name="wrist_d405" pos="{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}" quat="{q2[0]:.6f} {q2[1]:.6f} {q2[2]:.6f} {q2[3]:.6f}" fovy="{mw.group(3)}"/>')
+    # zed cam jitter: pos +-1.5 cm, rot +-2 deg
+    mz = _re.search(r'<camera name="zed" pos="([^"]*)" xyaxes="([^"]*)" fovy="([^"]*)"/>', x)
+    if mz:
+        p = np.array([float(v) for v in mz.group(1).split()]) + rng.uniform(-0.015,0.015,3)
+        ax = np.array([float(v) for v in mz.group(2).split()])
+        Rz = _rot_small(rng,2.0); xa = Rz@ax[:3]; ya = Rz@ax[3:]
+        x = x.replace(mz.group(0), f'<camera name="zed" pos="{p[0]:.4f} {p[1]:.4f} {p[2]:.4f}" xyaxes="{xa[0]:.4f} {xa[1]:.4f} {xa[2]:.4f} {ya[0]:.4f} {ya[1]:.4f} {ya[2]:.4f}" fovy="{mz.group(3)}"/>')
+    open(xml_path,"w").write(x)
+
+def run_scene(args):
+    global VARIANT
+    idx, out_root, VARIANT = (args if len(args) == 3 else (*args, 0))
+    os.environ.setdefault("MUJOCO_GL", "osmesa")
+    import mujoco
+    import imageio
+    demo = {"__file__": os.path.join(HERE, "mjwarp_pick_demo.py")}
+    exec(open(demo["__file__"]).read().split("if __name__")[0], demo)
+
+    sdir = os.path.join(out_root, f"scene_{idx + 200 * VARIANT:03d}")
+    os.makedirs(sdir, exist_ok=True)
+    objs = sample_scene(idx)
+    light = LIGHTS[idx % 3]
+    xml = os.path.join(sdir, "scene.xml")
+    build_scene_xml(objs, light, xml)
+    # ZED variant: inject the calibrated 'zed' camera (renders into the fixed slot)
+    _ZED_CAM = '<camera name="zed" pos="0.6014 -0.0870 0.6772" xyaxes="0.0723 0.9968 0.0349 -0.9062 0.0510 0.4197" fovy="69.1"/>'
+    _x = open(xml).read()
+    open(xml, "w").write(_x.replace('<camera name="fixed_d435"', _ZED_CAM + '\n    <camera name="fixed_d435"', 1))
+    apply_dr(xml, np.random.default_rng(900000 + idx * 17 + VARIANT))
+
+    m = mujoco.MjModel.from_xml_path(xml)
+    d = mujoco.MjData(m)
+    d.qpos[:6] = demo["Q_START"]
+    mujoco.mj_forward(m, d)
+    ren = mujoco.Renderer(m, height=H, width=W)
+    vopt = mujoco.MjvOption()
+    vopt.flags[mujoco.mjtVisFlag.mjVIS_RANGEFINDER] = 0
+    vopt.sitegroup[:] = 0
+    rf_adr = m.sensor_adr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SENSOR, "tip_range")]
+    tcp_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "tcp")
+    tcp_sid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "tcp")
+    cup_gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "cup_tip")
+    quat_down = np.zeros(4)
+    mujoco.mju_mat2Quat(quat_down, np.asarray(demo["R_DOWN"], float).ravel())
+
+    every = int(round(1.0 / (REC_HZ * demo["CTRL_DT"])))
+    wr405 = imageio.get_writer(os.path.join(sdir, "d405_rgb.mp4"), fps=REC_HZ, quality=8)
+    wr435 = imageio.get_writer(os.path.join(sdir, "d435_rgb.mp4"), fps=REC_HZ, quality=8)
+    rec = dict(t=[], q=[], qd=[], rf=[], suction=[], target=[])
+    depth = {"wrist_d405": [], "fixed_d435": []}
+    state = dict(tick=0, suction=0, target=-1)
+
+    def record(dd):
+        if state["tick"] % every:
+            return
+        for key, wr, cam in (("wrist_d405", wr405, "wrist_d405"), ("fixed_d435", wr435, "zed")):
+            ren.update_scene(dd, camera=cam, scene_option=vopt)
+            wr.append_data(ren.render())
+            if not VARIANT:
+                ren.enable_depth_rendering()
+                ren.update_scene(dd, camera=cam, scene_option=vopt)
+                dep = ren.render()
+                ren.disable_depth_rendering()
+                depth[key].append(np.clip(dep * 1000.0, 0, 65535).astype(np.uint16))
+        rec["t"].append(state["tick"] * demo["CTRL_DT"])
+        rec["q"].append(dd.qpos[:6].copy())
+        rec["qd"].append(dd.qvel[:6].copy())
+        rec["rf"].append(float(dd.sensordata[rf_adr]))
+        rec["suction"].append(state["suction"])
+        rec["target"].append(state["target"])
+
+    def run_ref(sched, on_tick=None):
+        for k in range(len(sched["qref"])):
+            if on_tick is not None:
+                on_tick(k)
+            for _ in range(demo["NSUB"]):
+                d.ctrl[:6] = demo["pd_tau"](sched, k, d.qpos[:6], d.qvel[:6])
+                mujoco.mj_step(m, d)
+            state["tick"] += 1
+            record(d)
+
+    picks = []
+
+    def pick_object(oi, attempt):
+        o = objs[oi]
+        bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, o["name"])
+        eq_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_EQUALITY, f"suction_{o['name']}")
+        p_now = d.xpos[bid].copy()
+        top = p_now[2] + o["half_extents"][2]
+        pk = dict(object=oi, attempt=attempt, frame_start=len(rec["t"]),
+                  frame_latch=-1, frame_release=-1, frame_end=-1,
+                  grasp_nominal=None, grasp_executed=None, success=False,
+                  fail_reason=None)
+        picks.append(pk)
+        if not (TABLE_X[0] - 0.06 < p_now[0] < TABLE_X[1] + 0.06
+                and TABLE_Y[0] - 0.08 < p_now[1] < TABLE_Y[1] + 0.08):
+            pk["frame_end"] = len(rec["t"])
+            pk["fail_reason"] = "off_table"
+            return False                                   # left the table
+        rngd = np.random.default_rng(idx * 131 + oi)
+        drop = BIN_XY + rngd.uniform(-0.06, 0.06, 2)
+        dik = mujoco.MjData(m)
+        q0 = d.qpos[:6].copy()
+        ik, R_DOWN, seg = demo["ik"], demo["R_DOWN"], demo["_seg"]
+        CUP_R, PRESS = demo["CUP_R"], demo["PRESS_M"]
+        # Bridge perturbation (VARIANT>0): noise on approach/carry waypoints,
+        # ZERO noise at grasp/press (the contact funnel endpoint stays nominal).
+        if VARIANT:
+            rngp = np.random.default_rng(100000 * VARIANT + idx * 37 + oi * 7 + attempt)
+            hov_off = rngp.uniform([-0.025, -0.025, 0.00], [0.025, 0.025, 0.05])
+            lif_off = rngp.uniform([-0.025, -0.025, 0.00], [0.025, 0.025, 0.05])
+            bin_off = rngp.uniform([-0.04, -0.04, -0.03], [0.04, 0.04, 0.05])
+            tsc = float(rngp.uniform(0.85, 1.25))
+        else:
+            hov_off = lif_off = bin_off = np.zeros(3); tsc = 1.0
+        q_hov, e1 = ik(m, dik, "tcp", [p_now[0] + hov_off[0], p_now[1] + hov_off[1],
+                                       top + 0.12 + hov_off[2]], R_DOWN, q0)
+        q_grasp, e2 = ik(m, dik, "tcp", [p_now[0], p_now[1], top + CUP_R], R_DOWN, q_hov)
+        q_press, e3 = ik(m, dik, "tcp", [p_now[0], p_now[1], top + CUP_R - PRESS],
+                         R_DOWN, q_grasp)
+        q_lift, e6 = ik(m, dik, "tcp", [p_now[0] + lif_off[0], p_now[1] + lif_off[1],
+                                        top + 0.12 + lif_off[2]], R_DOWN, q_press)
+        q_bin, e4 = ik(m, dik, "tcp", [drop[0] + bin_off[0], drop[1] + bin_off[1],
+                                       0.42 + bin_off[2]], R_DOWN, q_hov)
+        q_drop, e5 = ik(m, dik, "tcp", [drop[0], drop[1], 0.22], R_DOWN, q_bin)
+        pk["grasp_nominal"] = dict(
+            pos=[round(float(v), 5) for v in (p_now[0], p_now[1], top + CUP_R)],
+            press_pos=[round(float(v), 5) for v in (p_now[0], p_now[1],
+                                                    top + CUP_R - PRESS)],
+            quat=[round(float(v), 5) for v in quat_down])
+        if max(e1, e2, e3, e4, e5, e6) > 0.003:
+            pk["frame_end"] = len(rec["t"])
+            pk["fail_reason"] = "ik"
+            return False
+        qref = []
+        seg(qref, q0, q_hov, 2.0 * tsc)
+        seg(qref, q_hov, q_grasp, 1.6 * tsc)
+        seg(qref, q_grasp, q_press, 0.7)
+        i_press = len(qref)
+        seg(qref, q_press, q_press, 0.3)
+        seg(qref, q_press, q_lift, 1.2 * tsc)
+        seg(qref, q_lift, q_bin, 2.0 * tsc)
+        seg(qref, q_bin, q_drop, 0.8)
+        i_rel = len(qref)
+        seg(qref, q_drop, q_bin, 0.8)
+        qref = np.array(qref)
+        qdref, tau_ff, kp, kd = demo["_gains_and_ff"](m, d, qref)
+        sched = dict(qref=qref, qdref=qdref, tau_ff=tau_ff, kp=kp, kd=kd)
+
+        def on_tick(k):
+            if k == i_press:
+                f, tilt = demo["_cup_contact"](m, d, cup_gid)
+                if f > demo["SEAL_N"] and tilt < demo["SEAL_DEG"]:
+                    demo["_latch_weld"](m, d, eq_id, tcp_bid, bid)
+                    state["suction"] = 1
+                    state["target"] = oi
+                    eq = np.zeros(4)
+                    mujoco.mju_mat2Quat(eq, d.site_xmat[tcp_sid])
+                    pk["frame_latch"] = len(rec["t"])
+                    pk["grasp_executed"] = dict(
+                        pos=[round(float(v), 5) for v in d.site_xpos[tcp_sid]],
+                        quat=[round(float(v), 5) for v in eq],
+                        obj_pos=[round(float(v), 5) for v in d.xpos[bid]])
+            if k == i_rel and state["suction"]:
+                d.eq_active[eq_id] = 0
+                state["suction"] = 0
+                state["target"] = -1
+                pk["frame_release"] = len(rec["t"])
+
+        run_ref(sched, on_tick)
+        state["suction"] = 0
+        d.eq_active[eq_id] = 0
+        pk["frame_end"] = len(rec["t"])
+        if pk["frame_latch"] < 0:
+            pk["fail_reason"] = "no_seal"
+        p = d.xpos[bid]
+        ok = bool(abs(p[0] - BIN_XY[0]) < BIN_HALF
+                  and abs(p[1] - BIN_XY[1]) < BIN_HALF and p[2] < 0.12)
+        pk["success"] = ok
+        if not ok and pk["fail_reason"] is None:
+            pk["fail_reason"] = "missed_bin"
+        return ok
+
+    results = []
+    order = sorted(range(len(objs)),
+                   key=lambda i: np.hypot(*(np.array(objs[i]["pos"][:2]))))
+    for oi in order:
+        ok = False
+        for att in range(1 + MAX_RETRY):
+            ok = pick_object(oi, att)
+            if ok:
+                break
+        results.append((oi, ok))
+
+    wr405.close(); wr435.close()
+    np.savez_compressed(
+        os.path.join(sdir, "traj.npz"),
+        t=np.array(rec["t"]), q=np.array(rec["q"]), qd=np.array(rec["qd"]),
+        rangefinder=np.array(rec["rf"]), suction=np.array(rec["suction"]),
+        target=np.array(rec["target"]))
+    for cam in depth:
+        np.savez_compressed(os.path.join(sdir, f"{cam.split('_')[-1]}_depth_mm.npz"),
+                            depth=np.stack(depth[cam]) if depth[cam] else np.zeros((0, H, W), np.uint16))
+    meta = dict(scene=idx, seed=idx * 7919 + 13, light_pos=list(light),
+                rec_hz=REC_HZ, n_objects=len(objs), objects=[], picks=picks)
+    for oi, o in enumerate(objs):
+        bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, o["name"])
+        ok = dict(results).get(oi, False)
+        meta["objects"].append(dict(
+            name=o["name"], kind=o["kind"], geom=o["shape"],
+            obb_half_extents=o["half_extents"], rgba=o["rgba"],
+            init_pos=o["pos"], init_yaw=o["yaw"],
+            final_pos=[round(float(v), 4) for v in d.xpos[bid]],
+            final_quat=[round(float(v), 4) for v in d.xquat[bid]],
+            in_bin=bool(ok)))
+    with open(os.path.join(sdir, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=1)
+    n_ok = sum(1 for _, ok in results if ok)
+    return idx, len(objs), n_ok, len(rec["t"])
+
+
+VARIANT = 0      # 0 = nominal; >0 = bridge-perturbed funnel variant
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start", type=int, default=0)
+    ap.add_argument("--count", type=int, default=100)
+    ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--variant", type=int, default=0, help=">0: bridge-perturbed funnel variant; scene ids offset by 200*variant; val base ids 90-99 skipped")
+    a = ap.parse_args()
+    out = a.out
+    if out is None:
+        out = DEFAULT_OUT if os.access(os.path.dirname(DEFAULT_OUT), os.W_OK) else FALLBACK_OUT
+        try:
+            os.makedirs(out, exist_ok=True)
+        except PermissionError:
+            out = FALLBACK_OUT
+            os.makedirs(out, exist_ok=True)
+    print(f"[dataset] writing to {out} ({a.count} scenes, {a.workers} workers)")
+    global VARIANT
+    VARIANT = a.variant
+    ids = [i for i in range(a.start, a.start + a.count) if not (a.variant and 90 <= i <= 99)]
+    jobs = [(i, out, a.variant) for i in ids]
+    ctx = mp.get_context("spawn")
+    done = 0
+    with ctx.Pool(a.workers, maxtasksperchild=4) as pool:
+        for idx, n, ok, frames in pool.imap_unordered(run_scene, jobs):
+            done += 1
+            print(f"[dataset] scene {idx:03d}: {ok}/{n} in bin, {frames} frames "
+                  f"({done}/{a.count})", flush=True)
+    print("[dataset] complete")
+
+
+if __name__ == "__main__":
+    main()

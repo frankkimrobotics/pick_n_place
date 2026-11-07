@@ -71,7 +71,12 @@ def _pose_attrs(T):
 
 
 def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
-          warp=False, objects=None, light_pos=(0.3, 0.1, 1.5), out_path=None):
+          warp=False, objects=None, light_pos=(0.3, 0.1, 1.5), out_path=None,
+          plunger=False, plunger_k=2000.0, plunger_travel=0.012):
+    """plunger=True replaces the rigid cup tip with a sprung prismatic tip:
+    slide joint 'cup_plunger' (stiffness plunger_k N/m, travel plunger_travel m)
+    + jointpos sensor -> spring force = plunger_k * deflection. SIM-privileged
+    contact sensing for the seal-controller RL; the real cup has no sensor."""
     os.makedirs(MESH_DIR, exist_ok=True)
     # bake the STL meshes into our sim mesh dir (reuse mujoco_export's baker).
     # Reuse existing bakes: parallel dataset workers otherwise clobber the
@@ -119,7 +124,29 @@ def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
         if link == "tcp" or link.endswith("tcp"):
             L.append(f'{ind}<site name="tcp" size="0.005" rgba="1 0 0 1"/>')
             L.append(f'{ind}<site name="tip_rf" size="0.004" rgba="0 1 0 0.6"/>')
-            if warp:
+            if warp and plunger:
+                # sprung tip: the contact geom rides a slide joint along the cup
+                # axis (+z of the tcp frame points INTO the object when pressing)
+                L.append(f'{ind}<body name="plunger_tip" pos="0 0 0">')
+                L.append(f'{ind}    <joint name="cup_plunger" type="slide" axis="0 0 -1" '
+                         f'range="0 {plunger_travel:.4f}" stiffness="{plunger_k:.1f}" '
+                         f'damping="8.0" springref="0" limited="true"/>')
+                L.append(f'{ind}    <inertial pos="0 0 0" mass="0.012" '
+                         f'diaginertia="2e-7 2e-7 2e-7"/>')
+                L.append(f'{ind}    <geom name="cup_tip" type="sphere" size="0.008" '
+                         f'rgba="0.25 0.25 0.28 1"/>')
+                L.append(f'{ind}</body>')
+                # wrist camera, same as the rigid-tip branch (it mounts on the tcp
+                # link, not the sprung tip) so plunger scenes can render policy obs
+                Tc = np.asarray(C.T_TCP_CAM, float)
+                Rmj = Tc[:3, :3] @ np.diag([1.0, -1.0, -1.0])
+                qc = R_to_quat_wxyz(Rmj)
+                p = Tc[:3, 3] + Tc[:3, :3] @ np.array([0.0, 0.0, 0.012])
+                L.append(f'{ind}<camera name="wrist_d405" '
+                         f'pos="{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}" '
+                         f'quat="{qc[0]:.6f} {qc[1]:.6f} {qc[2]:.6f} {qc[3]:.6f}" '
+                         f'fovy="58.0"/>')
+            elif warp:
                 # the only contact geom on the arm: the cup tip, so press-to-seal
                 # is a real dynamic interaction (robot meshes stay contactless)
                 L.append(f'{ind}<geom name="cup_tip" type="sphere" size="0.008" '
@@ -188,15 +215,31 @@ def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
         f'size="{s[0]:.4f} {s[1]:.4f} {s[2]:.4f}" material="box"/>\n'
         for nm, s, p in walls)
 
+    plunger_sensors = ("    <jointpos name=\"plunger_x\" joint=\"cup_plunger\"/>\n"
+                       "    <jointvel name=\"plunger_v\" joint=\"cup_plunger\"/>\n"
+                       if (warp and plunger) else "")
     objs = objects if objects is not None else OBJECTS + (WARP_OBJECTS if warp else [])
     obj_mats = "".join(
         f'    <material name="o{i}" rgba="{o[4]}"/>\n'
         for i, o in enumerate(objs))
+    # YCB-style mesh objects: shape == "mesh" and o[2] is an absolute .stl path
+    obj_mesh_assets = "".join(
+        f'    <mesh name="om_{o[0]}" file="{o[2]}"/>\n'
+        for o in objs if o[1] == "mesh")
+
+    def _obj_geom(i, o):
+        if o[1] == "mesh":
+            gp = f' pos="{o[6]}"' if len(o) > 6 and o[6] else ''
+            return (f'      <geom name="g_{o[0]}" type="mesh" mesh="om_{o[0]}"{gp} '
+                    f'material="o{i}" mass="0.05"/>')
+        return (f'      <geom name="g_{o[0]}" type="{o[1]}" size="{o[2]}" '
+                f'material="o{i}" mass="0.05"/>')
+
     obj_bodies = "".join(
         f'    <body name="{o[0]}" pos="{o[3]}"'
         + (f' quat="{o[5]}"' if len(o) > 5 and o[5] else '') +
         f'><freejoint name="obj{i}_free"/>\n'
-        f'      <geom name="g_{o[0]}" type="{o[1]}" size="{o[2]}" material="o{i}" mass="0.05"/></body>\n'
+        + _obj_geom(i, o) + '</body>\n'
         for i, o in enumerate(objs))
 
     # suction welds for the warp variant: inactive until the controller sets
@@ -236,7 +279,7 @@ def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
     <material name="metal" rgba="0.7 0.72 0.75 1"/>
     <material name="box" rgba="0.27 0.43 0.78 1"/>
     <material name="table" rgba="0.55 0.55 0.58 1"/>
-{obj_mats}{meshes}  </asset>
+{obj_mats}{obj_mesh_assets}{meshes}  </asset>
   <worldbody>
     <light pos="{light_pos[0]:g} {light_pos[1]:g} {light_pos[2]:g}" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
     <geom name="floor" type="plane" size="2 2 0.1" pos="0 0 -0.1200" material="grid"/>
@@ -254,6 +297,7 @@ def build(box_xyz=(0.10, 0.40, 0.0), box_fp=0.30, box_h=0.30, box_wall=0.01,
 {act}  </actuator>
   <sensor>
     <rangefinder name="tip_range" site="tip_rf"/>
+{plunger_sensors}
   </sensor>
 </mujoco>
 """
