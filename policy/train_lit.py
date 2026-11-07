@@ -41,6 +41,7 @@ TO = 2
 TA = 16
 NCAM = 2
 NIMG = NCAM * TO
+WRIST_ONLY = False               # wrist-cam-only ablation (NIMG becomes 1*TO)
 PDIM = 6 + 6 + 1 + 1          # q, qd, suction, rangefinder per obs step
 GDIM = 9                      # goal: rel pos3 + rot6d
 ADIM = 7                      # 6 ctrl-pt dims + suction
@@ -72,8 +73,11 @@ class Transform:
         self.goals = goals
 
     def __call__(self, s):
-        imgs = np.stack([decode(s["d405_jpg"][0]), decode(s["d405_jpg"][1]),
-                         decode(s["d435_jpg"][0]), decode(s["d435_jpg"][1])])
+        if WRIST_ONLY:
+            imgs = np.stack([decode(s["d405_jpg"][0]), decode(s["d405_jpg"][1])])
+        else:
+            imgs = np.stack([decode(s["d405_jpg"][0]), decode(s["d405_jpg"][1]),
+                             decode(s["d435_jpg"][0]), decode(s["d435_jpg"][1])])
         imgs = torch.from_numpy(imgs).permute(0, 3, 1, 2)
         prop = np.concatenate([s["q"], s["qd"],
                                s["suction"][:, None].astype(np.float32),
@@ -273,9 +277,15 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--vision_lr", type=float, default=3e-5)
     ap.add_argument("--dit_depth", type=int, default=6)
+    ap.add_argument("--wrist_only", action="store_true",
+                    help="train on the wrist D405 only (2 images instead of 4)")
     ap.add_argument("--resume", default=None,
                     help="ckpt to continue from (net/ctx/ema/opt/step)")
     a = ap.parse_args()
+    global WRIST_ONLY, NIMG
+    if a.wrist_only:
+        WRIST_ONLY = True
+        NIMG = 1 * TO
     dev = "cuda"
     torch.manual_seed(0)
     run = f"{a.model}_{a.action}"
@@ -356,6 +366,7 @@ def main():
 
     def save_ckpt(tag, step):
         torch.save(dict(model=a.model, action=a.action, step=step,
+                        wrist_only=a.wrist_only,
                         lo=lo.cpu(), hi=hi.cpu(), spec=spec,
                         net=net.state_dict(), ctx=ctxnet.state_dict(), ema=ema,
                         opt=opt.state_dict()),

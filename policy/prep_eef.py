@@ -9,7 +9,7 @@ import mujoco
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 XML = os.path.join(HERE, "..", "outputs", "mujoco_sim", "robot_warp.xml")
-DS = os.path.expanduser("~/pnp_dataset")
+DS = os.path.expanduser(os.environ.get("PNP_DS", "~/pnp_dataset"))
 
 m = mujoco.MjModel.from_xml_path(XML)
 d = mujoco.MjData(m)

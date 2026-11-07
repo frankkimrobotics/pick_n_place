@@ -40,10 +40,10 @@ OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
 # RE-CALIBRATED 2026-07-03 (calib_handeye.py, 5x7 ChArUco @ [0.4,0,0], 20 views, DANIILIDIS):
 # board-spread 16.3mm (prior extrinsic) -> 6.0mm; correction dpos=12.8mm drot=2.57deg.
 T_TCP_CAM = np.array([
-    [-0.99781957, -0.06596721,  0.00210446,  0.01265501],
-    [ 0.06482786, -0.98557334, -0.1563411 ,  0.06511875],
-    [ 0.01238748, -0.15586378,  0.98770088, -0.11009472],
-    [ 0.0,          0.0,         0.0,          1.0],
+    [-0.99995226,  0.00224198, -0.00951070,  0.00850991],
+    [-0.00069319, -0.98714586, -0.15982044,  0.06399059],
+    [-0.00974676, -0.15980622,  0.98710028, -0.10040223],
+    [ 0.00000000,  0.00000000,  0.00000000,  1.00000000],
 ], dtype=np.float64)
 
 # T_TCP_CAM was calibrated with the tcp at HANDEYE_TCP_LEN below the flange. The real
