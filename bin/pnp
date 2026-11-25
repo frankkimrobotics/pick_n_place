@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# pnp launcher: runs pnp.cli under a Python >= 3.11 (tomllib). Tasks are then exec'd with their own interpreter.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+for PY in "$HOME/miniconda3/envs/ilpolicy/bin/python" "$HOME/miniconda3/envs/mjwarp/bin/python" python3.12 python3.11 python3; do
+  command -v "$PY" >/dev/null 2>&1 || [ -x "$PY" ] || continue
+  "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null && exec env PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m pnp.cli "$@"
+done
+echo "pnp: no Python >= 3.11 found" >&2; exit 1

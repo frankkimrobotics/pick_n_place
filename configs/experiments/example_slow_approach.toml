@@ -1,0 +1,5 @@
+# Example experiment layer: only the deltas. `pnp -e example_slow_approach config show --diff`
+[pi.stream]
+vmax = 30.0        # deg/s, gentler approach for a fragile object
+[task]
+lift_height = 0.12
