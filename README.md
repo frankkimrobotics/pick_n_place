@@ -295,6 +295,37 @@ frozen within 15 cm vertically, guarded settle before release, always home; SIGI
 stop streaming. Known policy quirk (2026-10-13): a systematic +3.9 cm +Y descent offset on the
 dagger6 policy — pre-compensate `obj_y -= 0.039`.
 
+### 4.6 Live suction in the RL twin (`PNP_LIVE_SUCTION=1`, 2026-11-07)
+
+The realistic suction model developed for the expert generator (§5.1) is ported into `rl/env_warp.py`
+**behind a flag, default off**, because it changes the attach dynamics every existing checkpoint was
+trained on. `live_suction=True` or `PNP_LIVE_SUCTION=1` adds:
+
+* **capture / self-centring** before the latch: while the pump is commanded and the lip is within
+  `CAPTURE_R` (12 mm) laterally and `CAPTURE_GAP` (4 mm) vertically, the object is pulled onto the lip
+  (`SNAP_F` 0.8 N) and drawn onto the cup axis (`CENTER_F` 0.6 N);
+* **an edge gate**: the 7.5 mm lip must sit entirely on the object's top face, so latching on a corner
+  leaks. (A ray-cast curvature test like `rim_seal.py` is not portable to the batched warp env; the
+  closed-form face test is the batched equivalent.)
+
+Two gates written for the pre-vacuum model had to be made consistent with it, both verified by
+measurement rather than assumption: `SEAL_VEL` (the low-energy gate that blocks latching on an impact
+jolt) counted the vacuum drawing the object in as an impact and refused nearly every captured grasp
+(seal 94 % -> 25 %), so the component of the object's motion *toward* the cup is discounted; and
+`pressing` (cup below the object-top reference) never fires once the vacuum lifts the object to meet
+the lip, so a closed gap is accepted instead.
+
+Effect on the deployed policy (`resid1_real_best`, 256 worlds, paper env):
+
+| | success | seal |
+|---|---|---|
+| flag off (the model it was trained in) | 94.1 % | 94.5 % |
+| flag on | 92.2 % | 93.8 % |
+
+The ~2-point drop is the cost of the new edge constraint, not a regression; a policy retrained with the
+flag on is the way to use it.
+
+
 ### 4.5 v2 / v3 (diverse objects, obstacles) and Q-planning
 ```bash
 $PY rl/build_scene_v2.py [--n_dist 3]                     # -> rl/scenes/diverse_v2.xml | obstacle_v3.xml
@@ -350,8 +381,11 @@ therefore only needs `--press` (1 cm), not the old 15 mm press-to-seal stroke, a
 
 Two bugs this surfaced, both fixed: `rim_seal` ray-casts are contype-blind, so the centre ray hit the
 robot's own suction-cup **visual** mesh ~3.5 mm above the lip and the seal test compared the object
-against the gripper (now the generator puts robot visuals in geom group 3 and `rim_seal` takes a
-`geomgroup` mask -- `dataset_gen_ycb.py` has the same latent flaw); and the failure taxonomy lumped
+against the gripper. `rim_seal` now skips visual-only bodies itself (any body whose geoms are all
+non-colliding) and walks the ray past them, so **every** caller is fixed with no scene change --
+`dataset_gen_ycb.py` and `rl/seal_env.py` were both running with the flaw. Indicative effect on the YCB
+generator: 5 of 8 objects binned in two fresh scenes, against 240 of 1132 picks in the block generated
+before the fix. And the failure taxonomy lumped
 weak/tilted contacts into `no_rim_seal` (now `no_contact`, `no_rim_seal`, `tilted`, `weak_contact`,
 `pushed`, `touched_other`).
 
@@ -375,6 +409,30 @@ cd ~/Desktop/2026/pick_and_place
 MUJOCO_GL=osmesa $PY dataset_gen_curobo.py --count 10 --box 0.30 0.34 --out ~/pnp_dataset_curobo      # fixed box position
 MUJOCO_GL=osmesa $PY dataset_gen_curobo.py --count 10 --box_range 0.24 0.36 0.33 0.42 --out ~/pnp_dataset_curobo   # random box per scene
 ```
+
+**Every leg is planned or gated (2026-11-07).** Originally only the approach and the carry went through
+cuRobo; the descent, lift, lowering into the box and retreat were scripted joint-space legs. Their IK was
+the stock multi-start solver, which keeps the lowest pose error regardless of configuration, so it
+regularly returned a solution on another branch and the joint-space interpolation to it swept the whole
+arm through a flip -- measured 148-235 deg joint swings, 180 deg wrist flips and the tool arcing to 93 cm.
+Nothing was actually struck (the executed paths kept >= 38 mm from the box), but the twin's arm links are
+contactless, so MuJoCo could not have told us. Now:
+
+* `ik_near` accepts only solutions within 75 deg of the current configuration; a needed branch change is
+  executed by cuRobo (`pregrasp` plan), never by a scripted leg.
+* the press stroke uses an iterated Jacobian servo (`cart_move`) to a **world-frame** target, so it cannot
+  change branch and does not stop short when a planned leg lands inside its pose tolerance (measured: the
+  tool sat 2.1 cm above the pre-grasp goal, which used to read as `no_contact`).
+* the lowering into the box and the retreat are cuRobo plans (with the object attached for the lowering);
+  the scripted fallbacks only run if the planner fails.
+* every remaining scripted leg is gated by `leg_clearance`, which checks cuRobo's own 59 robot collision
+  spheres against the box walls, table, floor and the other objects, and refuses the leg otherwise.
+* `check_arm_clearance.py` replays a recorded scene and reports the same metric offline.
+
+Result on the same four scenes: 19/25 cleared either way, 0 penetrations, worst clearance +16 mm (now set
+by the planner's own inflation rather than by luck), max joint swing 235 deg -> 99 deg, max tool height
+93 cm -> 49 cm (the home pose), median path/straight-line 1.27.
+
 
 Knobs for failure diversity: `--obs_noise` (aim error), `--snap_force` / `--center_force` / `--capture_r`
 (how strongly a running cup captures), `--press`, `--touch_n`, `--attempts`. 0 box contacts in any scene;

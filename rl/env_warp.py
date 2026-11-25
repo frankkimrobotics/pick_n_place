@@ -45,6 +45,13 @@ SEAL_VEL = 0.08            # m/s relative speed gate (low-energy latch)
 F_MAX = 20.0               # N suction holding limit
 TAU_CUP = 0.4              # N*m peel-torque limit (~F_MAX x cup radius)
 PEEL_COS = 0.878           # cos(~28.6 deg): tilt beyond this = cup peeling
+# Live-suction (pump already running) extras, ported from dataset_gen_curobo.py and OFF by default:
+# enabling them changes the attach dynamics every existing checkpoint was trained on.
+CAPTURE_R = 0.012          # lateral offset within which a running cup still captures the object (m)
+CAPTURE_GAP = 0.004        # vertical reach of the airflow above the object top (m)
+SNAP_F = 0.8               # peak pull onto the lip (N): only has to close a <=4 mm gap
+CENTER_F = 0.6             # lateral self-centring pull (N)
+RIM_R = 0.0075             # cup lip radius (m): the rim must sit inside the top face or it leaks
 TAU_TORSION = 0.15         # N*m torsional (yaw) friction limit ~ mu*F_MAX*r_cup
 BIN_XY = np.array([0.10, 0.40])
 BIN_HALF = 0.145
@@ -122,12 +129,17 @@ class PickEnv:
                  obs_lag=None, hover_range=(0.02, 0.04), smooth_w=None, transport_w=None,
                  descend_sigma=0.07, w_speed=0.0, w_acc=0.0,
                  v_soft_deg=30.0, a_soft_deg=400.0,
-                 drive_ref=None, lead_clip=None):
+                 drive_ref=None, lead_clip=None, live_suction=None):
         """mode='attach': staged sub-task -- episodes START with the cup
         hovering 2-4 cm above the (jittered) grasp point; success = seal +
         hold + 2 cm lift within a 40-step episode. mode='full': whole task."""
         self.nworld = nworld
         self.device = device
+        # live suction: the pump runs before contact, so the cup captures and self-centres the object
+        # and a lip hanging over the edge of the top face leaks. PNP_LIVE_SUCTION=1 or live_suction=True.
+        self.live_suction = (bool(int(os.environ.get("PNP_LIVE_SUCTION", "0")))
+                             if live_suction is None else bool(live_suction))
+        self._want_suction = None
         self.mode = mode
         self.dr = dr
         self.target_max = target_max
@@ -168,6 +180,7 @@ class PickEnv:
             xml = os.path.join(HERE, "_scene_rl.xml")
             build_scene_xml(half_extents, kind, xml)
         self.half = np.asarray(half_extents, float)
+        self.kind = kind
         self.mjm = mujoco.MjModel.from_xml_path(xml)
         mjd = mujoco.MjData(self.mjm)
         # ids
@@ -574,8 +587,30 @@ class PickEnv:
         tv = (tcp - self._last_tcp) * CTRL_HZ if hasattr(self, "_last_tcp") \
             else torch.zeros_like(tcp)
         rel_speed = torch.norm(tv - ov, dim=-1)
+        if self.live_suction:
+            # SEAL_VEL exists to stop the arm latching on an impact jolt. With the pump running the
+            # vacuum itself draws the object toward the lip, and that approach is not an impact --
+            # judging it by the raw relative speed refuses every captured grasp (measured: seal
+            # 94 % -> 25 %). Discount the component of the object's motion that is toward the cup.
+            toward = (-ov * (-R[:, :, 2])).sum(-1).clamp(min=0.0)
+            rel_speed = (rel_speed - toward).clamp(min=0.0)
         gate = want & ~self.sealed & (dist < self.seal_dist_w) & pressing \
             & tilt_ok & (rel_speed < self.seal_vel_w)
+        if self.live_suction:
+            # the 7.5 mm lip must sit fully on the top face, else the rim overhangs an edge and leaks
+            lat = tcp[:, :2] - gp[:, :2]
+            # `pressing` (cup below the object-top reference) assumes the object stays put while the arm
+            # pushes down. With the pump running the vacuum lifts the object to meet the lip, so the
+            # reference rises with it and the test never fires: accept a closed gap instead.
+            gap = tcp[:, 2] - gp[:, 2]
+            gate = gate | (want & ~self.sealed & tilt_ok & (dist < self.seal_dist_w)
+                           & (rel_speed < self.seal_vel_w) & (gap.abs() < CAPTURE_GAP))
+            if str(self.kind).startswith("cyl"):
+                on_face = torch.norm(lat, dim=-1) + RIM_R <= float(self.half[0])
+            else:
+                on_face = ((lat[:, 0].abs() + RIM_R <= float(self.half[0]))
+                           & (lat[:, 1].abs() + RIM_R <= float(self.half[1])))
+            gate = gate & on_face
         if gate.any():
             idx = torch.nonzero(gate).squeeze(-1)
             # anchor: object top point in tcp frame at latch
@@ -639,11 +674,35 @@ class PickEnv:
     # results recorded before the fix.
     LEGACY = bool(int(os.environ.get("PNP_LEGACY_SUCTION", "0")))
 
+    def _capture_force(self):
+        """Pre-latch vacuum capture: a RUNNING cup within reach pulls the object onto the lip and draws
+        it onto the cup axis. Measured on the CPU twin (dataset_gen_curobo): object shift before the
+        latch fell from up to 32 mm to 0.2 mm, and curved objects stopped being shoved away."""
+        if not self.live_suction or self._want_suction is None:
+            return None
+        want = self._want_suction
+        tcp, R = self._tcp()
+        gp = self._grasp_point()
+        lat = tcp[:, :2] - gp[:, :2]
+        lat_n = torch.norm(lat, dim=-1)
+        gap = tcp[:, 2] - gp[:, 2]
+        active = want & ~self.sealed & (lat_n < CAPTURE_R) & (gap < CAPTURE_GAP) & (gap > -0.02)
+        if not active.any():
+            return None
+        reach = (1.0 - gap.clamp(min=0.0) / CAPTURE_GAP).clamp(0.0, 1.0)[:, None]
+        F = SNAP_F * reach * (-R[:, :, 2])                       # onto the lip (cup z points into the object)
+        F[:, :2] = F[:, :2] - (CENTER_F * reach * (lat / lat_n.clamp(min=1e-6)[:, None])
+                               * (lat_n / CAPTURE_R).clamp(max=1.0)[:, None])
+        return F * active.float()[:, None]
+
     def _apply_suction_force(self):
         """Called each physics substep: spring-damper pulling the object's
         latch anchor to its latched pose in the (moving) tcp frame."""
+        cap = self._capture_force()
         if not self.sealed.any():
             self.xfrc[:, self.bid_obj] = 0.0
+            if cap is not None:
+                self.xfrc[:, self.bid_obj, :3] = cap
             return
         tcp, R = self._tcp()
         target = tcp + torch.einsum("nij,nj->ni", R, self.anchor)
@@ -654,7 +713,7 @@ class PickEnv:
         scale = (F_MAX / Fmag.clamp(min=1e-6)).clamp(max=1.0)
         F = F * scale
         m = self.sealed.float()[:, None]
-        self.xfrc[:, self.bid_obj, :3] = F * m
+        self.xfrc[:, self.bid_obj, :3] = F * m + ((cap * (1.0 - m)) if cap is not None else 0.0)
         # rotational spring on the FULL latched orientation.  The old
         # cross(objz, cupz) torque is perpendicular to the cup axis by
         # construction -> ZERO yaw authority, so a sealed object could spin
@@ -755,6 +814,7 @@ class PickEnv:
         obj_before = self._obj_pos().clone()
 
         first_possible = ~self.ever_sealed.clone()
+        self._want_suction = want                      # the pump runs during the substeps, not only at the latch
         latched_now = self._try_latch(want)
         first_latch = latched_now & first_possible
         released = self.sealed & ~want

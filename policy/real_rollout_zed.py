@@ -49,6 +49,9 @@ from collections import deque
 
 import cv2
 import numpy as np
+import zed_mask
+import pick_verify as _pv            # testable pick verification
+from pick_verify import inspect_xy
 import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -139,14 +142,25 @@ class ZedPolicy:
         self.model, self.arch = ck["model"], ck.get("arch", "unet")
         self.action_mode = ck.get("action", "waypoint")   # "waypoint" | "bspline" (control points)
         self.lat_shift = int(ck.get("lat_shift") or 0)    # latency-matched chunks start at t+1+L
-        if self.model not in ("dp", "cfm"):
-            raise SystemExit(f"model {self.model}: only dp/cfm checkpoints are supported here")
+        if self.model not in ("dp", "cfm", "ode"):
+            raise SystemExit(f"model {self.model}: only dp/cfm/ode checkpoints are supported here")
         kw = {}
+        _sd = ck.get("ema") or ck["net"]
         if self.arch == "mlp":
             kw = {"d": int(ck["net"]["inp.weight"].shape[0])}
-        self.net = {"unet": T.CondUnet1D, "dit": T.DiT1D, "mlp": T.MLPDenoiser}[self.arch](cond_dim=512, **kw).to(DEV)
+        elif self.arch == "dit":
+            # infer width/depth from the checkpoint (mega DiT is d=2048, depth=12)
+            kw = {"d": int(_sd["inp.weight"].shape[0]),
+                  "depth": 1 + max(int(k.split(".")[1]) for k in _sd if k.startswith("blocks."))}
+        if self.model == "ode":           # ODE policy (train_policy_zed.ODEField): H-step integrated path + suction head
+            self.net = T.ODEField(cond_dim=512, H=int(ck.get("ode_H") or 8)).to(DEV)
+        else:
+            self.net = {"unet": T.CondUnet1D, "dit": T.DiT1D, "mlp": T.MLPDenoiser}[self.arch](cond_dim=512, **kw).to(DEV)
         self.use_goal = bool(ck.get("goal"))
-        self.obs_enc = T.ObsEncoder(768, use_goal=self.use_goal).to(DEV)
+        self.goal_se3 = bool(ck.get("goal_se3"))
+        _fd = int(_sd["proj.0.weight"].shape[1]) if "proj.0.weight" in _sd else 768
+        self.obs_enc = T.ObsEncoder(_fd, use_goal=self.use_goal,
+                                    goal_dim=(9 if self.goal_se3 else 3)).to(DEV)
         w = ck.get("ema") or {}
         # strict=False: ckpts trained before the graspability head lack grasp_head.*
         self.net.load_state_dict({k: v for k, v in w.items() if k in self.net.state_dict()},
@@ -158,6 +172,8 @@ class ZedPolicy:
         self.lo, self.hi = ck["lo"].to(DEV), ck["hi"].to(DEV)
         self.euler = euler
         self.frozen_noise = frozen_noise
+        self.fast = False                # True: fp16 encoder + half-weight compiled denoiser (set before the first call,
+        self._fnet = None                # after any weight patch); same chunks to ~0.1 mm, about 2.4x faster
         self.decode_c0 = None            # set by the executor before each inference (bspline)
         self.gen = torch.Generator(device=DEV)
         self.gen.manual_seed(0)
@@ -168,15 +184,18 @@ class ZedPolicy:
                                        prediction_type="epsilon")
             self.sched.set_timesteps(16)
         # frozen encoder
-        from lingbot_vision import load_pretrained_backbone
-        self.enc, _ = load_pretrained_backbone(variant="base", device=DEV, dtype=torch.float32, verbose=False)
-        self.enc.eval()
-        for p in self.enc.parameters():
-            p.requires_grad_(False)
+        import extract_features as _EF
+        _EF.DEV = DEV
+        self._fwd, _m, _s = _EF.load_encoder(ck.get("enc", "lingbot"))
+        self._emean, self._estd = _m.to(DEV), _s.to(DEV)
         self.mean = torch.tensor((0.485, 0.456, 0.406), device=DEV).view(1, 3, 1, 1)
         self.std = torch.tensor((0.229, 0.224, 0.225), device=DEV).view(1, 3, 1, 1)
         print(f"[policy] {os.path.basename(os.path.dirname(ckpt))}: {self.model}/{self.arch} step {ck.get('step')} "
               f"euler {euler} {'frozen' if frozen_noise else 'fresh'} noise", flush=True)
+
+    def _basis(self):
+        from spline_action import BASIS
+        return torch.from_numpy(np.asarray(BASIS, np.float32)).to(DEV)
 
     @torch.no_grad()
     def encode(self, bgr):
@@ -187,34 +206,72 @@ class ZedPolicy:
         t = torch.from_numpy(rgb).permute(2, 0, 1).float()[None].to(DEV) / 255.0
         t = torch.nn.functional.interpolate(t, size=(224, 404), mode="bilinear", align_corners=False)
         x0 = (404 - 224) // 2
-        px = (t[:, :, :, x0:x0 + 224] - self.mean) / self.std
-        return self.enc(px, is_training=True)["x_norm_patchtokens"][0]
+        px = (t[:, :, :, x0:x0 + 224] - self._emean) / self._estd
+        if self.fast:
+            with torch.autocast("cuda", dtype=torch.float16):
+                return self._fwd(px)[0].float()
+        return self._fwd(px)[0]
+
+    def _fast_net(self):
+        """the 920M DiT reads 3.7 GB of fp32 weights per flow step: half weights + a compiled CUDA graph"""
+        if self._fnet is None:
+            self.net.half()
+            self._fnet = torch.compile(self.net, mode="reduce-overhead")
+        return self._fnet
 
     @torch.no_grad()
-    def __call__(self, tok4, prop, goal=None):
-        """tok4 [4,196,768] torch, prop [2,10] np, goal [3] np -> act [16,10]."""
+    def __call__(self, tok4, prop, goal=None, rtc=None):
+        """tok4 [4,196,768] torch, prop [2,10] np, goal [3] np -> act [16,10].
+        rtc = (Y [16,10] waypoints in this observation's frame, w [16,10] in 0..1): real-time-chunking style
+        conditioning (cfm only). At every flow step the predicted clean chunk is pulled toward Y where w > 0
+        (w = 1: the waypoint is the old chunk's), so the new chunk continues the one being executed."""
         g = (torch.from_numpy(np.asarray(goal, np.float32))[None].to(DEV)
              if self.use_goal else None)
         cond = self.obs_enc(tok4[None], torch.from_numpy(np.asarray(prop, np.float32))[None].to(DEV), g)
+        if self.model == "ode":
+            # integrate from the identity action; the chunk is H (< TA) waypoints, padded by holding the last one
+            # (the executor re-plans every n_exec = 8 decisions, so the padding is only reached on a late plan)
+            lo9, hi9 = self.lo[:9], self.hi[:9]
+            a0 = ((torch.tensor([0, 0, 0, 1, 0, 0, 0, 1, 0.0], device=DEV) - lo9) / (hi9 - lo9) * 2 - 1)[None]
+            traj = self.net.rollout(a0, cond)[0]                       # [H, 9] normalized
+            pose = (traj + 1) / 2 * (hi9 - lo9) + lo9
+            suc = torch.sigmoid(self.net.suc_head(cond))[0]            # [H]
+            act = torch.cat([pose, suc[:, None]], 1)
+            act = torch.cat([act, act[-1:].expand(T.TA - act.shape[0], -1)], 0)
+            return act.cpu().numpy()
         x = self.noise0.clone() if self.frozen_noise else torch.randn(1, T.ADIM, T.TA, device=DEV, generator=self.gen)
         if self.model == "cfm":
             n = self.euler
+            if rtc is not None:
+                # waypoints = BASIS @ control points; BASIS rows sum to 1, so the per-dim normalisation commutes
+                _B = torch.eye(T.TA, device=DEV) if self.action_mode != "bspline" else self._basis()
+                _Bp = torch.linalg.pinv(_B, rtol=1e-3)
+                Yn = (torch.from_numpy(np.asarray(rtc[0], np.float32)).to(DEV) - self.lo) / (self.hi - self.lo) * 2 - 1
+                Wt = torch.from_numpy(np.asarray(rtc[1], np.float32)).to(DEV)
+            fnet = self._fast_net() if (self.fast and rtc is None) else None
             for i in range(n):
                 t = torch.full((1,), i / n, device=DEV)
-                x = x + self.net(x, t * 50, cond) / n
+                if fnet is not None:
+                    with torch.autocast("cuda", dtype=torch.float16):
+                        v = fnet(x, t * 50, cond)
+                    v = v.float().clone()
+                else:
+                    v = self.net(x, t * 50, cond)
+                if rtc is not None:
+                    x1 = (x + (1 - i / n) * v)[0].T                    # predicted clean chunk [TA, ADIM]
+                    dC = _Bp @ (Wt * (Yn - _B @ x1))                    # smallest control-point change that meets it
+                    x = x + v / n + (i + 1) / n * dC.T[None]
+                else:
+                    x = x + v / n
         else:
             for t in self.sched.timesteps:
                 eps = self.net(x, t.expand(1).to(DEV), cond)
                 x = self.sched.step(eps, t, x).prev_sample
         act = (x.transpose(1, 2) + 1) / 2 * (self.hi - self.lo) + self.lo
         a = act[0].cpu().numpy()
-        if self.action_mode == "bspline":
-            # policy emits clamped-cubic control points; decode to waypoints like the eval
-            # harness. For a latency-matched ckpt (lat_shift>0) the curve is pinned to the
-            # handover state (c0) supplied by the executor at adoption time via decode_c0.
-            from spline_action import ctrl_to_waypoints, ab_refit
-            a = ctrl_to_waypoints(ab_refit(a, c0=self.decode_c0)).astype(np.float32)
-            self.decode_c0 = None
+        # bspline ckpts: return RAW control points; the executor decodes at plan-ADOPTION
+        # time with the then-current commanded state (c0) and velocity (v0), so chunk
+        # boundaries splice smoothly (decoding here would anchor to a ~300 ms stale pose).
         return a
 
 
@@ -257,10 +314,36 @@ def main():
     ap.add_argument("--steps", type=int, default=400, help="max decisions (0.1 s policy time each)")
     ap.add_argument("--n_exec", type=int, default=8, help="actions executed per chunk before re-planning (<= 16)")
     ap.add_argument("--euler", type=int, default=16)
+    ap.add_argument("--fast_infer", type=int, default=0, help="1 = fp16 encoder + half-weight compiled denoiser (cfm, no --rtc)")
     ap.add_argument("--fresh_noise", action="store_true")
     ap.add_argument("--slow", type=float, default=1.0)
-    ap.add_argument("--step_max", type=float, default=0.02, help="max cartesian step per decision (m)")
-    ap.add_argument("--dq_max", type=float, default=3.0, help="max joint step per decision (deg)")
+    ap.add_argument("--step_max", type=float, default=0.015, help="max LATERAL cartesian step per decision (m)")
+    ap.add_argument("--step_max_z", type=float, default=0.030,
+                    help="separate vertical step cap (m); 0 = use step_max. Descent is protected by the "
+                         "contact guard, so it can be looser than lateral motion")
+    ap.add_argument("--dq_max", type=float, default=2.5,
+                    help="max joint step per decision (deg). Measured 2026-11-08: 2.5 gave cmd-step "
+                         "p95 4.14->2.81 deg and lead-guard lurches 1->0 vs the old 3.0")
+    ap.add_argument("--dq_mid", type=float, default=0.0,
+                    help="separate joint step cap (deg/decision) for joints 2-4, used only while the commanded tool height is above "
+                         "--dq_mid_z; 0 = off. Twin 2026-11-19: 3.75 (25 deg/s at --slow 1.5) with the goal time-out boxed 127 vs 104 "
+                         "objects on 55 held-out scenes, at twice the time above 36 deg/s. Not yet run on the arm.")
+    ap.add_argument("--dq_mid_z", type=float, default=0.15, help="FK tool height (m) above which --dq_mid applies (twin used 0.12, table at z=0)")
+    ap.add_argument("--goal_to", type=float, default=0.0,
+                    help="s without an attached object before the episode gives up on this --goal (0 = off); prints '[result] goal_giveup'")
+    ap.add_argument("--zed_mask", type=int, default=0, help="1 = the policy sees the table-only ZED view (zed_mask.py); needs a patch fitted on masked features")
+    ap.add_argument("--aim", type=float, default=0.0,
+                    help="m; final-approach assist: within this lateral distance of --goal (and below --aim_z above it) the lateral "
+                         "target is put on the goal xy. 0 = off. Twin 2026-11-21 (with --aim_down 0.06 and the goal time-out): 146 vs 104 "
+                         "objects on 55 held-out scenes, 132 with an 8 mm position error; 15 mm error without the descent was worse than off.")
+    ap.add_argument("--aim_z", type=float, default=0.15, help="m above the goal below which --aim acts")
+    ap.add_argument("--aim_down", type=float, default=0.0,
+                    help="m/s; with --aim, once centred within 1 cm the executor descends at this rate, opens the valve 5 cm above the "
+                         "object and presses to 10 mm below the goal height; the carry hand-off waits for the bottom or torque contact")
+    ap.add_argument("--aim_press", type=float, default=2.0, help="s at the bottom without a hand-off before the descent assist lets go for 5 s")
+    ap.add_argument("--box_real", type=float, nargs=5, default=None, metavar=("X0", "X1", "Y0", "Y1", "H"),
+                    help="outer footprint (base frame, m) and rim height of the real place box: four walls added to the safety "
+                         "filter / scripted-path check. Measured from the ZED 2026-11-21: -0.05 0.21 0.24 0.49 0.23")
     ap.add_argument("--max_tilt", type=float, default=30.0, help="deg from straight down (START_Q itself is 20 deg)")
     ap.add_argument("--orient", default="yawlock", choices=["yawlock", "fixed", "policy"],
                     help="yawlock: predicted tool tilt, yaw locked to the demos' 90 deg (run 2: the policy's relative "
@@ -271,6 +354,11 @@ def main():
     ap.add_argument("--tau_abort", type=float, default=0.25)
     ap.add_argument("--tau_freeze_z", type=float, default=0.15, help="torque baseline frozen when the tip is below this z")
     ap.add_argument("--no_suction", action="store_true", help="never send suction")
+    ap.add_argument("--goal_dz", type=float, default=-0.024,
+                    help="ZED->FK z correction applied to --goal (m). Measured 2026-11-08 by "
+                         "torque-guarded touch at 4 points: the ZED depth map reports surfaces "
+                         "23.9 mm +-6.9 HIGHER than the robot finds them, so an uncorrected goal "
+                         "makes the cup hover above the object and never seal.")
     ap.add_argument("--goal", type=float, nargs=3, default=None, metavar=("X","Y","Z"),
                     help="base-frame grasp target (goal-conditioned ckpts): object top + cup radius. "
                          "Static for the whole episode (training semantics: goal stays at the original "
@@ -301,7 +389,41 @@ def main():
                     help="real J2/J3 torque rise -> sim torque-proxy units (sim firm contact ~0.7, real ~0.105)")
     ap.add_argument("--table_z", type=float, default=0.030, help="FK z of the table top (seal obs tipz offset)")
     ap.add_argument("--seal_dry", action="store_true", help="splice prints actions but does not execute them")
+    ap.add_argument("--lat_shift_override", type=int, default=-1,
+                    help="override the ckpt's lat_shift at inference (match MEASURED latency; "
+                         "e.g. the 920M DiT runs ~430 ms = 4-5 decisions vs its trained 2)")
+    ap.add_argument("--place_r", type=float, default=0.15,
+                    help="radius for the place-arrival check (m). Must cover how far a released "
+                         "object bounces/rolls: dropping from --place_z scatters it well beyond "
+                         "the release xy, and a tight radius reports a delivered object as missing")
+    ap.add_argument("--splice_tau", type=float, default=0.16,
+                    help="descent-refusal torque rise INSIDE the splice (crush protection; "
+                         "separate from --tau_abort, which must stay above carry/payload torque)")
+    ap.add_argument("--stream", default="deployed", choices=["deployed", "tuned"],
+                    help="Pi stream gains: deployed (arm runs ~42 ms ahead of its reference; all runs before 2026-11-14) "
+                         "or tuned (real_policy_ctrl.STREAM_GAINS_TUNED: on the reference, 10x lower tracking error)")
+    ap.add_argument("--safe", type=int, default=0, help="1 = realsim/safety.py filter on every streamed target (speed, accel, joint limits, "
+                                                        "arm vs table / back wall)")
+    ap.add_argument("--mast_r", type=float, default=0.050, help="m, radius of the ZED mast keep-out pillar in the filter model (twin uses the 1 cm mast; "
+                                                                    "here it also has to cover the ZED body and the wrist camera, which the meshes lack)")
+    ap.add_argument("--safe_wall", type=float, default=0.05, help="m, clearance the filter keeps to the back wall (x < -0.30)")
+    ap.add_argument("--ws_xmin", type=float, default=-0.05, help="m, lowest tool-target x; the policy cannot steer the tool behind it")
+    ap.add_argument("--safe_margin", type=float, default=0.010, help="m, arm-to-table/wall clearance kept by the filter")
+    ap.add_argument("--safe_vlim", type=float, default=30.0, help="deg/s joint speed limit of the filter")
+    ap.add_argument("--safe_alim", type=float, default=0.0, help="deg/s^2 joint acceleration limit of the filter (0 = off)")
+    ap.add_argument("--blend", type=int, default=0, help="cross-fade a new chunk over this many decisions (0 = switch)")
+    ap.add_argument("--vmax", type=float, default=0.0, help="deg/s Pi velocity-command clamp (0 = keep the stream gains' 50)")
+    ap.add_argument("--patch", default="", help="weight-space patch (.pt, realsim/wsp.py) applied on top of --ckpt")
     a = ap.parse_args()
+    if a.stream == "tuned":
+        import real_policy_ctrl as _rpc
+        _rpc.STREAM_GAINS.update(_rpc.STREAM_GAINS_TUNED)       # PiLink reads the module dict at send time
+        print(f"[stream] tuned gains {_rpc.STREAM_GAINS}", flush=True)
+    if a.vmax > 0:
+        import real_policy_ctrl as _rpc
+        _rpc.STREAM_GAINS["vmax"] = float(a.vmax)
+        _rpc.VEL_CMD_MAX = int(round(a.vmax * _rpc.STREAM_GAINS["vel_scale"]))
+        print(f"[stream] Pi velocity clamp {a.vmax} deg/s (vel_cmd_max {_rpc.VEL_CMD_MAX})", flush=True)
     assert 1 <= a.n_exec <= T.TA
     dt = CTRL_DT * a.slow
 
@@ -311,12 +433,60 @@ def main():
     json.dump(vars(a), open(os.path.join(log_dir, "args.json"), "w"), indent=1)
 
     policy = ZedPolicy(a.ckpt, euler=a.euler, frozen_noise=not a.fresh_noise)
+    policy.fast = bool(a.fast_infer)
+    if a.patch:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from realsim.wsp import apply_patch
+        apply_patch(policy, os.path.expanduser(a.patch))
     if policy.use_goal and a.goal is None:
         raise SystemExit("[abort] goal-conditioned checkpoint needs --goal X Y Z (object top + cup radius)")
+    if policy.fast:                                  # the first fast call compiles the denoiser (~8 s): do it before any motion
+        _t = time.time()
+        _tok = policy.encode(np.zeros((240, 432, 3), np.uint8))
+        _prop = np.tile(np.array([0, 0, 0, 1, 0, 0, 0, 1, 0, 0], np.float32), (2, 1))
+        for _ in range(3):
+            policy(torch.stack([_tok] * 4), _prop, np.zeros(9 if getattr(policy, "goal_se3", False) else 3, np.float32))
+        print(f"[policy] fast inference warmed up in {time.time() - _t:.1f} s", flush=True)
     global GOAL_BASE
     GOAL_BASE = np.asarray(a.goal, float) if a.goal is not None else None
+    if GOAL_BASE is not None:
+        _cf = os.path.join(ROOT, "outputs", "zed_fk_correction.json")
+        if os.path.exists(_cf):
+            _c = json.load(open(_cf))["coef"]            # spatially-varying plane fit
+            _dz = _c[0] * GOAL_BASE[0] + _c[1] * GOAL_BASE[1] + _c[2]
+            GOAL_BASE = GOAL_BASE + np.array([0.0, 0.0, _dz])
+            print(f"[goal] ZED->FK plane correction {1000*_dz:+.1f} mm -> {np.round(GOAL_BASE,4).tolist()}", flush=True)
+        elif a.goal_dz:
+            GOAL_BASE = GOAL_BASE + np.array([0.0, 0.0, a.goal_dz])
+            print(f"[goal] ZED->FK constant correction {1000*a.goal_dz:+.0f} mm", flush=True)
     ob = ObsBuilder(os.path.join(ROOT, "rl", "scenes", "box_med.xml"), [0.025, 0.025, 0.02])
     m, dik = ob.m, mujoco.MjData(ob.m)
+    FILT = None
+    if a.safe:
+        # static world the real cell has: table top z = 0 (wide slab; the scene's sim bin is not there), back wall x < -0.30
+        sys.path.insert(0, ROOT)
+        from realsim.safety import SafetyFilter
+        _sp = mujoco.MjSpec.from_file(os.path.join(ROOT, "rl", "scenes", "box_med.xml"))
+        for _g in list(_sp.worldbody.geoms):
+            if _g.name.startswith("box_"):
+                _sp.delete(_g)
+        _sp.worldbody.add_geom(name="real_table", type=mujoco.mjtGeom.mjGEOM_BOX, pos=[0.55, 0.0, -0.01], size=[0.40, 0.60, 0.01])
+        if a.box_real is not None:
+            _x0, _x1, _y0, _y1, _bh = a.box_real
+            _w = 0.01
+            for _n, _pos, _sz in (("real_box_xm", [_x0, (_y0 + _y1) / 2, _bh / 2], [_w, (_y1 - _y0) / 2, _bh / 2]),
+                                  ("real_box_xp", [_x1, (_y0 + _y1) / 2, _bh / 2], [_w, (_y1 - _y0) / 2, _bh / 2]),
+                                  ("real_box_ym", [(_x0 + _x1) / 2, _y0, _bh / 2], [(_x1 - _x0) / 2, _w, _bh / 2]),
+                                  ("real_box_yp", [(_x0 + _x1) / 2, _y1, _bh / 2], [(_x1 - _x0) / 2, _w, _bh / 2])):
+                _sp.worldbody.add_geom(name=_n, type=mujoco.mjtGeom.mjGEOM_BOX, pos=_pos, size=_sz, rgba=[0.6, 0.5, 0.3, 0.0], group=5)
+        from realsim.mast import add_zed_mast            # the ZED mast broke the wrist camera mount on 2026-11-15
+        _zp = np.array(json.load(open(os.path.join(ROOT, "outputs/extrinsics_zed.json")))["T_base_camzed"])[:3, 3]
+        add_zed_mast(_sp, cam_pos=_zp, radius=a.mast_r)
+        print(f"[safe] ZED mast pillar at ({_zp[0]:.3f},{_zp[1]:+.3f}), z up to {_zp[2]:.3f}, radius {1000 * a.mast_r:.0f} mm", flush=True)
+        FILT = SafetyFilter(_sp.compile(), margin=a.safe_margin, v_lim=math.radians(a.safe_vlim), a_lim=math.radians(a.safe_alim),
+                            wall_margin=a.safe_wall)
+        print(f"[safe] filter on: margin {1000 * a.safe_margin:.0f} mm, v {a.safe_vlim} deg/s, a {a.safe_alim} deg/s^2, "
+              f"world {[FILT.m.geom(g).name for g in FILT.world]} + wall x<-0.30", flush=True)
 
     class ZedGuard(Guard):
         """real_policy_ctrl.Guard with a configurable tip-x keep-out (its 0.12 blocks the sim bin at x 0.10)."""
@@ -325,6 +495,12 @@ def main():
             tcp, _ = self.ob.fk(q)
             if tcp[0] < a.x_min:
                 v.append(f"tip x {tcp[0]:.3f} < {a.x_min} (keep-out)")
+            if FILT is not None:
+                # scripted legs (lift / inspect / carry / home) are joint-space paths that never pass the per-decision
+                # filter: check every path point against the same static world (table, back wall, ZED mast)
+                _c, _ = FILT.clearance(np.asarray(q, float))
+                if _c < a.safe_margin:
+                    v.append(f"arm clearance {1000 * _c:.0f} mm < {1000 * a.safe_margin:.0f} mm (table / wall / ZED mast)")
             return v
     guard = ZedGuard(ob, a.z_floor + 0.03, force=a.force)   # Guard.z_floor = obj_top - 0.03
 
@@ -375,6 +551,36 @@ def main():
     if v0:
         raise SystemExit("[abort] start pose violates: " + "; ".join(v0))
 
+    # PRE-GRASP REFERENCE, taken now while the arm is at home and the view is clear.
+    # The lifted-vs-dragged test needs to know what the neighbourhood looked like BEFORE
+    # the grasp -- a drag is only detectable as occupancy appearing where there was none.
+    nbr_ref = [None]
+    place_ref = [None]
+    try:
+        _Tz = np.array(json.load(open(os.path.join(ROOT, "outputs/extrinsics_zed.json")))["T_base_camzed"])
+        if GOAL_BASE is not None:
+            _gxy = (float(GOAL_BASE[0]), float(GOAL_BASE[1]))
+            nbr_ref[0] = (_pv.occupancy_cells(_gxy, a.table_z, _Tz, shm=SHM),
+                          _pv.occupancy_cells(_gxy, a.table_z, _Tz, shm=SHM, R=0.04),
+                          _pv.table_coverage(_gxy, a.table_z, _Tz, shm=SHM))
+            print(f"[verify] pre-grasp reference at ({_gxy[0]:.3f},{_gxy[1]:+.3f}): "
+                  f"{len(nbr_ref[0][0])} cells within 12 cm, "
+                  f"{len(nbr_ref[0][1])} in the object footprint", flush=True)
+            if len(nbr_ref[0][1]) == 0:
+                # The same reference that powers the drag test also says whether there is
+                # anything to pick. Saying so now beats a descent onto bare table followed
+                # by an unexplainable "lifted" from the seal controller.
+                print(f"[verify] WARNING: no object-height surface at the goal -- the goal "
+                      f"looks EMPTY (stale coordinates?); the pick will have nothing to seal on",
+                      flush=True)
+        if a.place_xy is not None:
+            place_ref[0] = _pv.occupancy_cells((a.place_xy[0], a.place_xy[1]), a.table_z,
+                                               _Tz, shm=SHM, R=a.place_r)
+            print(f"[verify] place-site reference: {len(place_ref[0])} cells occupied "
+                  f"within {100 * a.place_r:.0f} cm", flush=True)
+    except Exception as _e:
+        print(f"[verify] pre-grasp reference unavailable ({_e})", flush=True)
+
     tau_base = link.torque_baseline(1.0) if a.exec else np.zeros(6)
     print(f"[contact] torque baseline {np.round(tau_base, 3).tolist()}  firm {TAU_FIRM} hard {TAU_HARD} abort {a.tau_abort}", flush=True)
     tq_hist = deque(maxlen=10)
@@ -392,30 +598,35 @@ def main():
     k = 0
     seq = 0
     released_at = [None]          # decision index at which a carried object was released
+    aim_block, aim_press, aim_n = 0, 0, 0
 
     _T_ZED = None
 
-    def zed_site_cleared(xy, table_z, r=0.03):
-        """True if no object surface remains at base-frame xy (reads the 3 Hz shm xyz map).
-        Conservative: on any read/geometry failure, assume cleared (don't block the place)."""
+    def zed_site_state(xy, table_z, r=0.03):
+        """Delegates to policy.pick_verify so the executor and the standalone test
+        (/tmp/verify_test.py) exercise the identical code path."""
         nonlocal _T_ZED
-        try:
-            import io as _io
-            if _T_ZED is None:
+        if _T_ZED is None:
+            try:
                 _T_ZED = np.array(json.load(open(os.path.join(ROOT, "outputs/extrinsics_zed.json")))["T_base_camzed"])
-            P = np.load(_io.BytesIO(open(f"{SHM}/pnp_zed_xyz.npy", "rb").read())).reshape(-1, 3).astype(np.float32)
-            P = P[np.isfinite(P).all(1)]
-            Pb = (_T_ZED[:3, :3] @ P.T).T + _T_ZED[:3, 3]
-            near = Pb[(np.hypot(Pb[:, 0] - xy[0], Pb[:, 1] - xy[1]) < r)]
-            if len(near) < 8:
-                return True                      # occluded / sparse -> cannot refute the pick
-            zs = np.sort(near[:, 2])
-            z_hi = float(np.median(zs[-8:]))     # top surface at the site
-            return z_hi < table_z + 0.015
-        except Exception as e:
-            print(f"[verify] zed check unavailable ({e}) -> assuming cleared", flush=True)
-            return True
+            except Exception as e:
+                return "unknown", f"extrinsics unavailable ({e})"
+        return _pv.site_state(xy, table_z, _T_ZED, shm=SHM, r=r)
 
+    # unloaded torque reference captured at a known joint pose, for payload differencing
+    probe_ref = [None]
+
+    def torque_median(dur=0.3):
+        s = []
+        t_end = time.time() + dur
+        while time.time() < t_end:
+            s.append(link.torque()); time.sleep(0.01)
+        return np.median(np.array(s), axis=0) if s else np.zeros(6)
+
+    prev_p_cmd = None
+    if a.lat_shift_override >= 0:
+        print(f"[policy] lat_shift {policy.lat_shift} -> {a.lat_shift_override} (inference override)", flush=True)
+        policy.lat_shift = a.lat_shift_override
     splice = None
     splice_tries = [0]
     if a.seal_ckpt:
@@ -428,22 +639,21 @@ def main():
         p_t, R_t = obs[1]["p"], obs[1]["R"]
         prop = np.stack([rel_pose(p_t, R_t, obs[0]["p"], obs[0]["R"], obs[0]["suc"]),
                          rel_pose(p_t, R_t, p_t, R_t, obs[1]["suc"])])
-        goal_rel = (R_t.T @ (GOAL_BASE - p_t)) if GOAL_BASE is not None else None
-        if policy.action_mode == "bspline" and policy.lat_shift > 0:
-            # boundary for the latency-matched spline: where the commanded reference is NOW
-            # (≈ where the arm will be when this plan starts executing), rel to the obs pose
-            dp0 = R_t.T @ (p_cmd - p_t)
-            dR0 = R_t.T @ R_cmd
-            policy.decode_c0 = np.concatenate([dp0, dR0[:, 0], dR0[:, 1],
-                                               [float(state["suction"])]])
+        goal_rel = None
+        if GOAL_BASE is not None:
+            goal_rel = R_t.T @ (GOAL_BASE - p_t)
+            if getattr(policy, "goal_se3", False):
+                _dRg = R_t.T @ R_DOWN
+                goal_rel = np.concatenate([goal_rel, _dRg[:, 0], _dRg[:, 1]])
         act = policy(tok4, prop, goal_rel)
         p_abs = np.stack([p_t + R_t @ act[i, :3] for i in range(T.TA)])
         R_abs = np.stack([R_t @ rot6d_to_R(act[i, 3:9]) for i in range(T.TA)])
         slot["plan"] = dict(k_obs=k_obs, p_abs=p_abs, R_abs=R_abs, suc=act[:, 9].copy(), act=act,
-                            latency=time.time() - t1, p_t=p_t.copy())
+                            latency=time.time() - t1, p_t=p_t.copy(), R_t=R_t.copy())
 
     print(f"[ctrl] loop: dt {dt:.2f} s, n_exec {a.n_exec}, step_max {a.step_max} m, dq_max {a.dq_max} deg, "
           f"max tilt {a.max_tilt} deg, z floor {a.z_floor}", flush=True)
+    t_free0 = time.time()
     last_print = 0.0
     try:
         while k < a.steps and not state["stop"]:
@@ -451,7 +661,28 @@ def main():
                     and k - released_at[0] >= a.stop_after_place):
                 print(f"[ctrl] placed at k {released_at[0]} -> early stop at k {k}", flush=True)
                 break
+            if attached_since is not None or released_at[0] is not None:
+                t_free0 = time.time()                      # goal time-out counts only time with nothing attached
+            elif a.goal_to > 0 and time.time() - t_free0 > a.goal_to:
+                if state["suction"]:
+                    link.suction(False); state["suction"] = 0
+                print(f"[ctrl] goal not picked within {a.goal_to:.0f} s -> giving up at k {k}", flush=True)
+                print("[result] goal_giveup", flush=True)
+                break
             t_k = t0 + k * dt
+            # scripted legs (splice align/seal, place carry, recovery) take 10-30 s without
+            # advancing k; without a re-base the loop then free-runs ~30 s behind its grid at
+            # ~0.03 s/decision (policy played ~3x its trained speed, plans adopted 4-5 decisions
+            # late, every segment anchored in the past -- 2026-11-07/08 logs). Re-base the grid
+            # and restart the spline stream so the first segment does not bend back to stale targets.
+            if time.time() - t_k > 2 * dt:
+                late = time.time() - t_k
+                t0 = time.time() - k * dt
+                t_k = t0 + k * dt
+                if hasattr(link, "hist"):
+                    link.hist.clear()
+                    link.spline_t0 = None
+                print(f"[ctrl] decision grid re-based at k {k} ({late:.1f} s late)", flush=True)
             while time.time() < t_k:
                 time.sleep(0.001)
             # ---- observe
@@ -469,7 +700,8 @@ def main():
                 print(f"[abort] camera stale {st}", flush=True)
                 break
             entry = dict(t=time.time(), p=p_m, R=R_m, suc=state["suction"], wrist_img=wrist_img, zed_img=zed_img,
-                         wrist_tok=policy.encode(wrist_img), zed_tok=policy.encode(zed_img))
+                         wrist_tok=policy.encode(wrist_img),
+                         zed_tok=policy.encode(zed_mask.apply(zed_img) if a.zed_mask else zed_img))
             hist.append(entry)
             # ---- torque contact
             tq = link.torque()
@@ -498,7 +730,15 @@ def main():
                     scripted_move(link, guard, ob, qg, "splice-align", v_peak_deg=10.0)
                     q_cmd = qg
                     p_cmd, R_cmd = ob.fk(q_cmd)
-                    tau_base_s = np.median(np.array(tq_hist)[-5:], axis=0)
+                    # UNLOADED REFERENCE: settled here, the cup is in free air 25 mm above the
+                    # object top. Returning to this exact joint configuration after the grasp
+                    # makes the gravity term cancel, so the torque difference is pure payload --
+                    # a vision-free "am I actually holding something" that no occlusion can fool.
+                    time.sleep(0.35)
+                    tau_base_s = torque_median(0.3)
+                    probe_ref[0] = (np.asarray(q_cmd, float).copy(), tau_base_s.copy())
+                    print(f"[verify] unloaded ref at align pose: J2 {tau_base_s[1]:+.4f} "
+                          f"J3 {tau_base_s[2]:+.4f}", flush=True)
 
                     class _IO:
                         def read(io_self):
@@ -518,8 +758,8 @@ def main():
                                 tq_now = link.torque()
                                 rise = (abs(tq_now[1] - tau_base_s[1])
                                         + W_J3 * abs(tq_now[2] - tau_base_s[2]))
-                                if rise >= a.tau_abort:
-                                    print(f"[splice] torque {rise:.3f} >= abort -> descent refused", flush=True)
+                                if rise >= a.splice_tau:
+                                    print(f"[splice] torque {rise:.3f} >= splice_tau -> descent refused", flush=True)
                                     return
                             tgt = p_cmd + np.array([0.0, 0.0, dz])
                             tgt[2] = max(tgt[2], a.z_floor)
@@ -531,11 +771,24 @@ def main():
                             p_cmd, R_cmd = ob.fk(q_cmd)
 
                         def suction(io_self, on):
+                            if not on and state["suction"] == 1:
+                                # one-way during the press: vacuum must build to attach; the
+                                # actor's off-flickers would kill it (cleanup forces off later)
+                                print("[splice] suction-off ignored during press", flush=True)
+                                return
                             link.suction(bool(on))
                             state["suction"] = int(on)
+                            if on:
+                                io_self.suc_t = time.time()
 
                         def lift(io_self, dz):
                             nonlocal q_cmd, p_cmd, R_cmd
+                            # real pump needs ~1 s to pull vacuum; the 50 Hz-trained actor
+                            # fires lift ~0.6 s after suction (sim seal is faster). Hold the
+                            # press until the pump has had a fair dwell.
+                            dwell = time.time() - getattr(io_self, "suc_t", time.time())
+                            if dwell < 1.0:
+                                time.sleep(1.0 - dwell)
                             tgt = p_cmd + np.array([0.0, 0.0, dz])
                             qi, pe, _ = ik(m, dik, ob.sid, tgt, R_DOWN, q_cmd)
                             if pe > 0.005 or guard.check_q(qi):
@@ -547,7 +800,14 @@ def main():
 
                     res = splice.run(_IO())
                     print(f"[splice] result: {res}", flush=True)
-                    if res == "lifted" and not a.seal_dry:
+                    # The actor can report "timeout" while the cup is ACTUALLY holding -- e.g. the
+                    # crush guard refused the descent its state machine was waiting on. Suction
+                    # being ON is the signal worth testing; the place block lifts and ZED-verifies,
+                    # which is the authoritative check. Never discard a possible grasp here.
+                    if not a.seal_dry and (res == "lifted" or state["suction"] == 1):
+                        if res != "lifted":
+                            print(f"[splice] result {res} but suction is ON -> trying lift+verify anyway",
+                                  flush=True)
                         attached_since = time.time() - 1.1    # place block fires next iteration
                     else:
                         if state["suction"]:
@@ -578,7 +838,25 @@ def main():
                 new = pending["slot"].get("plan")
                 pending.clear()
                 if new is not None:
+                    _old = plan
                     plan = new
+                    plan["k_adopt"] = k
+                    plan["old"] = None if _old is None else dict(p=_old["p_abs"], R=_old["R_abs"], k_obs=_old["k_obs"])
+                    if policy.action_mode == "bspline":
+                        # ABPolicy adoption-time splice: pin the curve to the CURRENT commanded
+                        # state and velocity relative to the plan's obs frame -> smooth boundary
+                        from spline_action import ctrl_to_waypoints, ab_refit
+                        pT, RT = plan["p_t"], plan["R_t"]
+                        dp0 = RT.T @ (p_cmd - pT)
+                        dR0 = RT.T @ R_cmd
+                        c0 = np.concatenate([dp0, dR0[:, 0], dR0[:, 1], [float(state["suction"])]])
+                        v0 = np.zeros(10)
+                        if prev_p_cmd is not None:
+                            v0[:3] = RT.T @ (p_cmd - prev_p_cmd) / dt     # cmd velocity, obs frame
+                        acts = ctrl_to_waypoints(ab_refit(plan["act"], v0=v0, c0=c0)).astype(np.float32)
+                        plan["p_abs"] = np.stack([pT + RT @ acts[i, :3] for i in range(T.TA)])
+                        plan["R_abs"] = np.stack([RT @ rot6d_to_R(acts[i, 3:9]) for i in range(T.TA)])
+                        plan["suc"] = acts[:, 9].copy()
                     seq += 1
                     i0 = k - plan["k_obs"]
                     dp = plan["act"]
@@ -597,6 +875,15 @@ def main():
                 else:
                     i = max(i, 0)
                     tgt_p, tgt_R, suc_pred = plan["p_abs"][i].copy(), plan["R_abs"][i].copy(), float(plan["suc"][i])
+                    jb = k - plan.get("k_adopt", k)               # cross-fade: old chunk's remaining steps -> new chunk
+                    if a.blend and plan.get("old") is not None and jb < a.blend:
+                        io = k - plan["old"]["k_obs"] - policy.lat_shift
+                        if 0 <= io < T.TA:
+                            wb = (jb + 1.0) / (a.blend + 1.0)
+                            wb = wb * wb * (3.0 - 2.0 * wb)
+                            tgt_p = (1.0 - wb) * plan["old"]["p"][io] + wb * tgt_p
+                            _U, _, _V = np.linalg.svd((1.0 - wb) * plan["old"]["R"][io] + wb * tgt_R)
+                            tgt_R = _U @ _V
                     if a.orient == "fixed":
                         tgt_R = R_DOWN.copy()
                     elif a.orient == "yawlock":
@@ -608,6 +895,23 @@ def main():
                         if np.linalg.norm(x) > 1e-3:
                             x /= np.linalg.norm(x)
                             tgt_R = np.stack([x, np.cross(z, x), z], axis=1)
+            # ---- final-approach assist (twin: realsim/eval_policy.py --aim/--aim_down): near the goal the executor puts the
+            # lateral target on it; with --aim_down it also brings the cup down and opens the valve. GOAL_BASE z = object top + cup radius.
+            if (a.aim > 0 and GOAL_BASE is not None and plan is not None and holding is None and released_at[0] is None
+                    and np.hypot(p_cmd[0] - GOAL_BASE[0], p_cmd[1] - GOAL_BASE[1]) < a.aim and p_cmd[2] < GOAL_BASE[2] + a.aim_z):
+                tgt_p[:2] = GOAL_BASE[:2]
+                aim_n += 1
+                if a.aim_down > 0 and k >= aim_block and np.hypot(p_cmd[0] - GOAL_BASE[0], p_cmd[1] - GOAL_BASE[1]) < 0.010:
+                    _flo = GOAL_BASE[2] - 0.010
+                    tgt_p[2] = min(tgt_p[2], max(_flo, p_cmd[2] - a.aim_down * dt))
+                    if p_cmd[2] < GOAL_BASE[2] + 0.042:
+                        suc_pred = 1.0
+                    if state["suction"] == 1 and attached_since is not None and p_m[2] > _flo + 0.006 and tau < TAU_FIRM:
+                        attached_since = time.time()           # no hand-off to the carry before the cup is down or in contact
+                    aim_press = aim_press + 1 if p_cmd[2] < _flo + 0.003 else 0
+                    if aim_press * dt > a.aim_press:
+                        aim_block, aim_press = k + int(5.0 / dt), 0
+                        print(f"[aim] {a.aim_press:.0f} s at the bottom without a hand-off -> assist off for 5 s", flush=True)
             # ---- suction (hysteresis on release)
             if plan is not None and not a.no_suction:
                 # physical sanity gate: a seal needs contact -- the cup must be near the table (object tops
@@ -652,24 +956,79 @@ def main():
                 px, py = a.place_xy
                 print(f"[place] attached -> scripted carry to ({px:.3f},{py:.3f},{a.place_z:.2f})", flush=True)
                 ok = True
-                pick_xy = (p_m[0], p_m[1])     # where the grasp happened (for ZED verification)
-                for tz, lbl in ((max(a.place_z, p_m[2] + 0.10), "lift"),
-                                (a.place_z, "carry")):
-                    tgt = [px, py, tz] if lbl == "carry" else [p_m[0], p_m[1], tz]
-                    qg, err, _ = ik(m, dik, ob.sid, tgt, R_cmd, q_cmd)
-                    if err > 0.01:
-                        print(f"[place] IK fail ({lbl}, err {err:.3f}) -> leaving it to the policy", flush=True)
-                        ok = False; break
+                pick_xy = (p_m[0], p_m[1])     # where the grasp happened
+                # Legs: a PROBE leg first when an unloaded reference exists. It returns to the
+                # exact joint configuration measured before the press, which lifts the object
+                # ~25 mm clear of the table and lets the payload torque be read against a
+                # same-pose baseline. Verifying HERE means an empty cup is caught in ~2 s
+                # instead of carrying air all the way to the box.
+                legs = []
+                legs.append(("lift", [p_m[0], p_m[1], max(a.place_z, p_m[2] + 0.10)], None))
+                # INSPECT leg: step laterally off the pick site before judging it. The lift
+                # ends directly ABOVE the pick xy, where the arm's own body makes the ZED
+                # unusable -- counted, it reads as "object still there"; filtered out by
+                # height, its occlusion shadow reads as "site empty". Neither is a
+                # measurement. 35 % of the way to the box is ~10 cm clear and costs nothing,
+                # because it is motion the carry had to make anyway.
+                _ix, _iy = inspect_xy(pick_xy, (px, py))
+                legs.append(("inspect", [_ix, _iy, a.place_z], None))
+                legs.append(("carry", [px, py, a.place_z], None))
+                for lbl, tgt_xyz, tgt_q in legs:
+                    if tgt_q is not None:
+                        qg = np.asarray(tgt_q, float).copy()
+                        if guard.check_q(qg):
+                            print(f"[place] probe pose fails the guard -> skipping the load probe", flush=True)
+                            continue
+                    else:
+                        qg, err, _ = ik(m, dik, ob.sid, tgt_xyz, R_cmd, q_cmd)
+                        if err > 0.01:
+                            print(f"[place] IK fail ({lbl}, err {err:.3f}) -> leaving it to the policy", flush=True)
+                            ok = False; break
                     scripted_move(link, guard, ob, qg, f"place-{lbl}", v_peak_deg=a.place_v)
                     q_cmd = qg; p_cmd, R_cmd = ob.fk(q_cmd)
-                    if lbl == "lift" and ok:
-                        # VERIFY the pick before carrying: the arm is high, the pick site is
-                        # visible to the ZED again — if a surface is still there, we are
-                        # carrying air (improved_run1: 'lifted' was motion-only, object stayed)
-                        time.sleep(0.6)            # one fresh 3 Hz xyz publish
-                        if not zed_site_cleared(pick_xy, a.table_z):
-                            print(f"[place] VERIFY FAILED: object still at ({pick_xy[0]:.3f},{pick_xy[1]:.3f}) "
-                                  f"-> release, retry", flush=True)
+
+                    if lbl == "inspect":
+                        # Poll the map instead of trusting one frame: at 3 Hz a single read can
+                        # land mid-publish or on a dropout. Take the first DEFINITE verdict.
+                        st, info = "unknown", "no reads"
+                        for _try in range(6):
+                            time.sleep(0.35)
+                            st, info = zed_site_state(pick_xy, a.table_z)
+                            if st != "unknown":
+                                break
+                        # record the payload torque for the log only -- calibration (see
+                        # /tmp/calib_load.json) measured same-pose drift of 0.048 pin against
+                        # just 0.021 pin for a 0.3 kg object, so this number CANNOT gate
+                        # anything on this hardware. It is kept because it is free to read.
+                        if probe_ref[0] is not None:
+                            ref = probe_ref[0][1]; tq_now = torque_median(0.2)
+                            load = float(abs(tq_now[1] - ref[1]) + W_J3 * abs(tq_now[2] - ref[2]))
+                            print(f"[verify] (payload torque {load:.4f} pin -- below the "
+                                  f"0.048 noise floor, informational only)", flush=True)
+                        print(f"[verify] pick site {st}: {info}", flush=True)
+                        # LIFTED vs DRAGGED: a cup that shoves the object sideways also
+                        # empties the site. Only a neighbourhood that stayed empty proves
+                        # the object actually left the table.
+                        dragged = False
+                        if st == "cleared" and nbr_ref[0] is not None and _T_ZED is not None:
+                            now = _pv.occupancy_cells(pick_xy, a.table_z, _T_ZED, shm=SHM)
+                            dragged, n_new, need = _pv.drag_verdict(nbr_ref[0][0], now, nbr_ref[0][1])
+                            cov = _pv.table_coverage(pick_xy, a.table_z, _T_ZED, shm=SHM)
+                            cov_ref = max(nbr_ref[0][2], 1)
+                            cov_frac = cov / cov_ref
+                            print(f"[verify] neighbourhood: {n_new} newly-occupied cells "
+                                  f"(drag threshold {need}), table coverage "
+                                  f"{100 * cov_frac:.0f}% of reference", flush=True)
+                            if not dragged and cov_frac < 0.6:
+                                # The arm is shadowing the neighbourhood, so "nothing appeared"
+                                # is not evidence that nothing is there.
+                                st = "unknown"
+                                print(f"[verify] drag test INCONCLUSIVE (neighbourhood "
+                                      f"{100 * (1 - cov_frac):.0f}% occluded)", flush=True)
+                        if dragged:
+                            print(f"[place] VERIFY FAILED: site is clear but the object "
+                                  f"re-appeared nearby -> dragged, not lifted; release and retry",
+                                  flush=True)
                             link.suction(False); state["suction"] = 0; attached_since = None
                             if GOAL_BASE is not None:
                                 qh, eh, _ = ik(m, dik, ob.sid,
@@ -680,21 +1039,74 @@ def main():
                                     q_cmd = qh; p_cmd, R_cmd = ob.fk(q_cmd)
                             plan = None; pending.clear(); hist.clear()
                             ok = False; break
+                        if st == "unknown":
+                            # Honest fallback: proceed with the place, but do NOT claim a
+                            # verified pick. Guessing "cleared" here is what carried air to
+                            # the box and reported success.
+                            print(f"[verify] UNVERIFIED (site not visible) -> placing anyway, "
+                                  f"outcome decided by the final check", flush=True)
+                        elif st == "occupied":
+                            print(f"[place] VERIFY FAILED: object still at "
+                                  f"({pick_xy[0]:.3f},{pick_xy[1]:.3f}) -> empty cup, "
+                                  f"release and retry", flush=True)
+                            link.suction(False); state["suction"] = 0; attached_since = None
+                            if GOAL_BASE is not None:
+                                qh, eh, _ = ik(m, dik, ob.sid,
+                                               np.array([GOAL_BASE[0], GOAL_BASE[1], GOAL_BASE[2] + 0.08]),
+                                               R_DOWN, q_cmd)
+                                if eh < 0.005 and not guard.check_q(qh):
+                                    scripted_move(link, guard, ob, qh, "verify-recover", v_peak_deg=12.0)
+                                    q_cmd = qh; p_cmd, R_cmd = ob.fk(q_cmd)
+                            plan = None; pending.clear(); hist.clear()
+                            ok = False; break
+                        else:
+                            print(f"[verify] pick CONFIRMED (site cleared with a clear view) "
+                                  f"-> carrying to the box", flush=True)
                 if ok:
                     link.suction(False); state["suction"] = 0; attached_since = None
                     print(f"[place] released at ({px:.3f},{py:.3f})", flush=True)
+                    # FINAL outcome: retreat to home first. "The object left the pick site" is
+                    # not success -- it also happens when the cup shoves the object off. Success
+                    # is the object ARRIVING at the box, and judging that needs the arm out of
+                    # the way of the drop site, which only a retreat gives.
+                    qh_m = scripted_move(link, guard, ob, START_Q, "place-retreat",
+                                         v_peak_deg=a.script_vmax, min_T=1.0)
+                    if qh_m is not None:
+                        q_cmd = qh_m; p_cmd, R_cmd = ob.fk(q_cmd)
+                    time.sleep(1.2)
+                    st, info = zed_site_state(pick_xy, a.table_z)
+                    arrived, n_new = None, 0
+                    if place_ref[0] is not None and _T_ZED is not None:
+                        now = _pv.occupancy_cells((px, py), a.table_z, _T_ZED, shm=SHM, R=a.place_r)
+                        n_new = len(now - place_ref[0])
+                        arrived = n_new >= 3
+                    print(f"[place] OUTCOME: pick site {st} ({info}); "
+                          f"place site {'+' if arrived else ''}{n_new} new cells"
+                          + ("  <-- OBJECT DELIVERED" if arrived
+                             else "  <-- NOTHING ARRIVED at the box" if arrived is False
+                             else ""), flush=True)
                     released_at[0] = k
                     if a.stop_after_place: break
             # ---- guards on the target
             clips = []
             step = tgt_p - p_cmd
-            n = float(np.linalg.norm(step))
-            if n > a.step_max:
-                tgt_p = p_cmd + step * (a.step_max / n)
-                clips.append(f"step {100 * n:.1f} cm")
+            # split lateral / vertical so a tight lateral cap cannot throttle descent
+            lat = np.array([step[0], step[1], 0.0]); vert = np.array([0.0, 0.0, step[2]])
+            nl = float(np.linalg.norm(lat)); nv = abs(float(vert[2]))
+            zcap = a.step_max_z if a.step_max_z > 0 else a.step_max
+            if nl > a.step_max:
+                lat *= a.step_max / nl
+                clips.append(f"lat {100 * nl:.1f} cm")
+            if nv > zcap:
+                vert *= zcap / nv
+                clips.append(f"vert {100 * nv:.1f} cm")
+            tgt_p = p_cmd + lat + vert
             if tgt_p[2] < a.z_floor:
                 tgt_p[2] = a.z_floor
                 clips.append("z floor")
+            if tgt_p[0] < a.ws_xmin:                       # workspace limit toward the back wall
+                tgt_p[0] = min(a.ws_xmin, p_cmd[0] + a.step_max) if p_cmd[0] < a.ws_xmin else a.ws_xmin
+                clips.append("x min")
             if tilt_deg(tgt_R) > a.max_tilt:
                 tgt_R = R_cmd
                 clips.append("tilt")
@@ -702,7 +1114,18 @@ def main():
                 tgt_p[2] = max(p_m[2], a.z_floor)          # hard contact: no further descent, lift/lateral allowed
                 clips.append(f"hard contact {tau:.2f}")
             lead = float(np.degrees(np.abs(q_cmd - q_m)).max())
-            if lead > a.lead_max:
+            # graceful degradation: scale the step down as lead grows instead of freezing
+            # outright (a binary hold lets the chunk advance without motion, then releases
+            # in one lurch -- measured 25 deg on the DiT run). Full speed below lead_soft,
+            # linearly to zero at lead_max.
+            # LEAD_MAX_DEG=3 is NOT arbitrary: K0*3deg saturates the Pi law at vmax, so a larger
+            # lead buys no speed and only lets the reference drift ahead (-> catch-up lurch).
+            # Ramp inside the ceiling: full step to 60%, linearly to zero at the cap.
+            lead_soft = 0.6 * a.lead_max
+            lead_scale = 1.0
+            if lead > lead_soft:
+                lead_scale = max(0.0, (a.lead_max - lead) / max(a.lead_max - lead_soft, 1e-6))
+            if lead_scale <= 0.0:
                 holding = f"lead {lead:.1f} deg"
             q_tgt = q_cmd.copy()
             if holding is None:
@@ -711,20 +1134,34 @@ def main():
                     holding = f"ik residual {1000 * pe:.1f} mm {math.degrees(re):.1f} deg"
                 else:
                     dq = q_ik - q_cmd
-                    mx = float(np.degrees(np.abs(dq)).max())
-                    if mx > a.dq_max:
-                        dq *= a.dq_max / mx
+                    lim = np.full(6, a.dq_max)
+                    if a.dq_mid > 0 and p_cmd[2] > a.dq_mid_z:     # joints 2-4 faster, only well above the table
+                        lim[1:4] = a.dq_mid
+                    sc = float((np.degrees(np.abs(dq)) / lim).max())   # uniform scaling keeps the direction
+                    if sc > 1.0:
+                        mx = float(np.degrees(np.abs(dq)).max())
+                        dq /= sc
                         clips.append(f"dq {mx:.1f} deg")
+                    if lead_scale < 1.0:
+                        dq *= lead_scale               # ease off instead of stalling
+                        clips.append(f"lead-scale {lead_scale:.2f}")
                     q_tgt = q_cmd + dq
+                    if FILT is not None:
+                        q_tgt, finfo = FILT(q_cmd, q_tgt, dt)
+                        if finfo["why"]:
+                            clips.append(f"filt {finfo['why']} a{finfo['alpha']:.2f} clr {1000 * finfo['clr']:.0f}mm")
                     v = guard.check_q(q_tgt)
                     if v:
                         holding = "guard: " + "; ".join(v)
                         q_tgt = q_cmd.copy()
             if holding is not None:
                 n_hold += 1
+                if FILT is not None:
+                    FILT.reset()
             # ---- send
             link.send_segment(q_cmd, q_tgt, t_k, dt=dt, seq=k, tag=f"zed:{k}", hold=holding is not None)
             q_cmd = q_tgt
+            prev_p_cmd = p_cmd.copy()
             p_cmd, R_cmd = ob.fk(q_cmd)
             rec = dict(k=k, t=time.time(), q_meas=np.round(q_m, 5).tolist(), q_cmd=np.round(q_cmd, 5).tolist(),
                        tip=np.round(p_m, 4).tolist(), tip_cmd=np.round(p_cmd, 4).tolist(), tgt=np.round(tgt_p, 4).tolist(),
@@ -739,6 +1176,8 @@ def main():
             k += 1
     finally:
         log_f.close()
+    if a.aim > 0:
+        print(f"[aim] lateral assist active in {aim_n} decisions", flush=True)
     print(f"[ctrl] episode end at k {k}: holds {n_hold}, suction {state['suction']}, log {log_dir}", flush=True)
     if state["suction"]:
         print("[ctrl] releasing", flush=True)
