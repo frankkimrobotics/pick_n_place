@@ -1,0 +1,84 @@
+# Task registry: the supported things to run. `pnp tasks` lists, `pnp run <name> [args...]` runs with the
+# right interpreter and PYTHONPATH. `needs_robot = true` runs `pnp config validate` first and refuses on failure.
+# Fields: script (relative to the repo), env (key in machine [interpreters]), cwd, pythonpath (extra, may use
+# {paths.*}), args (defaults, appended before user args), description, inputs, outputs.
+
+[cam_server]
+description = "ZED 2i + wrist D405 publisher into /dev/shm (15 fps); must run before any visual policy"
+script = "policy/zed_cam_server.py"
+env = "system"
+pythonpath = ["{paths.librealsense}"]
+args = ["--fps", "15"]
+service = true
+
+[planner_v08]
+description = "cuRobo v0.8 planner server on :9997 (ground -0.1; send a table cuboid)"
+script = "{paths.curobo_cfg_dir}/curobo_planner_server_v2.py"
+env = "curobo2"
+args = ["--ground-z", "-0.1"]
+service = true
+
+[planner_v09]
+description = "cuRoboV2-Fast planner server on :9996, 22 ms/plan"
+script = "{paths.curobo_cfg_dir}/curobo_planner_server_v2.py"
+env = "curobo3"
+args = ["--ground-z", "-0.1", "--port", "9996", "--collision-cache", "32"]
+service = true
+
+[datagen_curobo]
+description = "cuRobo expert demos: cluttered objects cleared into a runtime-placed 25 cm box, live suction, failure modes"
+script = "dataset_gen_curobo.py"
+env = "mjwarp"
+inputs = ["planner_v09 running"]
+outputs = ["{paths.dataset_mega}/scene_*"]
+
+[datagen_zed]
+description = "Gen-B demos with the real sensor setup (ZED pose), for train_zed"
+script = "dataset_gen_zed.py"
+env = "mjwarp"
+outputs = ["{paths.dataset_zed}/scene_*"]
+
+[features_zed]
+description = "frozen encoder features for both cameras (<enc>_pool.npy, <enc>_zed_pool.npy)"
+script = "policy/extract_features_zed.py"
+env = "ilpolicy"
+args = ["--enc", "lingbot"]
+
+[train_zed]
+description = "train DP / CFM / ACT heads on Gen-B features (UMI-style, 16-step relative-EE chunks)"
+script = "policy/train_policy_zed.py"
+env = "ilpolicy"
+outputs = ["{paths.policies}/<run>/ckpt_*.pt"]
+
+[eval_sim_zed]
+description = "closed-loop sim evaluator for Gen-B policies (the first one; 2026-10)"
+script = "policy/rollout_sim_zed.py"
+env = "mjwarp"
+
+[eval_realsim]
+description = "real executor logic on the validated measured-drive twin, plunger, latency emulation (--level real)"
+script = "realsim/eval_policy.py"
+env = "mj4"
+args = ["--level", "real"]
+inputs = ["planner_v09 running (--gen curobo)"]
+outputs = ["{paths.rollouts_realsim}/<out>/results.json"]
+notes = "max --par 3 on GPU0 (6.4 GB per worker); --par 4 lost 7/10 scenes to OOM; use a fresh --out per run"
+
+[rollout_real]
+description = "visual policy on the real Pro 630 with the ZED camera (receding horizon, DLS IK, torque guard)"
+script = "policy/real_rollout_zed.py"
+env = "ilpolicy"
+needs_robot = true
+inputs = ["cam_server running", "robot_hal on the Pi, START pressed"]
+outputs = ["{paths.runs_real}/zed_<ts>/steps.jsonl"]
+
+[seal_sac]
+description = "privileged-force seal controller, asymmetric SAC (deploy actor_100k, never actor_final)"
+script = "rl/seal_sac.py"
+env = "mjwarp"
+outputs = ["{paths.rl_runs}/seal_sac*/actor_*.pt"]
+
+[check_clearance]
+description = "offline replay: cuRobo collision spheres vs box/table for a recorded trajectory"
+script = "check_arm_clearance.py"
+env = "curobo3"

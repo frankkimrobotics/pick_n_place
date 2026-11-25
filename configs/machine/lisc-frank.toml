@@ -1,0 +1,47 @@
+# Machine layer for lisc-frank (the lab desktop). Absolute paths, interpreters, serials, hosts.
+# Another machine gets its own file; nothing here is referenced from code by literal.
+
+[paths]
+repo2026 = "/home/lisc-frank/Desktop/2026"
+pick_and_place = "/home/lisc-frank/Desktop/2026/pick_and_place"
+mycobot_mpc = "/home/lisc-frank/Desktop/2026/mycobot_mpc"                  # CANONICAL Pi controller repo (Sept 2026, B-spline streaming, suction, torque)
+mycobot_mpc_stale = "/home/lisc-frank/Desktop/2026/frankkimrobotics/mycobot_mpc"   # June copy, do not edit; retire in phase 5
+desc_dir = "/home/lisc-frank/Desktop/2026/frankkimrobotics/ros2_mycobot/src/mycobot_description"
+curobo_cfg_dir = "/home/lisc-frank/Desktop/2026/frankkimrobotics/ros2_mycobot/src/mycobot_description/curobo"
+calib_dir = "/home/lisc-frank/Desktop/2026/frankkimrobotics/ros2_mycobot/src/mycobot_description/calib"
+datasets = "/home/lisc-frank"                      # pnp_dataset_zed, pnp_dataset_mega, pnp_dataset_dp live here
+dataset_zed = "/home/lisc-frank/pnp_dataset_zed"
+dataset_mega = "/home/lisc-frank/pnp_dataset_mega"
+policies = "/home/lisc-frank/pnp_policies"
+runs_real = "/home/lisc-frank/pnp_real_runs"
+recordings = "/home/lisc-frank/pnp_recordings"
+rollouts_realsim = "/home/lisc-frank/pnp_rollouts_realsim"
+mcap_runs = "/home/lisc-frank/pnp_runs_mcap"
+rl_runs = "/home/lisc-frank/pnp_rl"
+librealsense = "/home/lisc-frank/librealsense/build/release"               # PYTHONPATH for pyrealsense2 (system python)
+
+[interpreters]
+ilpolicy = "/home/lisc-frank/miniconda3/envs/ilpolicy/bin/python"          # 3.11  policy training, real executor, features
+mjwarp = "/home/lisc-frank/miniconda3/envs/mjwarp/bin/python"              # 3.11  mujoco_warp twin, RL, closed-loop sim evals
+mj4 = "/home/lisc-frank/miniconda3/envs/mj4/bin/python"                    # 3.12  realsim (MuJoCo 4 MjSpec), no matplotlib
+curobo2 = "/home/lisc-frank/miniconda3/envs/curobo2/bin/python"            # 3.10  cuRobo v0.8 planner server :9997, nvblox
+curobo3 = "/home/lisc-frank/miniconda3/envs/curobo3/bin/python"            # 3.10  cuRobo v0.9 (cuRoboV2-Fast) server :9996
+sam3 = "/home/lisc-frank/miniconda3/envs/sam3/bin/python"                  # 3.12  SAM3 perception, litdata
+system = "/usr/bin/python3"                                                # 3.8   ZED SDK + pyrealsense2 camera server, ROS 2 Humble
+nodejs = "/home/lisc-frank/miniconda3/envs/nodejs/bin/node"                # 26    archify diagrams
+
+[pi]
+host = "192.168.50.2"                # direct cable, 1-2 ms; 10.0.0.27 is WiFi with 50-125 ms spikes
+user = "pi"
+robot_hal_path = "/home/pi/Desktop/mpc/robot_hal.py"
+
+[cameras.wrist]
+serial = "218622271300"
+[cameras.fixed]
+serial = "218622277013"
+[cameras.zed]
+serial = ""                          # ZED 2i: SDK picks the only ZED; fill in if a second appears
+
+[gpus]
+a5000 = 0                            # 24.5 GB; evals: max 3 realsim workers (6.4 GB each)
+rtx2080ti = 1                        # 11 GB; thermally throttles to 1500 MHz at 86C under any sustained load

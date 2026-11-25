@@ -1,0 +1,356 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "runlog: one MCAP per robot run",
+    "subtitle": "Recorder owns the file; PiLink starts and stops it; publishing never blocks the control loop",
+    "output": "runlog_architecture.html",
+    "quality_profile": "showcase"
+  },
+  "components": [
+    {
+      "id": "exec",
+      "type": "backend",
+      "label": "Executor / calib script",
+      "sublabel": "8 PiLink scripts, ilpolicy env, no ROS",
+      "pos": [
+        40,
+        300
+      ],
+      "size": [
+        200,
+        68
+      ]
+    },
+    {
+      "id": "pilink",
+      "type": "backend",
+      "label": "PiLink",
+      "sublabel": "send_segment, suction, acks",
+      "pos": [
+        310,
+        300
+      ],
+      "size": [
+        190,
+        68
+      ],
+      "tag": "spawns + stops recorder"
+    },
+    {
+      "id": "publisher",
+      "type": "messagebus",
+      "label": "runlog.Publisher",
+      "sublabel": "unix datagram, drops if behind",
+      "pos": [
+        310,
+        470
+      ],
+      "size": [
+        190,
+        68
+      ]
+    },
+    {
+      "id": "pi",
+      "type": "external",
+      "label": "Pi robot_hal",
+      "sublabel": ":9998 commands, :9999 feedback 100 Hz",
+      "pos": [
+        580,
+        120
+      ],
+      "size": [
+        200,
+        68
+      ]
+    },
+    {
+      "id": "recorder",
+      "type": "backend",
+      "label": "runlog.Recorder",
+      "sublabel": "own process, single writer, zstd chunks",
+      "pos": [
+        580,
+        470
+      ],
+      "size": [
+        200,
+        68
+      ]
+    },
+    {
+      "id": "hal",
+      "type": "external",
+      "label": "LinuxCNC HAL + CAN drives",
+      "sublabel": "10 ms servo thread; pro600 pins, CAN to STM32 drives",
+      "pos": [
+        860,
+        120
+      ],
+      "size": [
+        210,
+        68
+      ]
+    },
+    {
+      "id": "camsrv",
+      "type": "backend",
+      "label": "zed_cam_server",
+      "sublabel": "/dev/shm jpg, depth, xyz, stamps",
+      "pos": [
+        860,
+        470
+      ],
+      "size": [
+        210,
+        68
+      ]
+    },
+    {
+      "id": "mcap",
+      "type": "database",
+      "label": "<YYYYmmdd_HHMMSS_mmm>.mcap",
+      "sublabel": "run id = timestamp; ~/pnp_runs_mcap",
+      "pos": [
+        580,
+        630
+      ],
+      "size": [
+        210,
+        68
+      ]
+    },
+    {
+      "id": "check",
+      "type": "security",
+      "label": "runlog check",
+      "sublabel": "rates, gaps, clock drift, camera liveness",
+      "pos": [
+        310,
+        630
+      ],
+      "size": [
+        210,
+        68
+      ],
+      "tag": "runs at every stop"
+    },
+    {
+      "id": "cams",
+      "type": "external",
+      "label": "Cameras",
+      "sublabel": "wrist D405, ZED 2i, fixed D405 at 15 fps",
+      "pos": [
+        1150,
+        630
+      ],
+      "size": [
+        210,
+        68
+      ]
+    },
+    {
+      "id": "consumers",
+      "type": "external",
+      "label": "Foxglove / bags_to_dataset",
+      "sublabel": "ROS 2 schemas read natively",
+      "pos": [
+        860,
+        630
+      ],
+      "size": [
+        210,
+        68
+      ]
+    },
+    {
+      "id": "piagent",
+      "type": "backend",
+      "label": "runlog-pi agent",
+      "sublabel": "halsampler pins, NML errors, candump, stdout, status",
+      "pos": [
+        1150,
+        120
+      ],
+      "size": [
+        210,
+        68
+      ],
+      "tag": "started over SSH per run"
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Desktop",
+      "wraps": [
+        "exec",
+        "pilink",
+        "publisher",
+        "recorder",
+        "camsrv"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "Raspberry Pi",
+      "wraps": [
+        "pi",
+        "hal",
+        "piagent"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "exec-pilink",
+      "from": "exec",
+      "to": "pilink",
+      "label": "send_segment / suction",
+      "variant": "emphasis"
+    },
+    {
+      "id": "pilink-pi",
+      "from": "pilink",
+      "to": "pi",
+      "label": "chunk / spline JSON",
+      "variant": "emphasis"
+    },
+    {
+      "id": "pi-hal",
+      "from": "pi",
+      "to": "hal",
+      "label": "poscmd / posfb"
+    },
+    {
+      "id": "exec-pub",
+      "from": "exec",
+      "to": "publisher",
+      "label": "decision, plan, event",
+      "variant": "dashed"
+    },
+    {
+      "id": "pilink-pub",
+      "from": "pilink",
+      "to": "publisher",
+      "label": "cmd, ack, suction",
+      "variant": "dashed"
+    },
+    {
+      "id": "pub-rec",
+      "from": "publisher",
+      "to": "recorder",
+      "label": "datagrams"
+    },
+    {
+      "id": "camsrv-rec",
+      "from": "camsrv",
+      "to": "recorder",
+      "label": "tail /dev/shm at 15 fps"
+    },
+    {
+      "id": "cams-camsrv",
+      "from": "cams",
+      "to": "camsrv",
+      "label": "USB"
+    },
+    {
+      "id": "rec-mcap",
+      "from": "recorder",
+      "to": "mcap",
+      "label": "log_time + publish_time per message",
+      "variant": "emphasis"
+    },
+    {
+      "id": "mcap-consumers",
+      "from": "mcap",
+      "to": "consumers"
+    },
+    {
+      "id": "mcap-check",
+      "from": "mcap",
+      "to": "check",
+      "variant": "security"
+    },
+    {
+      "id": "pi-rec",
+      "from": "pi",
+      "to": "recorder",
+      "label": "own :9999 client at 100 Hz",
+      "variant": "dashed"
+    },
+    {
+      "id": "hal-agent",
+      "from": "hal",
+      "to": "piagent",
+      "label": "all pro600 pins at 100 Hz, error channel, can0"
+    },
+    {
+      "id": "pi-agent",
+      "from": "pi",
+      "to": "piagent",
+      "label": "stdout/stderr, status, per-tick CSV",
+      "variant": "dashed"
+    },
+    {
+      "id": "agent-rec",
+      "from": "piagent",
+      "to": "recorder",
+      "label": ":9997 line stream, later zenoh pi/**",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [
+        [
+          1255,
+          420
+        ],
+        [
+          680,
+          420
+        ]
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Every run, automatically",
+      "items": [
+        "PiLink.__init__ spawns the recorder and the Pi agent, close() stops both",
+        "Run id is the timestamp: YYYYmmdd_HHMMSS_mmm",
+        "Covers all 8 PiLink scripts; RUNLOG=0 disables"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Timestamps",
+      "items": [
+        "log_time = recorder receipt, host clock",
+        "publish_time = source time: Pi stamp + offset, camera stamp",
+        "/clock/pi at 1 Hz: t_recv, t_pi, offset, for offline re-fit"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Never blocks the loop",
+      "items": [
+        "Datagrams drop under backpressure instead of waiting",
+        "Images never cross the socket; the recorder tails /dev/shm",
+        "A recorder crash does not stop the run"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Everything from the Pi and the drives",
+      "items": [
+        "HAL pins via halsampler at the servo rate, no polling",
+        "LinuxCNC error channel: faults and Power OFF",
+        "candump of every CAN frame: the drives' status words",
+        "robot_hal stdout, pro600 debug, dmesg, start/stop snapshots",
+        "runlog check fails the run if any source is missing"
+      ]
+    }
+  ]
+}

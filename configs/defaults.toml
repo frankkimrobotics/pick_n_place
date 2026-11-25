@@ -1,0 +1,104 @@
+# pnp defaults. Every value has a unit and a source. Machine-specific things (paths, serials, hosts,
+# interpreters) live in configs/machine/<hostname>.toml. Experiments override in configs/experiments/.
+# Provenance of any effective value: `pnp config show`.
+
+[robot]
+name = "mycobot_pro_630"
+joint_names = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+home_q = [-1.5707963, 0.0, 0.0, 0.0, 0.0, 0.0]                      # rad, URDF convention   (config.py HOME_Q)
+base_q = [0.0, -0.349066, 1.396263, 0.174533, -1.570796, 0.0]        # rad, pick-and-place start (config.py BASE_Q / START_Q)
+joint_limits_deg = [[-180, 180], [-270, 90], [-150, 150], [-260, 80], [-168, 168], [-174, 174]]  # from config.py JOINT_LIMITS; verify against URDF in phase 2
+elbow_box_deg = [70.0, 145.0]        # |j2| <= 70, |j3| <= 145 (real_policy_ctrl ELBOW_DEG; cuRobo position_limit_clip)
+handeye_tcp_len = 0.145              # m, tcp length when the hand-eye was calibrated (config.py)
+planner_tcp_len = 0.135              # m, URDF/planner tcp length; cam_tcp_z_shift = handeye - planner = 0.010
+render_scale = 0.5                   # 424x240 render (config.py RENDER_SCALE)
+
+[suction]
+cup_lip_radius = 0.0075              # m, measured from suction_cup.stl (rim_seal)
+cup_tip_radius = 0.008               # m, cup_tip sphere in the MJCF (env_warp CUP_R)
+seal_max_dev = 0.002                 # m, rim-conformance threshold; NOT calibrated (one real negative)
+plunger_travel = 0.015               # m, user: "compresses around 15 mm"; realsim/plunger.py
+plunger_k = 300.0                    # N/m, ASSUMED (realsim); rl/seal_env used 2000 -- unresolved, see docs
+plunger_preload = 2.0                # N, ASSUMED
+vacuum_onset = 0.30                  # s, before a seal can hold (realsim; ASSUMED)
+vacuum_release = 0.15                # s
+diameter_legacy = 0.010              # m, config.py SUCTION_DIAMETER (old 1-sphere seal model)
+
+[task]
+table_z = -0.10                      # m, table top == planner ground_z default (config.py TABLE_Z)
+table_dims = [1.2, 1.2, 0.04]        # m
+pregrasp_standoff = 0.06             # m, along +normal from the grasp point
+lift_height = 0.10                   # m
+place_hover = 0.08                   # m
+release_clearance = 0.04             # m, object bottom above the box rim
+box_pose_xyz = [0.10, 0.40, -0.10]   # m, box bottom on the table (config.py BOX_POSE_XYZ)
+box_inner = [0.38, 0.28, 0.20]       # m, W D H inner; 1 cm walls (config.py BOX_INNER)
+box_wall = 0.010                     # m
+seal_pos_tol = 0.005                 # m   (config.py SEAL_POS_TOL)
+seal_ang_tol_deg = 15.0              # deg (config.py SEAL_ANG_TOL_DEG)
+
+[pi]
+cmd_port = 9998                      # robot_hal command socket (JSON lines)
+feedback_port = 9999                 # robot_hal feedback stream, 100 Hz joints_deg + timestamp
+agent_port = 9997                    # runlog-pi agent stream (docs/runlog_design.md), not yet implemented
+period_ms = 10                       # robot_hal control period; HAL servo thread is 10 ms (elerob.ini SERVO_PERIOD)
+vel_cmd_max = 850                    # drive units after vel_scale: 17 per deg/s -> 50 deg/s (real_policy_ctrl)
+ctrl_dt = 0.10                       # s, decision period (real_policy_ctrl CTRL_DT)
+traj_dt = 0.02                       # s, reference grid sent to the Pi
+feedback_stale_s = 0.5               # s, abort if no feedback
+suction_pin = "pro600.digital_out00"
+
+[pi.stream]                          # default streaming gains; every policy result to 2026-11-14 used these
+k0 = 10.0
+k1 = 0.3
+vmax = 50.0                          # deg/s
+vel_scale = 17.0                     # drive units per deg/s, measured 2026-09-17
+vff = 1.0                            # feedforward; mandatory with posfb feedback
+lead = 0.045                         # s, drive dead-time compensation
+
+[pi.stream_tuned]                    # 2026-11-14 sysid fit; select with --stream tuned; needs the Pi robot_hal of that date
+k0 = 10.0
+k1 = 0.3
+vmax = 50.0
+vel_scale = 16.4
+vff = 1.0
+lead = 0.040
+lead_p = 0.0
+taff = 0.0
+vfric = 0.35
+
+[cameras]
+fps = 15                             # Hz, zed_cam_server publish rate; policy samples at 10 Hz
+shm_dir = "/dev/shm"
+[cameras.wrist]                      # D405 on the wrist
+width = 424
+height = 240
+shm_color = "pnp_wrist.jpg"
+shm_depth = "pnp_wrist_depth.npy"
+shm_intrinsics = "pnp_wrist_intr.json"
+[cameras.zed]                        # ZED 2i on the mast; HD720 left, resized to the sim fovy
+width = 432
+height = 240
+shm_color = "pnp_zed.jpg"
+shm_xyz = "pnp_zed_xyz.npy"
+xyz_every = 5                        # publish the decimated cloud every N frames
+[cameras.fixed]                      # second D405, fixed mount
+width = 424
+height = 240
+shm_color = "pnp_fixed.jpg"
+[cameras.stamps]
+file = "pnp_cam_stamp.json"
+stale_s = 1.0                        # executor aborts past this
+
+[planner]
+curobo_v08_port = 9997               # curobo_planner_server_v2.py, env curobo2
+curobo_v09_port = 9996               # cuRoboV2-Fast, env curobo3, --collision-cache
+ground_z = -0.1                      # keep at -0.1 and send a table cuboid; ground_z 0 puts base spheres in collision
+max_acceleration = 8.0               # v0.9 envelope: 0 violations at 8.0
+
+[runlog]                             # docs/runlog_design.md; not yet implemented
+run_id_format = "%Y%m%d_%H%M%S_%f"   # ms suffix truncated to 3 digits
+depth_fps = 15
+cloud_fps = 5
+chunk_mb = 4
+compression = "zstd"
