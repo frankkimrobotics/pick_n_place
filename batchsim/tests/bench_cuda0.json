@@ -1,0 +1,50 @@
+{
+ "256": {
+  "state_only": {
+   "decisions_per_s": 248,
+   "sim_seconds_per_s": 24.8,
+   "physics_steps_per_s": 12388,
+   "gpu_mem_gb": 0.01,
+   "healthy": 1.0
+  },
+  "with_cameras": {
+   "decisions_per_s": 343,
+   "sim_seconds_per_s": 34.3,
+   "physics_steps_per_s": 17170,
+   "gpu_mem_gb": 0.68,
+   "healthy": 1.0,
+   "observe_ms": 63.6,
+   "images_per_s": 8048
+  }
+ },
+ "1024": {
+  "state_only": {
+   "decisions_per_s": 1488,
+   "sim_seconds_per_s": 148.8,
+   "physics_steps_per_s": 74404,
+   "gpu_mem_gb": 0.68,
+   "healthy": 1.0
+  },
+  "with_cameras": {
+   "decisions_per_s": 1153,
+   "sim_seconds_per_s": 115.3,
+   "physics_steps_per_s": 57666,
+   "gpu_mem_gb": 2.7,
+   "healthy": 1.0,
+   "observe_ms": 224.5,
+   "images_per_s": 9122
+  }
+ },
+ "4096": {
+  "state_only": {
+   "decisions_per_s": 5719,
+   "sim_seconds_per_s": 571.9,
+   "physics_steps_per_s": 285957,
+   "gpu_mem_gb": 2.7,
+   "healthy": 1.0
+  },
+  "with_cameras": {
+   "error": "RuntimeError(\"Failed to allocate 1698693120 bytes on device 'cuda:0'\")"
+  }
+ }
+}

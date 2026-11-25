@@ -59,6 +59,12 @@ ELBOW_DEG = (70.0, 145.0)           # |j2|, |j3| (URDF deg), same box as real_pn
 # j3/j4 1.53/1.45 -> 0.94/0.68 deg/s, same-tick position error 1.14/1.62 -> 0.71/0.98 deg). lead with K0=20
 # made the approach aggressive enough to false-trigger the contact guard 4 cm above the object.
 STREAM_GAINS = dict(k0=10.0, k1=0.3, vmax=50.0, vel_scale=17.0, vff=1.0, lead=0.045)
+# Tuned on the arm 2026-11-14 (realsim/sysid, guidebook subpage "Drive identification"): the feedforward leads the
+# drive delay, the position error does not (`lead_p`, needs the Pi robot_hal of that date), breakaway compensation,
+# corrected velocity scale. 1 Hz 3 deg sine: rms 0.45 -> 0.045 deg, arm no longer 42 ms ahead of its reference.
+# NOT the default: every policy result up to that date was obtained with STREAM_GAINS above. Select with
+# STREAM_GAINS.update(STREAM_GAINS_TUNED) before the first PiLink send (real_rollout_zed.py --stream tuned).
+STREAM_GAINS_TUNED = dict(k0=10.0, k1=0.3, vmax=50.0, vel_scale=16.4, vff=1.0, lead=0.040, lead_p=0.0, taff=0.0, vfric=0.35)
 PERIOD_MS = 10
 VEL_CMD_MAX = 850                   # Pi clamp on vel_cmd AFTER vel_scale (units = 17 per deg/s): 850 = 50 deg/s.
                                     # Run 1 (2026-09-20) used 100 = 5.9 deg/s -> the arm crawled and timed out.

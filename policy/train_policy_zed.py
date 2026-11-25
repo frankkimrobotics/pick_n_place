@@ -71,6 +71,7 @@ class UmiDataset(torch.utils.data.Dataset):
         self.goal_q = {}
         self.rf = {}
         self.grasp = {}
+        self.tau = {}
         self.use_goal = use_goal
         max_sid = int(os.environ.get("PNP_MAX_SID", "100000"))
         _ex = []
@@ -84,12 +85,15 @@ class UmiDataset(torch.utils.data.Dataset):
             if (sid in VAL_SCENES) != (split == "val"):
                 continue
             pf, pfz = (os.path.join(sdir, f"{enc}_pool.npy"),
-                       os.path.join(sdir, f"{enc}_zed_pool.npy"))
+                       os.path.join(sdir, f"{enc}_zed{os.environ.get('PNP_ZED_TAG', '')}_pool.npy"))   # PNP_ZED_TAG=tm: table-masked ZED
             if os.path.exists(pf) and os.path.exists(pfz):
                 tk, tkz = np.load(pf, mmap_mode="r"), np.load(pfz, mmap_mode="r")
-            else:
+            elif (os.path.exists(os.path.join(sdir, f"{enc}_tokens.npy"))
+                  and os.path.exists(os.path.join(sdir, f"{enc}_zed_tokens.npy"))):
                 tk = np.load(os.path.join(sdir, f"{enc}_tokens.npy"), mmap_mode="r")
                 tkz = np.load(os.path.join(sdir, f"{enc}_zed_tokens.npy"), mmap_mode="r")
+            else:
+                continue            # scene without (complete) features: skip, don't crash
             e = np.load(os.path.join(sdir, "eef.npz"))
             pos, quat, suc = e["pos"], e["quat"], e["suction"].astype(np.float32)
             T = min(len(tk), len(tkz), len(pos))
@@ -124,6 +128,16 @@ class UmiDataset(torch.utils.data.Dataset):
                                 if os.path.exists(tf) else np.zeros(T, np.float32))
             # precompute absolute pose mats for relative transforms
             self.rel[sid] = (pos[:T].astype(np.float32), R.astype(np.float32), suc[:T])
+            if os.environ.get("PNP_WARP"):       # "vlim,alim": labels follow the same path at the drive's limits
+                vl_, al_ = (float(x) for x in os.environ["PNP_WARP"].split(","))
+                cf = os.path.join(sdir, f"tau_{vl_:g}_{al_:g}.npy")
+                if os.path.exists(cf):
+                    tau = np.load(cf)
+                else:
+                    from retime import time_law
+                    tau = time_law(np.load(os.path.join(sdir, "traj.npz"))["q"], vlim=vl_, alim=al_)
+                    np.save(cf, tau)
+                self.tau[sid] = tau[:T] if len(tau) >= T else np.concatenate([tau, tau[-1] + 0.1 * np.arange(1, T - len(tau) + 1)])
             for t in range(T - TA - LAT_SHIFT):
                 self.samples.append((sid, t))
         self.dim = self.tokens[next(iter(self.tokens))][0].shape[-1]
@@ -142,10 +156,26 @@ class UmiDataset(torch.utils.data.Dataset):
         t0 = max(t - 1, 0)
         tk, tkz = self.tokens[sid]
         obs_tok = torch.from_numpy(np.stack([tk[t0], tk[t], tkz[t0], tkz[t]]).copy())
-        prop = np.stack([self._rel_pose(pos, R, suc, t, t0),
-                         self._rel_pose(pos, R, suc, t, t)])                # [2,10]
-        act = np.stack([self._rel_pose(pos, R, suc, t, t + 1 + LAT_SHIFT + k)
-                        for k in range(TA)])                                # [16,10]
+        if sid in self.tau:
+            # time-warped labels: where the speed-limited arm is 0.1 s before / 0.1 s * (1..16) after frame t
+            tau = self.tau[sid]
+            tq = tau[t] + 0.1 * np.concatenate([[-1.0], 1.0 + LAT_SHIFT + np.arange(TA)])
+            f = np.clip(np.interp(tq, tau, np.arange(len(tau))), 0, len(pos) - 1)
+            i0 = np.floor(f).astype(int); i1 = np.minimum(i0 + 1, len(pos) - 1); w = (f - i0)[:, None].astype(np.float32)
+            pw = (1 - w) * pos[i0] + w * pos[i1]
+            U, _, Vt = np.linalg.svd((1 - w[:, :, None]) * R[i0] + w[:, :, None] * R[i1])   # blend + re-orthonormalise
+            Rw = (U @ Vt).astype(np.float32)
+            sw = suc[np.rint(f).astype(int)]
+            rel = lambda j: np.concatenate([R[t].T @ (pw[j] - pos[t]), rot6d(R[t].T @ Rw[j]), [sw[j]]]).astype(np.float32)
+            t0 = int(np.rint(f[0]))                                         # nearest recorded image to "0.1 s ago"
+            obs_tok = torch.from_numpy(np.stack([tk[t0], tk[t], tkz[t0], tkz[t]]).copy())
+            prop = np.stack([rel(0), self._rel_pose(pos, R, suc, t, t)])
+            act = np.stack([rel(1 + k) for k in range(TA)])
+        else:
+            prop = np.stack([self._rel_pose(pos, R, suc, t, t0),
+                             self._rel_pose(pos, R, suc, t, t)])                # [2,10]
+            act = np.stack([self._rel_pose(pos, R, suc, t, t + 1 + LAT_SHIFT + k)
+                            for k in range(TA)])                                # [16,10]
         delta = None
         if TRAJ_NOISE > 0:
             # displaced start: proprio/goal say the arm is delta off; labels converge back
@@ -491,6 +521,10 @@ def main():
                     help="weight of the auxiliary head predicting the privileged tip raycast distance "
                          "over the chunk (distills height-above-surface into the features)")
     ap.add_argument("--depth", type=int, default=0, help="override denoiser depth (dit)")
+    ap.add_argument("--tok_noise", type=float, default=0.0,
+                    help="vision-token noise, relative to token std (feature-space image noise)")
+    ap.add_argument("--cam_dropout", type=float, default=0.0,
+                    help="prob of zeroing ONE camera's tokens per sample (stale/failed-camera robustness)")
     ap.add_argument("--goal_noise", type=float, default=0.0,
                     help="m: noise the goal INPUT (labels unchanged) -> vision corrects goal error")
     ap.add_argument("--traj_noise", type=float, default=0.0,
@@ -582,6 +616,7 @@ def main():
                   ode_H=(net.H if a.model == "ode" else None), lat_shift=a.lat_shift,
                   goal_noise=a.goal_noise, traj_noise=a.traj_noise,
                   goal_se3=a.goal_se3, goal_dropout=a.goal_dropout, ranger_aux=a.ranger_aux,
+                  tok_noise=a.tok_noise, cam_dropout=a.cam_dropout,
                   depth=a.depth,
                   net=net.state_dict(),
                   obs_enc=obs_enc.state_dict() if obs_enc else None)
@@ -638,6 +673,17 @@ def main():
                 tok = tok + torch.randn_like(tok.float()) * (0.01 * tok.float().std())
                 if goal_ is not None:
                     goal_ = goal_ + torch.randn_like(goal_) * 0.010
+            if a.tok_noise > 0:
+                tok = tok + torch.randn_like(tok.float()) * (a.tok_noise * tok.float().std())
+            if a.cam_dropout > 0:
+                # tokens are [B, 4, D]: wrist(t-1), wrist(t), zed(t-1), zed(t) -> drop one camera
+                B = tok.shape[0]
+                drop = torch.rand(B, device=tok.device) < a.cam_dropout
+                cam = torch.randint(0, 2, (B,), device=tok.device)      # 0=wrist pair, 1=zed pair
+                mask = torch.ones_like(tok)
+                for b in torch.nonzero(drop).flatten():
+                    mask[b, 2*cam[b]:2*cam[b]+2] = 0.0
+                tok = tok * mask
             x1 = norm(act.to(dev)).transpose(1, 2)          # [B,ADIM,TA]
             if a.model == "dp":
                 cond = obs_enc(tok, prop, goal_)

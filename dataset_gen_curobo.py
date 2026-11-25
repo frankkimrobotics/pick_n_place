@@ -51,6 +51,7 @@ import sys
 import time
 
 import numpy as np
+import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -59,6 +60,8 @@ import dataset_gen_ycb as G  # noqa: E402  (sample_scene, LIGHTS, W, H, TABLE_X/
 BOX_FP, BOX_H, BOX_WALL = 0.25, 0.25, 0.01
 ZED_CAM = ('<camera name="zed" pos="0.6014 -0.0870 0.6772" '
            'xyaxes="0.0723 0.9968 0.0349 -0.9062 0.0510 0.4197" fovy="69.1"/>')
+ROBOT_YML = ("/home/lisc-frank/Desktop/2026/frankkimrobotics/ros2_mycobot/src/"
+             "mycobot_description/curobo/mycobot_pro_630_v2.yml")
 R_DOWN_QUAT = [0.0, 0.7071, 0.7071, 0.0]        # wxyz of the demos' R_DOWN (cup down, +90 deg yaw)
 CTRL_DT = 0.004
 
@@ -251,7 +254,36 @@ def run_scene(args):
         record()
         state["tick"] += 1
 
+    def retime(qref):
+        """Slow a 4 ms joint path down (never speed it up) until every joint keeps --vlim / --alim:
+        forward-backward pass on the squared path speed, then resampling. The path itself is unchanged."""
+        qref = np.asarray(qref, float)
+        if a.vlim <= 0 or len(qref) < 4:
+            return qref
+        vl, al = np.radians(a.vlim), np.radians(a.alim)
+        q1 = np.gradient(qref, CTRL_DT, axis=0)
+        q2 = np.gradient(q1, CTRL_DT, axis=0)
+        aq1, aq2 = np.abs(q1).max(1), np.abs(q2).max(1)
+        x = np.minimum(1.0, np.minimum((vl / np.maximum(aq1, 1e-9)) ** 2, 0.5 * al / np.maximum(aq2, 1e-9)))
+        if x.min() >= 1.0:
+            return qref
+
+        def u_bound(i, sign):                    # largest path acceleration (sign=+1) or deceleration (-1) at i
+            num = al - sign * np.sign(q1[i]) * q2[i] * x[i]
+            return float(np.min(np.maximum(num, 0.0) / np.maximum(np.abs(q1[i]), 1e-9)))
+        for i in range(len(x) - 1):
+            x[i + 1] = min(x[i + 1], x[i] + 2 * CTRL_DT * u_bound(i, 1))
+        for i in range(len(x) - 1, 0, -1):
+            x[i - 1] = min(x[i - 1], x[i] + 2 * CTRL_DT * u_bound(i, -1))
+        sd = np.sqrt(np.maximum(x, 1e-4))
+        t_new = np.concatenate([[0.0], np.cumsum(2 * CTRL_DT / (sd[1:] + sd[:-1]))])
+        idx = np.interp(np.arange(0.0, t_new[-1] + 1e-9, CTRL_DT), t_new, np.arange(len(qref)))
+        out = CubicSpline(np.arange(len(qref)), qref, axis=0)(idx)
+        state["retime_s"] = state.get("retime_s", 0.0) + (len(out) - len(qref)) * CTRL_DT
+        return out
+
     def run_qref(qref, on_tick=None, held=None, stop=None):
+        qref = retime(qref)
         qdref, tau_ff, kp, kd = demo["_gains_and_ff"](m, d, qref)
         sched = dict(qref=qref, qdref=qdref, tau_ff=tau_ff, kp=kp, kd=kd)
         for k in range(len(qref)):
@@ -294,6 +326,94 @@ def run_scene(args):
         pk.setdefault("plans", {})[key] = dict(success=bool(res.get("success")), solve_ms=round(1000 * float(res.get("solve_time", 0) or 0), 1),
                                               motion_s=round(float(res.get("motion_time", 0) or 0), 3), n=len(res.get("trajectory", [])))
 
+    # ---- the arm's own collision model (cuRobo robot spheres). The twin's links are CONTACTLESS
+    # (cup_tip is the only robot collision geom), so a scripted joint-space leg can sweep a link
+    # straight through the box and MuJoCo would never report it. Every scripted leg is gated below.
+    SPHERES = {}
+    try:
+        _cs = yaml.safe_load(open(ROBOT_YML))["robot_cfg"]["kinematics"]["collision_spheres"]
+        for _lk, _lst in _cs.items():
+            _b = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, _lk)
+            if _b >= 0:
+                SPHERES[_b] = (np.array([x["center"] for x in _lst], float),
+                               np.array([x["radius"] for x in _lst], float))
+    except Exception as _exc:                                            # noqa: BLE001
+        print(f"[warn] collision spheres unavailable ({_exc}) -- scripted legs ungated", flush=True)
+    WORLD_BOX, WORLD_PLANE = [], []
+    for _g in range(m.ngeom):
+        if m.geom_bodyid[_g] != 0 or not (m.geom_contype[_g] or m.geom_conaffinity[_g]):
+            continue
+        _nm = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, _g) or f"geom{_g}"
+        if m.geom_type[_g] == mujoco.mjtGeom.mjGEOM_BOX:
+            WORLD_BOX.append((m.geom_pos[_g].copy(), m.geom_size[_g].copy(), _nm))
+        elif m.geom_type[_g] == mujoco.mjtGeom.mjGEOM_PLANE:
+            WORLD_PLANE.append((float(m.geom_pos[_g][2]), _nm))
+
+    def leg_clearance(qpath, exclude_bids=()):
+        """min(surface distance - sphere radius) over a joint path vs box walls, table, floor and the
+        other objects. Negative => the leg drives the ARM into something."""
+        if not SPHERES:
+            return np.inf, "ungated"
+        obs = list(WORLD_BOX)
+        for o_ in ob:
+            if o_["bid"] in exclude_bids:
+                continue
+            p_ = d.xpos[o_["bid"]]
+            if p_[2] < -0.05:
+                continue
+            obs.append((p_.copy(), np.asarray(o_["half"], float), o_["name"]))
+        worst, who = np.inf, None
+        for qq in qpath:
+            dik.qpos[:6] = qq
+            mujoco.mj_kinematics(m, dik)
+            for bid_, (cen, rad) in SPHERES.items():
+                P = dik.xpos[bid_] + cen @ dik.xmat[bid_].reshape(3, 3).T
+                for c_, h_, nm_ in obs:
+                    dqv = np.abs(P - c_) - h_
+                    outside = np.linalg.norm(np.maximum(dqv, 0.0), axis=1)
+                    dist = np.where(outside > 0, outside, dqv.max(axis=1))
+                    cl = float((dist - rad).min())
+                    if cl < worst:
+                        worst, who = cl, nm_
+                for z_, nm_ in WORLD_PLANE:
+                    cl = float((P[:, 2] - z_ - rad).min())
+                    if cl < worst:
+                        worst, who = cl, nm_
+        return worst, who
+
+    def ik_near(target_p, target_R, q_seed, pos_tol=0.003, rot_tol=0.05, max_dq_deg=75.0):
+        """IK that stays on the CURRENT branch. The stock multi-start IK keeps the lowest pose error
+        regardless of configuration, so a scripted joint-space leg to it sweeps the arm through a
+        180 deg wrist flip (measured: 235 deg joint swing, tool up to 93 cm). Seeded solve first, then
+        small perturbations of the seed, keeping the admissible solution closest to the seed."""
+        q_seed = np.asarray(q_seed, float)
+        rl = np.random.default_rng(0)
+        cands = []
+        for i in range(17):                      # seed, then narrow and wide perturbations of it
+            sd = q_seed if i == 0 else q_seed + rl.normal(0.0, 0.08 if i < 9 else 0.4, 6)
+            cands.append(demo["_ik_once"](m, dik, tcp_sid, np.asarray(target_p, float), target_R, sd))
+        qg, peg = demo["ik"](m, dik, "tcp", np.asarray(target_p, float), target_R, q_seed)
+        if qg is not None:                       # the stock multi-start solution is a candidate too,
+            cands.append((qg, peg, 0.0))         # but only if it happens to stay on this branch
+        best = None
+        adm = []
+        for qc, pe, re in cands:
+            if qc is None:
+                continue
+            dqm = float(np.degrees(np.abs(np.asarray(qc, float) - q_seed)).max())
+            adm.append((pe, re, dqm))
+            if pe > pos_tol or re > rot_tol:
+                continue
+            if dqm <= max_dq_deg and (best is None or dqm < best[1]):
+                best = (np.asarray(qc, float).copy(), dqm)
+        if best is None and adm:
+            bp = min(adm, key=lambda t: t[0])
+            on = [t for t in adm if t[0] <= pos_tol and t[1] <= rot_tol]
+            print(f"[ik_near] no on-branch solution: best pose err {1000 * bp[0]:.1f} mm / "
+                  f"{np.degrees(bp[1]):.1f} deg; {len(on)} reached the pose, nearest branch "
+                  f"{min((t[2] for t in on), default=float('nan')):.0f} deg away (cap {max_dq_deg:.0f})", flush=True)
+        return (best[0], best[1]) if best else (None, np.inf)
+
     GEOMGROUP = np.array([1, 1, 1, 0, 1, 1], dtype=np.uint8)      # group 3 = robot visual meshes
     RAY_BACK = 0.03
     bid2obj = {o["bid"]: o for o in ob}
@@ -320,6 +440,53 @@ def run_scene(args):
         b = int(m.geom_bodyid[int(gid[0])])
         return float(dist) - RAY_BACK, (b if b in bid2obj else None)
 
+    def jac_step(q_from, dp):
+        """q + J^+ dp: a short Cartesian move that CANNOT change branch (an IK call can, and the
+        scripted leg to it then flips the wrist). Used for the press stroke."""
+        dik.qpos[:6] = np.asarray(q_from, float)
+        mujoco.mj_kinematics(m, dik)
+        mujoco.mj_comPos(m, dik)
+        jp = np.zeros((3, m.nv))
+        jr = np.zeros((3, m.nv))
+        mujoco.mj_jacSite(m, dik, jp, jr, tcp_sid)
+        J = np.vstack([jp[:, :6], 0.5 * jr[:, :6]])
+        err = np.concatenate([np.asarray(dp, float), np.zeros(3)])
+        return np.asarray(q_from, float) + J.T @ np.linalg.solve(J @ J.T + 1e-4 * np.eye(6), err)
+
+    def cart_move(q_from, dp, iters=25, tol=2e-4):
+        """Iterated jac_step: a single linearisation under-delivers at an ill-conditioned pose (the
+        press then never reaches the surface). Re-linearises until the tool actually moved dp."""
+        q = np.asarray(q_from, float).copy()
+        dik.qpos[:6] = q
+        mujoco.mj_kinematics(m, dik)
+        goal = dik.site_xpos[tcp_sid].copy() + np.asarray(dp, float)
+        for _ in range(iters):
+            dik.qpos[:6] = q
+            mujoco.mj_kinematics(m, dik)
+            rem = goal - dik.site_xpos[tcp_sid]
+            if np.linalg.norm(rem) < tol:
+                break
+            q = np.clip(jac_step(q, np.clip(rem, -0.01, 0.01)), m.jnt_range[:6, 0], m.jnt_range[:6, 1])
+        dik.qpos[:6] = q
+        mujoco.mj_kinematics(m, dik)
+        return q, float(np.linalg.norm(goal - dik.site_xpos[tcp_sid]))
+
+    def safe_seg(q_to, label, T=1.0, held=None, exclude=(), margin=0.005, pk=None):
+        """Run a scripted min-jerk leg only if the whole path keeps the arm clear; returns False
+        (without moving) when it would not, so the caller can fall back to the planner."""
+        qpath = []
+        seg(qpath, d.qpos[:6].copy(), np.asarray(q_to, float), T)
+        qpath = np.array(qpath)
+        ex = set(exclude) | ({held["bid"]} if held else set())
+        cl, who = leg_clearance(qpath, exclude_bids=ex)
+        if pk is not None:
+            pk["clear_mm"] = min(pk.get("clear_mm", 1e9), round(1000 * cl, 1))
+        if cl < margin:
+            print(f"[gate] {label}: scripted leg would clear {1000 * cl:+.1f} mm vs {who} -> refused", flush=True)
+            return False
+        run_qref(qpath, held=held)
+        return True
+
     ik, seg = demo["ik"], demo["_seg"]
     R_DOWN = demo["R_DOWN"]
     CUP_R, PRESS = demo["CUP_R"], demo["PRESS_M"]
@@ -333,12 +500,10 @@ def run_scene(args):
         if tip[2] >= z_min:
             return
         R_now = d.site_xmat[tcp_sid].reshape(3, 3).copy()          # keep whatever tool yaw the grasp used
-        q_up, err = ik(m, dik, "tcp", [tip[0], tip[1], z_min], R_now, d.qpos[:6].copy())
-        if err > 0.005:
+        q_up, _dq = ik_near([tip[0], tip[1], z_min], R_now, d.qpos[:6].copy())
+        if q_up is None:
             return
-        qref = []
-        seg(qref, d.qpos[:6].copy(), q_up, T)
-        run_qref(np.array(qref), held=held)
+        safe_seg(q_up, "lift clear", T=T, held=held)
 
     def pick_object(o, attempt):
         lift_clear(0.15)
@@ -374,17 +539,48 @@ def run_scene(args):
         #    and vacuum flow pulls a near object the last millimetres onto the lip (--snap_gap/--snap_force).
         #    An object can therefore be caught mid-push, which is what the real gripper does.
         q0 = d.qpos[:6].copy()
-        q_grasp, e1 = ik(m, dik, "tcp", [est[0], est[1], top + CUP_R], R_DOWN, q0)
-        q_press, e2 = ik(m, dik, "tcp", [est[0], est[1], top + CUP_R - a.press], R_DOWN, q_grasp)
-        pk["grasp_nominal"] = dict(pos=[round(float(v), 5) for v in (est[0], est[1], top + CUP_R)], quat=quat_used)
-        if max(e1, e2) > 0.003:
+        grasp_xyz = [est[0], est[1], top + CUP_R]
+        stroke, at_grasp = a.press, False
+        q_grasp, dq1 = ik_near(grasp_xyz, R_DOWN, q0)
+        if q_grasp is None:
+            # No solution on the current branch (measured: the only one is 235 deg away). A scripted leg
+            # there would flip the whole arm, so let the PLANNER change configuration -- collision-checked
+            # -- to a pre-grasp 1.2 cm above the surface, and press from there with a Jacobian step.
+            res_pg = pl.plan_pose(q0, [grasp_xyz[0], grasp_xyz[1], grasp_xyz[2] + 0.012], quat=quat_used)
+            plan_log(pk, "pregrasp", res_pg)
+            if res_pg.get("success"):
+                run_plan(res_pg)
+                q0 = q_grasp = d.qpos[:6].copy()
+                stroke, at_grasp = 0.012 + a.press, True
+        if q_grasp is None:
             pk.update(frame_end=len(rec["t"]), fail_reason="ik")
             return False
+        # Press target in WORLD terms (--press below the surface, centred on the estimate) rather than
+        # relative to wherever the arm ended up: a planned leg lands within its own pose tolerance plus
+        # tracking error, and a relative stroke then stops short of the object.
+        dik.qpos[:6] = q_grasp
+        mujoco.mj_kinematics(m, dik)
+        tip_now = dik.site_xpos[tcp_sid].copy()
+        dp_press = np.array([est[0] - tip_now[0], est[1] - tip_now[1],
+                             (top + CUP_R - a.press) - tip_now[2]], float)
+        dp_press[:2] = np.clip(dp_press[:2], -0.03, 0.03)
+        pk["pregrasp_tip"] = [round(float(v), 4) for v in tip_now]
+        q_press, press_err = cart_move(q_grasp, dp_press)
+        pk["press_stroke_mm"] = round(1000 * float(abs(dp_press[2])), 1)
+        pk["press_shortfall_mm"] = round(1000 * press_err, 2)
+        pk["grasp_nominal"] = dict(pos=[round(float(v), 5) for v in grasp_xyz], quat=quat_used)
         qref = []
-        seg(qref, q0, q_grasp, 1.6)
+        if not at_grasp:
+            seg(qref, q0, q_grasp, 1.6)
         seg(qref, q_grasp, q_press, 0.7)
         seg(qref, q_press, q_press, 0.3)
         qref = np.array(qref)
+        cl_d, who_d = leg_clearance(qref, exclude_bids={o["bid"]})
+        pk["clear_mm"] = min(pk.get("clear_mm", 1e9), round(1000 * cl_d, 1))
+        if cl_d < 0.005:
+            print(f"[gate] {o['name']} descent would clear {1000 * cl_d:+.1f} mm vs {who_d} -> skipped", flush=True)
+            pk.update(frame_end=len(rec["t"]), fail_reason="descent_blocked")
+            return False
         p_before = d.xpos[o["bid"]].copy()
         latched = {"ok": False}
         st = dict(contact=False, rim_min=np.inf, rim_ok=False, tilt_min=np.inf, f_max=0.0,
@@ -470,10 +666,9 @@ def run_scene(args):
                 pk["touched_other"] = st["other"]
         if not latched["ok"]:
             # back up to the hover height so the next attempt / object starts clear of the clutter
-            q_up, _ = ik(m, dik, "tcp", [est[0], est[1], top + 0.12], R_DOWN, d.qpos[:6].copy())
-            qref = []
-            seg(qref, d.qpos[:6].copy(), q_up, 1.0)
-            run_qref(np.array(qref))
+            q_up, _dq = ik_near([est[0], est[1], top + 0.12], R_DOWN, d.qpos[:6].copy())
+            if q_up is not None:
+                safe_seg(q_up, f"{o['name']} back off", T=1.0, exclude={o["bid"]}, pk=pk)
             state["target"] = -1
             pk["frame_end"] = len(rec["t"])
             return False
@@ -503,10 +698,17 @@ def run_scene(args):
             return False
         run_plan(res, held=o)
         # 4. lower into the box mouth (object bottom 3 cm below the rim), release, detach, retreat up
-        q_low, e3 = ik(m, dik, "tcp", [box_xy[0], box_xy[1], BOX_H - 0.03 + h_obj + CUP_R], R_DOWN, d.qpos[:6].copy())
-        qref = []
-        seg(qref, d.qpos[:6].copy(), q_low, 1.0)
-        run_qref(np.array(qref), held=o)
+        low_xyz = [box_xy[0], box_xy[1], BOX_H - 0.03 + h_obj + CUP_R]
+        res_low = pl.plan_pose(d.qpos[:6], low_xyz, quat=quat_used)
+        plan_log(pk, "lower", res_low)
+        if res_low.get("success"):
+            run_plan(res_low, held=o)                      # collision-checked WITH the carried object
+        else:
+            q_low, _dq = ik_near(low_xyz, R_DOWN, d.qpos[:6].copy())
+            if q_low is None or not safe_seg(q_low, f"{o['name']} lower into box", T=1.0, held=o, pk=pk):
+                pk["lower"] = "released_above"             # neither route is safe: let it drop from the rim
+            else:
+                pk["lower"] = "scripted"
         d.eq_active[o["eq"]] = 0
         state["suction"] = 0
         pl.detach()
@@ -514,10 +716,16 @@ def run_scene(args):
         qref = []
         seg(qref, d.qpos[:6].copy(), d.qpos[:6].copy(), 0.5)      # let it fall
         run_qref(np.array(qref))
-        q_ret, _ = ik(m, dik, "tcp", [box_xy[0], box_xy[1], retreat_z], R_DOWN, d.qpos[:6].copy())
-        qref = []
-        seg(qref, d.qpos[:6].copy(), q_ret, 1.0)
-        run_qref(np.array(qref))
+        pl.set_world(world_for())                          # the object just placed is an obstacle now
+        ret_xyz = [box_xy[0], box_xy[1], retreat_z]
+        res_ret = pl.plan_pose(d.qpos[:6], ret_xyz, quat=quat_used)
+        plan_log(pk, "retreat", res_ret)
+        if res_ret.get("success"):
+            run_plan(res_ret)
+        else:
+            q_ret, _dq = ik_near(ret_xyz, R_DOWN, d.qpos[:6].copy())
+            if q_ret is not None:
+                safe_seg(q_ret, f"{o['name']} retreat", T=1.0, pk=pk)
         state["watch_box"] = False
         state["target"] = -1
         pk["box_contacts"] = state["box_contacts"]
@@ -531,7 +739,29 @@ def run_scene(args):
     # nearest object first, each up to a.attempts tries, re-observed before every try
     order = sorted(range(len(ob)), key=lambda i: np.hypot(*ob[i]["half"][:2]) * 0 + np.linalg.norm(d.xpos[ob[i]["bid"]][:2]))
     done = 0
+    skipped = []
+
+    def sealable(o):
+        """Privileged look before the attempt: would the lip seal on the top face at the aim point and 5 mm around it
+        (the expert's estimate is off by --obs_noise)? Curved / studded / edge-on tops are left on the table."""
+        c, top = d.xpos[o["bid"]].copy(), obj_top(o)
+        worst = 0.0
+        for dx, dy in ((0, 0), (0.005, 0), (-0.005, 0), (0, 0.005), (0, -0.005)):
+            ok, dev, _, _ = rim_seal(m, d, np.array([c[0] + dx, c[1] + dy, top + 0.002]), np.array([0.0, 0.0, -1.0]),
+                                     target_bid=o["bid"], exclude_bid=tcp_bid, geomgroup=GEOMGROUP)
+            worst = max(worst, float(dev))
+            if not ok:
+                return False, worst
+        return True, worst
+
     for i in order:
+        if a.precheck and not in_box(ob[i]):
+            lift_clear(0.15)
+            ok_, dev_ = sealable(ob[i])
+            if not ok_:
+                skipped.append(dict(object=ob[i]["name"], kind=ob[i]["kind"], reason="precheck",
+                                    rim_dev_mm=None if not np.isfinite(dev_) else round(1000 * dev_, 2)))
+                continue
         for attempt in range(a.attempts):
             if in_box(ob[i]):
                 break
@@ -553,7 +783,7 @@ def run_scene(args):
                 objects=[dict(name=o["name"], kind=o["kind"], geom=o["shape"], half_extents=o["half"],
                               init_pos=[round(float(v), 4) for v in objs[k]["pos"]],
                               final_pos=[round(float(v), 4) for v in d.xpos[o["bid"]]], in_box=in_box(o)) for k, o in enumerate(ob)],
-                picks=picks, frames=len(rec["t"]), wall_s=round(time.time() - t_scene, 1))
+                picks=picks, skipped=skipped, precheck=int(a.precheck), attempts=a.attempts, frames=len(rec["t"]), wall_s=round(time.time() - t_scene, 1), vlim=a.vlim, alim=a.alim, retime_s=round(state.get("retime_s", 0.0), 1))
     json.dump(meta, open(os.path.join(sdir, "meta.json"), "w"), indent=1)
     return idx, len(ob), done, len(picks), len(rec["t"])
 
@@ -577,6 +807,9 @@ def main():
     ap.add_argument("--press", type=float, default=0.010, help="descent depth below the expected surface (m); a running cup latches on contact, so the old 15 mm press-to-seal stroke only rams the object")
     ap.add_argument("--capture_r", type=float, default=0.012, help="lateral offset from the cup axis within which a running cup still captures an object (m)")
     ap.add_argument("--center_force", type=float, default=1.5, help="lateral self-centring force drawing a captured object onto the cup axis (N)")
+    ap.add_argument("--precheck", type=int, default=0, help="1 = skip objects whose top the lip cannot seal on (rim test at the aim point +-5 mm)")
+    ap.add_argument("--vlim", type=float, default=0.0, help="joint speed limit of every executed leg (deg/s); legs are slowed, never sped up; 0 = off")
+    ap.add_argument("--alim", type=float, default=150.0, help="joint acceleration limit used with --vlim (deg/s^2)")
     ap.add_argument("--workers", type=int, default=1)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
