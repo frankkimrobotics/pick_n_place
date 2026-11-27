@@ -1,9 +1,9 @@
 {
  "real": {
   "cmd_latency_ms": [
-   183,
-   183,
-   183
+   181,
+   181,
+   181
   ],
   "pi_lead_ms": [
    40,
@@ -16,14 +16,14 @@
    40
   ],
   "zed_lat_ms": [
-   90,
-   90,
-   90
+   30,
+   30,
+   30
   ],
   "wrist_lat_ms": [
-   70,
-   70,
-   70
+   11,
+   11,
+   11
   ],
   "measured_motion_onset_ms": [
    240,
@@ -36,23 +36,23 @@
    10
   ],
   "zed_frame_age_ms": [
-   90,
-   108,
-   120
+   30,
+   37,
+   43
   ],
   "wrist_frame_age_ms": [
-   70,
-   88,
-   100
+   13,
+   20,
+   27
   ],
   "rendered_state_error_rad": 0.0,
   "healthy": true
  },
  "real, fast inference": {
   "cmd_latency_ms": [
-   93,
-   93,
-   93
+   91,
+   91,
+   91
   ],
   "pi_lead_ms": [
    40,
@@ -65,14 +65,14 @@
    40
   ],
   "zed_lat_ms": [
-   90,
-   90,
-   90
+   30,
+   30,
+   30
   ],
   "wrist_lat_ms": [
-   70,
-   70,
-   70
+   11,
+   11,
+   11
   ],
   "measured_motion_onset_ms": [
    150,
@@ -85,14 +85,14 @@
    10
   ],
   "zed_frame_age_ms": [
-   90,
-   108,
-   120
+   30,
+   37,
+   43
   ],
   "wrist_frame_age_ms": [
-   70,
-   88,
-   100
+   13,
+   20,
+   27
   ],
   "rendered_state_error_rad": 0.0,
   "healthy": true
@@ -135,22 +135,22 @@
   ],
   "zed_frame_age_ms": [
    0,
-   18,
-   30
+   7,
+   13
   ],
   "wrist_frame_age_ms": [
    0,
-   18,
-   30
+   7,
+   13
   ],
   "rendered_state_error_rad": 0.0,
   "healthy": true
  },
  "real, randomised": {
   "cmd_latency_ms": [
-   143,
-   186,
-   228
+   141,
+   184,
+   226
   ],
   "pi_lead_ms": [
    40,
@@ -163,18 +163,18 @@
    61
   ],
   "zed_lat_ms": [
-   68,
-   96,
-   130
+   29,
+   43,
+   60
   ],
   "wrist_lat_ms": [
-   44,
-   75,
-   99
+   9,
+   21,
+   30
   ],
   "measured_motion_onset_ms": [
    200,
-   251,
+   248,
    300
   ],
   "measured_fb_minus_motion_ms": [
@@ -183,16 +183,114 @@
    10
   ],
   "zed_frame_age_ms": [
-   70,
-   118,
-   170
+   31,
+   52,
+   75
   ],
   "wrist_frame_age_ms": [
-   50,
-   97,
-   130
+   10,
+   29,
+   45
   ],
   "rendered_state_error_rad": 0.0,
+  "healthy": true
+ },
+ "5 ms stack": {
+  "cmd_latency_ms": [
+   181,
+   181,
+   181
+  ],
+  "pi_lead_ms": [
+   30,
+   30,
+   30
+  ],
+  "drive_dead_ms": [
+   31,
+   31,
+   31
+  ],
+  "zed_lat_ms": [
+   30,
+   30,
+   30
+  ],
+  "wrist_lat_ms": [
+   11,
+   11,
+   11
+  ],
+  "measured_motion_onset_ms": [
+   230,
+   230,
+   230
+  ],
+  "measured_fb_minus_motion_ms": [
+   5,
+   5,
+   5
+  ],
+  "zed_frame_age_ms": [
+   30,
+   37,
+   45
+  ],
+  "wrist_frame_age_ms": [
+   12,
+   19,
+   27
+  ],
+  "rendered_state_error_rad": 0.0,
+  "healthy": true
+ },
+ "5 ms stack, randomised": {
+  "cmd_latency_ms": [
+   141,
+   184,
+   226
+  ],
+  "pi_lead_ms": [
+   30,
+   30,
+   30
+  ],
+  "drive_dead_ms": [
+   25,
+   33,
+   43
+  ],
+  "zed_lat_ms": [
+   29,
+   43,
+   60
+  ],
+  "wrist_lat_ms": [
+   9,
+   21,
+   30
+  ],
+  "measured_motion_onset_ms": [
+   185,
+   232,
+   280
+  ],
+  "measured_fb_minus_motion_ms": [
+   5,
+   5,
+   5
+  ],
+  "zed_frame_age_ms": [
+   30,
+   51,
+   75
+  ],
+  "wrist_frame_age_ms": [
+   10,
+   29,
+   45
+  ],
+  "rendered_state_error_rad": 1.1920928955078125e-07,
   "healthy": true
  }
 }

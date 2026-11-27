@@ -14,11 +14,11 @@ from batchsim import latency
 D = os.path.expanduser("~/pnp_real_runs/sysid"); OFF = np.array([0, 90, 0, 90, 0, 0.0])
 
 
-def run(tag="sine_012345_fast_new", joint_model=0, dev="cuda:0", N=4):
+def run(tag="sine_012345_fast_new", joint_model=0, dev="cuda:0", N=4, timing="measured"):
     f = sorted(glob.glob(f"{D}/*{tag}_pi.csv"))[-1]; ref = np.load(f[:-7] + "_ref.npy"); g = json.load(open(f[:-7] + "_meta.json"))["gains"]
     over = dict(k0=g.get("k0", 10.0), k1=g.get("k1", 0.3), vff=g.get("vff", 1.0), lead=g.get("lead", 0.0), lead_p=g.get("lead_p"),
                 vfric=np.radians(g.get("vfric", 0.0)), vmax=np.radians(g.get("vmax", 40.0)), vgain=1.025 * g.get("vel_scale", 17.0) / 17.0,
-                tx_spike_p=0.0, joint_model=joint_model)
+                tx_spike_p=0.0, joint_model=joint_model, timing=timing)
     cfg = make_cfg("real", **over)
     q_start = np.radians(ref[0] + OFF)
     # ---- scalar twin
@@ -30,12 +30,12 @@ def run(tag="sine_012345_fast_new", joint_model=0, dev="cuda:0", N=4):
     qs = np.array([r["q"] for r in tw.log]); taus = np.array([r["tau"] for r in tw.log])
     # ---- batched
     A = lambda v: np.full(6, v) if np.isscalar(v) else np.asarray(v, float)
-    w = BatchWorld(XML, N, dev, joint_physics=dict(armature=A(cfg["armature"]), damping=A(cfg["damping"]), frictionloss=A(cfg["frictionloss"])))
+    w = BatchWorld(XML, N, dev, joint_physics=dict(armature=A(cfg["armature"]), damping=A(cfg["damping"]), frictionloss=A(cfg["frictionloss"])), cmd_dt=cfg["cmd_dt"])
     qp = w.qpos0.clone(); qp[:6] = torch.tensor(q_start, dtype=torch.float32); w.reset(qpos=qp[None].expand(N, -1))
     lat = latency.sample(cfg, N, dev)
     dr = DriveChain(w, cfg, lat, max_pts=len(ref))
     hold = w.qpos[:, :6].clone()                                   # settle like the scalar twin: hold the start pose 0.5 s
-    for _ in range(50):
+    for _ in range(int(round(0.5 / cfg["cmd_dt"]))):
         dr.send(hold[:, None, :].expand(-1, 2, -1), dr.t, 1.0, dr.t); dr.tick()
     q0b = w.qpos[:, :6].clone()
     ptsb = q0b[:, None, :] + torch.tensor(np.radians(ref - ref[0]), dtype=torch.float32, device=dev)[None]
@@ -47,7 +47,7 @@ def run(tag="sine_012345_fast_new", joint_model=0, dev="cuda:0", N=4):
     dq = np.degrees((qb[:, 0] - q0b[0].cpu().numpy()) - (qs - q0))
     spread = np.degrees(np.abs(qb - qb[:, :1]).max())
     amp = np.degrees(np.abs(qs - q0).max(0))
-    return dict(tag=tag, joint_model=joint_model, rms_deg=np.sqrt((dq ** 2).mean(0)).round(4).tolist(), max_deg=np.abs(dq).max(0).round(4).tolist(),
+    return dict(tag=tag, joint_model=joint_model, timing=timing, phys_dt=w.dt, rms_deg=np.sqrt((dq ** 2).mean(0)).round(4).tolist(), max_deg=np.abs(dq).max(0).round(4).tolist(),
                 motion_amp_deg=amp.round(2).tolist(), world_spread_deg=float(spread), tau_rms_Nm=np.sqrt(((tb[:, 0] - taus) ** 2).mean(0)).round(3).tolist(),
                 finite=bool(np.isfinite(qb).all()))
 

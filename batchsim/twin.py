@@ -16,7 +16,7 @@ import os
 import numpy as np
 import torch
 
-from realsim.config import make_cfg, STREAM_TUNED
+from realsim.config import make_cfg, STREAMS
 from . import latency
 from .drive import DriveChain
 from .sensors import BatchCamera, JointFeedback, StateHistory
@@ -27,13 +27,14 @@ from .world import BatchWorld, NJ
 class BatchTwin:
     def __init__(self, xml, nworld=256, device="cuda:0", level="real", dr=False, stream="tuned", cameras=(), cam_res=(432, 240),
                  seed=0, max_pts=8, nconmax=None, njmax=None, **over):
-        if stream == "tuned" and level != "ideal":
-            over = {**STREAM_TUNED, **over}
+        if stream in STREAMS and level != "ideal":             # "tuned" | "fast" | "fast5" (5 ms stack: timing="stack_5ms")
+            over = {**STREAMS[stream], **over}
         self.cfg = cfg = make_cfg(level, **over)
         self.N, self.dev = nworld, device
         A = lambda v: np.full(NJ, v) if np.isscalar(v) else np.asarray(v, float)
         phys = dict(armature=A(cfg["armature"]), damping=A(cfg["damping"]), frictionloss=A(cfg["frictionloss"]))
-        self.world = w = BatchWorld(os.path.expanduser(xml), nworld, device, joint_physics=phys, nconmax=nconmax, njmax=njmax)
+        self.world = w = BatchWorld(os.path.expanduser(xml), nworld, device, joint_physics=phys, nconmax=nconmax, njmax=njmax,
+                                    cmd_dt=cfg["cmd_dt"])
         w.obj_vadr_t = torch.tensor(w.obj_vadr, device=device)
         self.lat = lat = latency.sample(cfg, nworld, device, dr=dr, gen=torch.Generator().manual_seed(seed))
         if dr:                                                    # per-world reflected inertia spread

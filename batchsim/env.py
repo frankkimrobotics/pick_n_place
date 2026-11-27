@@ -52,7 +52,7 @@ class PickLiftEnv:
         cfg, lat, h = self.tw.cfg, self.tw.lat, self.tw.hist
         t_cap = self.tw.t - lat["zed_lat"]
         t_cap = torch.floor(t_cap / cfg["zed_period"] + 1e-4) * cfg["zed_period"]
-        qp = h.qpos.at(h.ticks_ago(self.tw.t - t_cap))
+        qp = h.at_age(self.tw.t - t_cap)[0]
         a = self.obj_qadr[self.tgt]
         return qp[self.ar[:, None], a[:, None] + torch.arange(3, device=self.dev)[None]]
 

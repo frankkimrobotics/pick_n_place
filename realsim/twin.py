@@ -15,6 +15,7 @@ from collections import deque
 
 import mujoco
 import numpy as np
+from realsim.config import phys_substeps
 
 NJ = 6
 
@@ -42,8 +43,11 @@ class Pro630Twin:
         self.m, self.d, self.cfg = m, d, cfg
         self.rng = rng or np.random.default_rng(0)
         self.on_tick = on_tick                     # callback(twin) after every 10 ms tick (suction, metrics)
-        self.dt_phys = float(m.opt.timestep)
-        self.sub = max(1, int(round(cfg["cmd_dt"] / self.dt_phys)))
+        # physics step must divide the Pi period (5 ms stack on 2 ms scenes -> 3 x 1.667 ms, not 4 ms ticks)
+        self.sub, self.dt_phys = phys_substeps(cfg["cmd_dt"], float(m.opt.timestep))
+        m.opt.timestep = self.dt_phys
+        self._quat_adr = [int(m.jnt_qposadr[j]) + (3 if m.jnt_type[j] == 0 else 0)   # free: pos then quat; ball: quat
+                          for j in range(m.njnt) if m.jnt_type[j] in (0, 1)]
         m.dof_armature[:NJ] = cfg["armature"]
         m.dof_damping[:NJ] = np.asarray(cfg["damping"], float)
         m.dof_frictionloss[:NJ] = np.asarray(cfg["frictionloss"], float)
@@ -112,6 +116,12 @@ class Pro630Twin:
             v_cmd = -self.point_k0 * (q_fb - self.point_target)
         else:
             v_cmd = c["vff"] * v_ref - c["k0"] * (q_fb - q_ref_p) - c["k1"] * (qd_fb - v_ref_p)
+            if c.get("taff", 0.0) > 0:                            # robot_hal acceleration feedforward u += taff * a_ref
+                h = c["cmd_dt"]                                    # (envelope 2026-11-25: taff 0.015 halves the step error)
+                _, v_nxt = spline_eval(pts, t_anchor, rdt, self.t + c["lead"] + h)
+                if self.t + c["lead"] + h > t_anchor + (len(pts) - 1) * rdt:
+                    v_nxt = np.zeros(NJ)
+                v_cmd = v_cmd + c["taff"] * (v_nxt - v_ref) / h
             if c.get("vfric", 0.0) > 0:                           # breakaway / Coulomb compensation
                 v_cmd = v_cmd + c["vfric"] * np.tanh(v_cmd / c.get("veps", np.radians(0.3)))
             q_ref = q_ref_p
@@ -127,7 +137,11 @@ class Pro630Twin:
         for _ in range(self.sub):
             self.v_buf.append(v_cmd)
             v_eff = self.v_buf[0]                                 # written n_dead physics steps ago
-            self.v_drive = self.v_drive + np.clip(v_eff - self.v_drive, -da, da)
+            vlag = c.get("vlag", 0.0)                             # first-order velocity lag of the drive (bare fit 2026-11-14:
+            step = v_eff - self.v_drive                           # 32-36 ms dead + 10-20 ms lag); 0 = pure dead time + amax
+            if vlag > 0:
+                step = step * min(1.0, self.dt_phys / vlag)
+            self.v_drive = self.v_drive + np.clip(step, -da, da)
             self.q_drive = self.q_drive + self.v_drive * self.dt_phys
             qj = d.qpos[:NJ]
             lead = self.q_drive - qj
@@ -162,14 +176,23 @@ class Pro630Twin:
         self.hist.append((self.t, self.d.qpos.copy(), self.d.qvel.copy()))
 
     def state_at(self, t_query):
-        """(t, qpos, qvel) of the newest recorded tick at or before t_query."""
-        best = self.hist[0]
-        for h in self.hist:
-            if h[0] <= t_query + 1e-9:
-                best = h
-            else:
-                break
-        return best
+        """(t, qpos, qvel) at t_query, linearly interpolated between the two recorded ticks around it (free-joint
+        quaternions re-normalised). Camera capture times fall between Pi ticks; before the history: the oldest tick."""
+        h = self.hist
+        if t_query <= h[0][0] + 1e-9:
+            return h[0]
+        prev = h[0]
+        for cur in h:
+            if cur[0] >= t_query - 1e-9:
+                if cur[0] - t_query < 1e-9:
+                    return cur
+                w = (t_query - prev[0]) / (cur[0] - prev[0])
+                qpos = (1 - w) * prev[1] + w * cur[1]
+                for a in self._quat_adr:
+                    qpos[a:a + 4] /= max(np.linalg.norm(qpos[a:a + 4]), 1e-12)
+                return t_query, qpos, (1 - w) * prev[2] + w * cur[2]
+            prev = cur
+        return prev
 
     def joint_feedback(self):
         """posfb as the desktop sees it: 100 Hz sample-and-hold + stream latency."""

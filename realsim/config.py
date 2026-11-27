@@ -31,6 +31,8 @@ REAL = dict(
     k0=10.0, k1=0.3, vff=1.0,     # real_policy_ctrl.STREAM_GAINS (deployed 2026-09-20)
     lead=0.045,            # Pi samples the reference at t + lead (= drive dead-time)
     lead_p=None,           # position-error lead; None = same as `lead` (the law before 2026-11-14)
+    vlag=0.0,              # s, drive first-order velocity lag (twin drive model); 0 = dead time + amax only (fit of 2026-11-14)
+    taff=0.0,              # acceleration feedforward u += taff * a_ref (robot_hal; 0.015 in STREAM_FAST)
     vfric=0.0, veps=D(0.3),       # breakaway compensation u += vfric*tanh(u/veps) (robot_hal 2026-11-14)
     vmax=D(50.0),          # vel_cmd_max 850 / vel_scale 17 = 50 deg/s
     vgain=1.025,           # measured velocity / commanded at vel_scale 17 (bare-drive runs 2026-11-14: 1.01-1.04)
@@ -54,14 +56,22 @@ REAL = dict(
     damping=[0.493, 0.443, 0.472, 0.462, 0.462, 0.479],
     frictionloss=[0.285, 0.289, 0.312, 0.281, 0.298, 0.282],
     # ---------------- transport ----------------
-    tx_lat=0.003,          # desktop -> Pi TCP 2-5 ms typical (2026-09-17 per-hop table)
-    tx_spike_p=0.03,       # Pi GIL-contention spikes 50-125 ms ("arrived late once" at 20 Hz chunks)
-    tx_spike=(0.050, 0.125),
-    fb_lat=0.002,          # Pi -> desktop joint stream 0.2-0.8 ms + 100 Hz cadence (sample-and-hold below)
-    fb_period=0.010,
-    # ---------------- cameras (ASSUMED: capture->host age not yet measured on this rig) ----------------
-    zed_lat=0.090, zed_period=1.0 / 30,      # ZED 2i HD720@30 typical 2-3 frames glass-to-host
-    wrist_lat=0.070, wrist_period=1.0 / 30,  # D405 USB3 typical ~2 frames
+    # measured 2026-11-27 on the cable, clocks chrony-synced over the cable (realsim/sysid/stream_slack.py, 670 spline
+    # commands through PiLink, ~/pnp_real_runs/stream_slack/): send -> Pi t_recv median 0.8-1.0 ms, p99 2.9-4.8, max 11.9;
+    # TCP RTT 0.49 ms. The 50-125 ms spikes of September (WiFi era, old robot_hal) were not seen again.
+    tx_lat=0.001,
+    tx_spike_p=0.01,
+    tx_spike=(0.004, 0.012),
+    fb_lat=0.001,          # Pi -> desktop joint stream (one-way ~0.25 ms + ack/parse); 2026-11-27 realsim/sysid/fb_rate.py
+    fb_period=0.010,       # 10 ms stack: posfb/torqfb pins change every 10.0 ms per joint (sampled on the Pi at 770 Hz,
+                           # 2026-11-27); 5 ms stack: timing="stack_5ms"
+    # ---------------- cameras: policy/cam_server60.py, every camera at 60 fps (measured 2026-11-27) ----------------
+    # *_lat = sensor capture time -> frame published in /dev/shm, from the cameras' own capture stamps (ZED
+    # TIME_REFERENCE.IMAGE, D405 global time); 60 s, all three cameras running. Frame-period sample-and-hold is
+    # modelled separately by *_period. Not yet checked against an external flash -> DR below is skewed upward.
+    zed_lat=0.030, zed_period=1.0 / 60,      # ZED 2i HD720@60: median 29.6 ms, p95 39.8, max 47.2
+    wrist_lat=0.011, wrist_period=1.0 / 60,  # D405 424x240@60: median 10.9 ms, p95 11.1, max 17.0
+    # the old policy/zed_cam_server.py is NOT this: make_cfg(timing="old_cam_server")
     cam_noise=0.0,         # additive gaussian pixel noise (0-255 scale); 0 = off
     # ---------------- policy compute ----------------
     infer_mean=0.150, infer_sd=0.025, infer_min=0.09,  # UNet/CFM 110-200 ms measured (2026-10-15, 11-07);
@@ -85,13 +95,46 @@ REAL = dict(
 # 0.033 vs 0.031 deg tracking rms on the arm.
 STREAM_TUNED = dict(k0=10.0, k1=0.3, vff=1.0, lead=0.040, lead_p=0.0, vfric=D(0.35), veps=D(0.3),
                     vgain=1.025 * 16.4 / 17.0)
+# 2026-11-25 envelope (realsim/sysid/envelope.py): tuned + acceleration feedforward, clamp 60 deg/s. On the arm, J1 step
+# 30 deg/s err max 0.59 -> 0.23 deg; no drive fault at 60.7 deg/s actual. real_policy_ctrl.STREAM_GAINS_FAST.
+STREAM_FAST = dict(STREAM_TUNED, taff=0.015, vmax=D(60.0))
+# 2026-11-27 5 ms stack (launch_mpc_stack_5ms.sh): same law, lead 0.030 (lead 0.040 is 2x worse there).
+# real_policy_ctrl.STREAM_GAINS_FAST_5MS / real_rollout --stream fast5. Use with timing="stack_5ms".
+STREAM_FAST_5MS = dict(STREAM_FAST, lead=0.030)
+STREAMS = {"tuned": STREAM_TUNED, "fast": STREAM_FAST, "fast5": STREAM_FAST_5MS}
 
 # domain randomisation ranges (multipliers / absolute), env_warp DRIVE_DR + latency spreads
 DR = dict(
     dead=(0.030, 0.065), amax_mult=(0.75, 1.15), vmax_mult=(0.9, 1.1),
-    zed_lat=(0.060, 0.130), wrist_lat=(0.040, 0.100), infer_mean=(0.110, 0.200),
+    # cameras 2026-11-27 (cam_server60): measured p5..max plus room for the unverified capture-stamp offset
+    zed_lat=(0.025, 0.060), wrist_lat=(0.008, 0.030), infer_mean=(0.110, 0.200),
     armature=(0.15, 0.23),
 )
+
+# Timing presets, make_cfg(timing=...). Each overrides config values and, under "dr", the camera DR ranges
+# (stored in the cfg as dr_<key> so the batched twin draws from the same ranges).
+TIMING = {
+    "measured": {},        # REAL + DR as above: 10 ms stack, cam_server60 at 60 fps, cable transport (2026-11-27)
+    # policy/zed_cam_server.py (all real runs up to 2026-11-27): ZED throttle aliased to 10.7 Hz (frames 100 ms apart),
+    # 30 fps grab + 17 ms publish; wrist frames bunched by the GIL every ~100 ms (median gap 7 ms, p95 92 ms)
+    "old_cam_server": dict(zed_lat=0.049, zed_period=0.100, wrist_lat=0.011, wrist_period=0.100,
+                           dr=dict(zed_lat=(0.040, 0.080), wrist_lat=(0.008, 0.030))),
+    # the assumptions every twin result before 2026-11-27 used -- reproduce old numbers with this
+    "legacy_1126": dict(tx_lat=0.003, tx_spike_p=0.03, tx_spike=(0.050, 0.125), fb_lat=0.002,
+                        zed_lat=0.090, zed_period=1.0 / 30, wrist_lat=0.070, wrist_period=1.0 / 30,
+                        dr=dict(zed_lat=(0.060, 0.130), wrist_lat=(0.040, 0.100))),
+    # 5 ms HAL stack (elerob_5ms.ini, CAN IRQ pinned cpu3 fifo99), 2026-11-27: :9999 196 Hz, drive pins every 5 ms,
+    # dead time 46-50 -> 31 ms. Pair with stream="fast5" (lead 0.030). Physics runs at 5/3 ms (phys_substeps).
+    "stack_5ms": dict(cmd_dt=0.005, fb_period=0.005, dead=0.031, lead=0.030,
+                      dr=dict(dead=(0.025, 0.045))),
+}
+
+
+def phys_substeps(cmd_dt, dt0):
+    """Physics steps per Pi tick and the timestep to use: the largest step <= the scene's dt0 that divides cmd_dt
+    (10 ms on 2 ms physics -> 5 x 2 ms; the 5 ms stack -> 3 x 1.667 ms rather than silently running 4 ms ticks)."""
+    n = max(1, int(np.ceil(cmd_dt / dt0 - 1e-6)))
+    return n, (dt0 if abs(n * dt0 - cmd_dt) < 1e-9 else cmd_dt / n)      # keep the scene's step bit-exact when it divides
 
 # "ideal" = the old eval harness's assumptions: no delays, stiff drive, no transport/compute time
 IDEAL_OVERRIDES = dict(
@@ -134,20 +177,29 @@ JOINT_TORQUE_FIT = dict(
 
 def make_cfg(level="real", dr=False, rng=None, **over):
     joint_model = int(over.pop("joint_model", 0))
+    timing = over.pop("timing", "measured")
+    if timing not in TIMING:
+        raise ValueError(f"timing={timing!r}: choose one of {list(TIMING)}")
     cfg = copy.deepcopy(REAL)
+    t_over = copy.deepcopy(TIMING[timing])
+    t_dr = t_over.pop("dr", {})
+    cfg.update(t_over)
+    cfg["timing"] = timing
+    for k in ("zed_lat", "wrist_lat", "dead"):
+        cfg[f"dr_{k}"] = tuple(t_dr.get(k, DR[k]))
     cfg.update(LEVELS[level])
     if dr:
         rng = rng or np.random.default_rng()
         if level in ("drive", "drive+sensor", "drive+sensor+compute", "real"):
-            cfg["dead"] = rng.uniform(*DR["dead"])
+            cfg["dead"] = rng.uniform(*cfg["dr_dead"])
             if "lead" not in over:
                 cfg["lead"] = cfg["dead"]      # the Pi lead is tuned to the dead-time
             cfg["amax"] *= rng.uniform(*DR["amax_mult"])
             cfg["vmax"] *= rng.uniform(*DR["vmax_mult"])
             cfg["armature"] = rng.uniform(*DR["armature"])
         if level in ("drive+sensor", "drive+sensor+compute", "real"):
-            cfg["zed_lat"] = rng.uniform(*DR["zed_lat"])
-            cfg["wrist_lat"] = rng.uniform(*DR["wrist_lat"])
+            cfg["zed_lat"] = rng.uniform(*cfg["dr_zed_lat"])
+            cfg["wrist_lat"] = rng.uniform(*cfg["dr_wrist_lat"])
         if level in ("drive+sensor+compute", "real"):
             cfg["infer_mean"] = rng.uniform(*DR["infer_mean"])
     if joint_model:

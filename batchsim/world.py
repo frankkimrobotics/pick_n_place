@@ -14,10 +14,13 @@ NJ = 6
 
 
 class BatchWorld:
-    def __init__(self, xml, nworld, device="cuda:0", joint_physics=None, nconmax=None, njmax=None):
+    def __init__(self, xml, nworld, device="cuda:0", joint_physics=None, nconmax=None, njmax=None, cmd_dt=None):
         wp.config.quiet = True
         self.device, self.N = device, int(nworld)
         self.mjm = mujoco.MjModel.from_xml_path(xml) if isinstance(xml, str) else xml
+        if cmd_dt is not None:                             # physics step must divide the Pi period (5 ms stack -> 1.667 ms)
+            from realsim.config import phys_substeps
+            self.mjm.opt.timestep = phys_substeps(float(cmd_dt), float(self.mjm.opt.timestep))[1]
         if joint_physics is not None:                      # nominal values go in BEFORE put_model: friction adds
             for k, f in (("armature", "dof_armature"), ("damping", "dof_damping"), ("frictionloss", "dof_frictionloss")):
                 getattr(self.mjm, f)[:NJ] = np.asarray(joint_physics[k], float)      # constraint rows that are sized there
