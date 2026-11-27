@@ -38,6 +38,8 @@ class DriveChain:
         N, dev = world.N, world.device
         self.N, self.dev, self.P = N, dev, max_pts
         self.sub = max(1, int(round(cfg["cmd_dt"] / world.dt)))
+        if abs(self.sub * world.dt - cfg["cmd_dt"]) > 1e-9:       # e.g. the 5 ms Pi stack on 2 ms physics -> 4 ms ticks
+            raise ValueError(f"cmd_dt {cfg['cmd_dt']} is not a multiple of the physics timestep {world.dt}")
         f = lambda v: torch.as_tensor(v, dtype=torch.float32, device=dev)
         self.kp, self.kd = f(cfg["kp"]), f(cfg["kd"])
         self.n_dead = torch.round(lat["dead"] / world.dt).long()             # dead time at physics resolution

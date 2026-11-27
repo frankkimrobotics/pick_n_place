@@ -49,12 +49,13 @@ def sample(cfg, nworld, device, dr=False, gen=None):
              cam_phase=torch.zeros(nworld, device=device))
     lead_follows = cfg.get("lead_p") is None and abs(cfg["lead"] - cfg["dead"]) < 0.011
     if dr:
-        p["dead"] = U(*DR["dead"])
+        p["dead"] = U(*cfg.get("dr_dead", DR["dead"]))
         if lead_follows:
             p["lead"] = p["dead"].clone()                   # the Pi lead is tuned to the dead time
         p["amax"] = p["amax"] * U(*DR["amax_mult"])
         p["vmax"] = p["vmax"] * U(*DR["vmax_mult"])
-        p["zed_lat"], p["wrist_lat"] = U(*DR["zed_lat"]), U(*DR["wrist_lat"])
+        p["zed_lat"] = U(*cfg.get("dr_zed_lat", DR["zed_lat"]))        # timing preset ranges (realsim.config.TIMING)
+        p["wrist_lat"] = U(*cfg.get("dr_wrist_lat", DR["wrist_lat"]))
         p["infer_mean"] = U(*DR["infer_mean"]) if cfg["infer_mean"] > 0.1 else p["infer_mean"] * U(0.8, 1.3)
         p["phys_scale"] = U(DR["armature"][0] / 0.191, DR["armature"][1] / 0.191)
         p["cam_phase"] = U(0.0, 1.0)                       # fraction of a frame period: cameras free-run

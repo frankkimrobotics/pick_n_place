@@ -70,7 +70,7 @@ def eval_scene(idx, a, rq):
         over = {}
         for kv in a["cfg"]:
             k_, v_ = kv.split("=", 1)
-            over[k_] = float(v_) if k_ not in ("orient",) else v_
+            over[k_] = float(v_) if k_ not in ("orient", "timing") else v_   # timing: realsim.config.TIMING preset
         dq_wrist = float(np.radians(over.pop("dq_wrist", 0.0)))  # deg per decision for joints 4-6, 0 = same as dq_max
         dq_mid = float(np.radians(over.pop("dq_mid", 0.0)))      # deg per decision for joints 2-4 (vertical moves), 0 = same
         dq_mid_z = float(over.pop("dq_mid_z", -1.0))             # dq_mid applies only above this tool height (m)
@@ -78,9 +78,9 @@ def eval_scene(idx, a, rq):
         for k_ in ("dq_max", "lead_max"):                      # given in degrees on the CLI
             if k_ in over:
                 over[k_] = float(np.radians(over[k_]))
-        if a["stream"] == "tuned" and a["level"] != "ideal":   # Pi stream gains tuned on the arm 2026-11-14
-            from realsim.config import STREAM_TUNED
-            over = {**STREAM_TUNED, **over}
+        if a["stream"] != "deployed" and a["level"] != "ideal":   # Pi stream gains tuned on the arm (realsim.config.STREAMS)
+            from realsim.config import STREAMS
+            over = {**STREAMS[a["stream"]], **over}
         cfg = make_cfg(a["level"], dr=a["dr"], rng=rng, **over)
         dt = 0.1 * a["slow"]
 
@@ -664,9 +664,10 @@ def main():
     ap.add_argument("--dr_scene", action="store_true",
                     help="randomise the scene per episode: lights, colours, camera extrinsics, object pose/mass/"
                          "friction, plunger spring, seal threshold, vacuum onset, goal error")
-    ap.add_argument("--stream", default="deployed", choices=["deployed", "tuned"],
-                    help="Pi stream law: deployed (lead 45 ms on feedforward and position: arm leads its reference) or "
-                         "tuned (realsim.config.STREAM_TUNED, 2026-11-14)")
+    ap.add_argument("--stream", default="deployed", choices=["deployed", "tuned", "fast", "fast5"],
+                    help="Pi stream law: deployed (lead 45 ms on feedforward and position: arm leads its reference), "
+                         "tuned (STREAM_TUNED, 2026-11-14), fast (+accel ff, 60 deg/s), fast5 (5 ms stack: pair with "
+                         "--cfg timing=stack_5ms)")
     ap.add_argument("--seed", type=int, default=0, help="offset of the per-scene rng (DR draws)")
     ap.add_argument("--patch", default="", help="weight-space patch (.pt, see realsim/wsp.py) applied on top of --ckpt")
     ap.add_argument("--zed_mask", type=int, default=0, help="1 = the policy sees the table-only ZED view (policy/zed_mask.py)")

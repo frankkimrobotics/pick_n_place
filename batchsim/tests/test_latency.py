@@ -10,7 +10,9 @@ dev = sys.argv[1] if len(sys.argv) > 1 else "cuda:0"
 xml = sys.argv[2] if len(sys.argv) > 2 else "~/pnp_dataset_mega/scene_980/scene.xml"
 out = {}
 for name, kw in (("real", dict(level="real")), ("real, fast inference", dict(level="real", infer_mean=0.06, infer_sd=0.0, infer_min=0.045)),
-                 ("ideal", dict(level="ideal")), ("real, randomised", dict(level="real", dr=True))):
+                 ("ideal", dict(level="ideal")), ("real, randomised", dict(level="real", dr=True)),
+                 ("5 ms stack", dict(level="real", timing="stack_5ms", stream="fast5")),
+                 ("5 ms stack, randomised", dict(level="real", timing="stack_5ms", stream="fast5", dr=True))):
     N = 16
     tw = BatchTwin(xml, N, dev, cameras=("zed", "wrist_d405"), tx_spike_p=0.0, infer_sd=kw.pop("infer_sd", 0.0), **kw)
     q0 = tw.world.qpos0.clone(); q0[:6] = torch.tensor([0.0, -0.35, 1.40, 0.17, -1.57, 0.0]); tw.reset(qpos=q0[None].expand(N, -1))
@@ -32,8 +34,9 @@ for name, kw in (("real", dict(level="real")), ("real, fast inference", dict(lev
             seen[k] = torch.where(m & torch.isnan(seen[k]), torch.full_like(seen[k], t), seen[k])
         if i >= 70:                                                # the rendered state must be the true state `age` ago
             for c, cam in tw.cams.items():
-                k = torch.round(cam.age / tw.cfg["cmd_dt"]).long()
-                past = torch.stack(qlog)[len(qlog) - 1 - k, torch.arange(N, device=dev)]
+                u = cam.age / tw.cfg["cmd_dt"]                     # ages fall between ticks: interpolate the true log
+                k0 = torch.floor(u + 1e-4).long(); w_ = (u - k0).clamp(0, 1)[:, None]; Q = torch.stack(qlog); ar = torch.arange(N, device=dev)
+                past = (1 - w_) * Q[len(qlog) - 1 - k0, ar] + w_ * Q[len(qlog) - 2 - k0, ar]
                 cam_err[c] = max(cam_err[c], float((cam.qpos[:, :6] - past).abs().max()))
                 cam_age[c].append(cam.age.clone())
     ms = lambda x: [round(1000 * float(x.min())), round(1000 * float(x.mean())), round(1000 * float(x.max()))]
